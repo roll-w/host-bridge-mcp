@@ -2,34 +2,36 @@
 
 # Host Bridge MCP
 
-Run host toolchain commands via MCP and stream output with SSE.
+Run host commands through MCP with TUI approvals, live logs, and full final output.
 
-[Quickstart](#quickstart) | [Configuration](#configuration) | [Usage](#usage) | [Security](#security) | [Documentation](#documentation)
+[Quickstart](#quickstart) | [Configuration](#configuration) | [Usage](#usage) | [TUI](#tui) | [Security](#security) | [Documentation](#documentation)
 
 </div>
 
-`host-bridge-mcp` is a Rust MCP server that executes a single command line on the machine where the server runs.
-It returns an SSE URL you can subscribe to for real-time stdout/stderr and exit status.
-
-This is useful when your MCP client runs in a different environment (container, WSL, remote) but you need access to the host toolchain.
+`host-bridge-mcp` is a Rust MCP server that executes exactly one host command per tool call.
+It is designed for setups where your MCP client runs in a different environment (container, WSL, remote workspace) but
+still needs the local host toolchain.
 
 > [!WARNING]
-> This server can execute commands on the machine where it runs.
-> Do not expose it to untrusted networks. Review and lock down policies in `host-bridge.toml`.
+> This server can execute host commands.
+> Do not expose it to untrusted networks. Review `host-bridge.toml` carefully before use.
 
 ## Features
 
-- Execute a single command string (for example, `mvn clean compile`)
-- Stream output and exit status in real time via SSE
-- Policy engine with `allow`, `confirm`, `deny` (command and subcommand level)
-- Optional working directory and environment variables per request
-- Path mapping rules for container/WSL/host interoperability
+- Execute exactly one command line per tool call
+- Block the MCP tool call until execution completes, then return full `stdout` and `stderr`
+- Show live operational logs and pending approvals in a local TUI
+- Require approval in the TUI when policy demands confirmation
+- Keep a hot in-memory log buffer plus optional on-disk log backing for full log history
+- Expose per-execution SSE streams for external subscribers
+- Support path mapping for container/WSL/host interoperability
+- Use grouped command policies with concise subcommand overrides
 
 ## Quickstart
 
 ### Build
 
-Prerequisites: Rust toolchain (`cargo`) for building from source
+Prerequisite: a Rust toolchain with `cargo`
 
 ```bash
 cargo build --release
@@ -47,31 +49,59 @@ Configuration load order (highest to lowest priority):
 
 Start from the default template: `host-bridge.toml`.
 
-### Run (use the compiled binary)
+### Run
 
 ```bash
 ./target/release/host-bridge-mcp --config host-bridge.toml
 ```
 
-The server listens on the configured address (default: `0.0.0.0:8787`).
+Useful CLI flags:
 
-### Connect
+- `-c, --config <PATH>`: use a custom config file
+- `-h, --help`: show help text and exit
+- `-V, --version`: print version and exit
 
-- MCP endpoint: `http://127.0.0.1:8787/mcp` (transport: `streamable-http`)
-- Health check: `http://127.0.0.1:8787/health`
+By default the server listens on `0.0.0.0:8787`.
+
+## TUI
+
+When the process starts in an interactive terminal, it opens a TUI that shows:
+
+- pending approval requests
+- live server logs
+- the full log history from head to tail
+
+TUI keys:
+
+- `Up` / `Down`: select approval entries
+- `a`: approve the selected request
+- `r`: reject the selected request
+- mouse wheel / `PgUp` / `PgDn`: scroll logs
+- `Home` / `End`: jump to the start or follow the tail
+- `q`: gracefully shut down the server
+
+If the process is not attached to a TTY, the TUI is disabled and confirmation-required commands are rejected.
+
+The server also handles system termination signals and shuts down gracefully on `SIGINT` / `SIGTERM` (or `Ctrl+C` on
+non-Unix platforms).
 
 ## Usage
 
-Add to your MCP client:
+### Connect to MCP
+
+- MCP endpoint: `http://127.0.0.1:8787/mcp`
+- Health check: `http://127.0.0.1:8787/health`
+
+Example client configuration:
 
 ```json
 {
-    "type": "streamable-http",
-    "url": "http://localhost:8787/mcp"
+  "type": "streamable-http",
+  "url": "http://localhost:8787/mcp"
 }
 ```
 
-### Tool: execute_command
+### Tool: `execute_command`
 
 Call MCP `tools/call` with tool name `execute_command`.
 
@@ -88,47 +118,59 @@ Example tool arguments:
 }
 ```
 
-### Stream output (SSE)
+Tool behavior:
 
-Subscribe to sse to receive events: `status`, `output`, `exit`, `error`.
+- `command` must contain exactly one command line
+- shell chaining operators such as `&&`, `||`, `;`, and `|` are rejected
+- if policy is `confirm`, the tool call stays pending until the local TUI operator approves or rejects it
+- if approved, the command runs and the tool returns only after execution completes
+- the final tool result includes `executionId`, final `status`, `exit`, `stdout`, and `stderr`
+
+### SSE execution stream
+
+The server also exposes a per-execution SSE stream:
 
 ```bash
 curl -N "http://127.0.0.1:8787/executions/<executionId>/stream"
 ```
 
-### Confirmation behavior
+Events include `status`, `output`, `exit`, and `error`.
 
-Policies can require confirmation.
+### MCP logging notifications
 
-> [!IMPORTANT]
-> Interactive confirmation happens in the server console and requires a TTY.
-> For automation, prefer explicit allow/deny policies.
+While a tool call is pending or running, the server also emits MCP `logging/message` notifications.
+These notifications include structured JSON for approval state, incremental output, exit status, and runtime errors.
 
 ## Configuration
 
-- Default template: `host-bridge.toml`
+Key sections in `host-bridge.toml`:
 
-Common settings:
+- `[server]`
+- `[logging]`
+- `[execution]`
+- `[[execution.commands]]`
+- `[[execution.path_mappings]]`
 
-- `server.bind_address` and `server.public_base_url`
-- `execution.default_policy` and `execution.command_policies`
-- `execution.path_mappings` (prefix-based path rewriting)
-- `execution.enable_builtin_wsl_mapping` (optional `/mnt/<drive>/...` to `C:\...` mapping)
+Highlights:
+
+- `logging.memory_buffer_lines`: hot in-memory log window for the TUI
+- `logging.file_path`: optional explicit log file path
+- `logging.persist_file`: keep or delete the backing log file on exit
+- `execution.default_action`: fallback action for unmatched commands
+- `[[execution.commands]]`: grouped command policies with optional nested `[[execution.commands.rules]]` overrides
+- `execution.default_timeout_ms` / `execution.max_timeout_ms`: timeout control
+
+See `docs/configuration.md` for the full reference.
 
 ## Security
 
-Recommended baseline for a safe setup:
+Recommended baseline:
 
-- Bind to `127.0.0.1` (or a private interface) unless you fully trust the network.
-- Keep `default_policy = "confirm"` and allow-list only what you need.
-- Deny high-risk subcommands (`publish`, `deploy`, etc.).
-- Run as a non-root user and in a restricted working directory.
-
-## CLI options
-
-- `-c, --config <PATH>`: set configuration file path
-- `-h, --help`: show help
-- `-V, --version`: show version
+- bind to `127.0.0.1` or another trusted interface unless you fully trust the network
+- keep `execution.default_action = "confirm"` unless you have a strong allow-list
+- explicitly deny high-risk commands such as publish/deploy flows
+- run as a non-root user where possible
+- keep the TUI attached when using confirmation-based policies
 
 ## License
 

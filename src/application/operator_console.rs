@@ -106,11 +106,17 @@ impl OperatorConsole {
     }
 
     pub fn set_interactive(&self, interactive: bool) {
-        self.state.lock().expect("console lock poisoned").interactive = interactive;
+        self.state
+            .lock()
+            .expect("console lock poisoned")
+            .interactive = interactive;
     }
 
     pub fn is_interactive(&self) -> bool {
-        self.state.lock().expect("console lock poisoned").interactive
+        self.state
+            .lock()
+            .expect("console lock poisoned")
+            .interactive
     }
 
     pub fn push_log(&self, level: ConsoleLogLevel, message: impl Into<String>) {
@@ -183,7 +189,9 @@ impl OperatorConsole {
             active: true,
         };
 
-        let approved = receiver.await.map_err(|_| ConsoleApprovalError::Cancelled)?;
+        let approved = receiver
+            .await
+            .map_err(|_| ConsoleApprovalError::Cancelled)?;
         guard.disarm();
         Ok(approved)
     }
@@ -290,7 +298,9 @@ impl LogStore {
         }
 
         let end = (start + limit).min(self.total_log_count);
-        let buffer_start = self.total_log_count.saturating_sub(self.buffered_logs.len());
+        let buffer_start = self
+            .total_log_count
+            .saturating_sub(self.buffered_logs.len());
 
         if start >= buffer_start {
             return self
@@ -305,12 +315,7 @@ impl LogStore {
         let file_end = end.min(buffer_start);
         let mut entries = self.storage.read_range(start, file_end);
         if end > buffer_start {
-            entries.extend(
-                self.buffered_logs
-                    .iter()
-                    .take(end - buffer_start)
-                    .cloned(),
-            );
+            entries.extend(self.buffered_logs.iter().take(end - buffer_start).cloned());
         }
         entries
     }
@@ -490,7 +495,11 @@ fn sanitize_console_text(input: &str) -> String {
                 }
             }
             State::OscEscape => {
-                state = if ch == '\\' { State::Normal } else { State::Osc };
+                state = if ch == '\\' {
+                    State::Normal
+                } else {
+                    State::Osc
+                };
             }
         }
     }
@@ -557,7 +566,9 @@ mod tests {
 
         let waiter_console = console.clone();
         let wait_task =
-            tokio::spawn(async move { waiter_console.request_confirmation(sample_request()).await });
+            tokio::spawn(
+                async move { waiter_console.request_confirmation(sample_request()).await },
+            );
 
         tokio::task::yield_now().await;
         let approval_id = console.snapshot().pending_approvals[0].id;
@@ -598,7 +609,8 @@ mod tests {
 
     #[test]
     fn removes_temporary_log_file_on_drop() {
-        let log_path = std::env::temp_dir().join(format!("host-bridge-mcp-test-{}.log", Uuid::new_v4()));
+        let log_path =
+            std::env::temp_dir().join(format!("host-bridge-mcp-test-{}.log", Uuid::new_v4()));
         {
             let console = OperatorConsole::new(LoggingConfig {
                 memory_buffer_lines: 2,

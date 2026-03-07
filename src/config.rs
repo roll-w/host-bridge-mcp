@@ -45,9 +45,9 @@ pub struct LoggingConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ExecutionConfig {
-    #[serde(alias = "default_policy")]
     pub default_action: PolicyAction,
-    pub rules: Vec<ExecutionRule>,
+    #[serde(default)]
+    pub commands: Vec<CommandPolicyConfig>,
     pub default_working_directory: Option<String>,
     pub path_mappings: Vec<PathMappingRule>,
     pub target_platform: TargetPlatform,
@@ -57,8 +57,16 @@ pub struct ExecutionConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct ExecutionRule {
+pub struct CommandPolicyConfig {
     pub command: String,
+    pub action: PolicyAction,
+    pub default_working_directory: Option<String>,
+    #[serde(default)]
+    pub rules: Vec<CommandRuleConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CommandRuleConfig {
     #[serde(default)]
     pub args_prefix: Vec<String>,
     pub action: PolicyAction,
@@ -132,7 +140,7 @@ impl Default for AppConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            bind_address: "0.0.0.0:8787".to_string()
+            bind_address: "0.0.0.0:8787".to_string(),
         }
     }
 }
@@ -151,7 +159,7 @@ impl Default for ExecutionConfig {
     fn default() -> Self {
         Self {
             default_action: PolicyAction::Confirm,
-            rules: Vec::new(),
+            commands: Vec::new(),
             default_working_directory: None,
             path_mappings: Vec::new(),
             target_platform: TargetPlatform::Auto,
@@ -178,9 +186,11 @@ impl AppConfig {
     }
 
     pub fn load_with_path(config_path: Option<&str>) -> Result<Self, ConfigError> {
-        let path = config_path.map(|value| value.to_string()).unwrap_or_else(|| {
-            std::env::var(CONFIG_ENV_KEY).unwrap_or_else(|_| DEFAULT_CONFIG_FILE.to_string())
-        });
+        let path = config_path
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| {
+                std::env::var(CONFIG_ENV_KEY).unwrap_or_else(|_| DEFAULT_CONFIG_FILE.to_string())
+            });
         if !Path::new(&path).exists() {
             return Ok(Self::default());
         }
@@ -189,8 +199,12 @@ impl AppConfig {
             path: path.clone(),
             source,
         })?;
-        let config =
-            toml::from_str::<Self>(&raw).map_err(|source| ConfigError::Parse { path, source })?;
+        let value = toml::from_str::<toml::Value>(&raw)
+            .map_err(|source| ConfigError::Parse { path: path.clone(), source })?;
+        reject_legacy_execution_keys(&value)?;
+        let config = value
+            .try_into::<Self>()
+            .map_err(|source| ConfigError::Parse { path, source })?;
         config.validate()?;
         Ok(config)
     }
@@ -215,19 +229,33 @@ impl AppConfig {
             ));
         }
 
-        for (index, rule) in self.execution.rules.iter().enumerate() {
-            if rule.command.trim().is_empty() {
-                return Err(ConfigError::Validation(
-                    format!("execution.rules[{index}].command cannot be empty"),
-                ));
-            }
+        for (index, command) in self.execution.commands.iter().enumerate() {
+            validate_command_name(
+                &command.command,
+                &format!("execution.commands[{index}].command"),
+            )?;
+            validate_working_directory(
+                command.default_working_directory.as_deref(),
+                &format!("execution.commands[{index}].default_working_directory"),
+            )?;
 
-            for (arg_index, token) in rule.args_prefix.iter().enumerate() {
-                if token.trim().is_empty() {
+            for (rule_index, rule) in command.rules.iter().enumerate() {
+                if rule.args_prefix.is_empty() {
                     return Err(ConfigError::Validation(format!(
-                        "execution.rules[{index}].args_prefix[{arg_index}] cannot be empty"
+                        "execution.commands[{index}].rules[{rule_index}].args_prefix must contain at least one token"
                     )));
                 }
+
+                validate_args_prefix(
+                    &rule.args_prefix,
+                    &format!("execution.commands[{index}].rules[{rule_index}].args_prefix"),
+                )?;
+                validate_working_directory(
+                    rule.default_working_directory.as_deref(),
+                    &format!(
+                        "execution.commands[{index}].rules[{rule_index}].default_working_directory"
+                    ),
+                )?;
             }
         }
 
@@ -245,21 +273,73 @@ impl AppConfig {
             ));
         }
 
-        if let Some(path) = &self.logging.file_path {
-            if path.trim().is_empty() {
-                return Err(ConfigError::Validation(
-                    "logging.file_path cannot be empty when provided".to_string(),
-                ));
-            }
-        }
+        validate_working_directory(self.logging.file_path.as_deref(), "logging.file_path")?;
 
         Ok(())
     }
 }
 
+fn validate_command_name(command: &str, location: &str) -> Result<(), ConfigError> {
+    if command.trim().is_empty() {
+        return Err(ConfigError::Validation(format!(
+            "{location} cannot be empty"
+        )));
+    }
+
+    Ok(())
+}
+
+fn reject_legacy_execution_keys(value: &toml::Value) -> Result<(), ConfigError> {
+    let Some(execution) = value.get("execution").and_then(toml::Value::as_table) else {
+        return Ok(());
+    };
+
+    if execution.contains_key("default_policy") {
+        return Err(ConfigError::Validation(
+            "execution.default_policy is no longer supported; use execution.default_action"
+                .to_string(),
+        ));
+    }
+
+    if execution.contains_key("rules") {
+        return Err(ConfigError::Validation(
+            "execution.rules is no longer supported; migrate to execution.commands".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_args_prefix(args_prefix: &[String], location: &str) -> Result<(), ConfigError> {
+    for (index, token) in args_prefix.iter().enumerate() {
+        if token.trim().is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "{location}[{index}] cannot be empty"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_working_directory(path: Option<&str>, location: &str) -> Result<(), ConfigError> {
+    if let Some(path) = path {
+        if path.trim().is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "{location} cannot be empty when provided"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn default_config_is_valid() {
@@ -267,15 +347,15 @@ mod tests {
     }
 
     #[test]
-    fn reject_rule_with_empty_command() {
+    fn reject_command_policy_with_empty_command() {
         let config = AppConfig {
             server: ServerConfig::default(),
             execution: ExecutionConfig {
-                rules: vec![ExecutionRule {
+                commands: vec![CommandPolicyConfig {
                     command: "   ".to_string(),
-                    args_prefix: Vec::new(),
                     action: PolicyAction::Allow,
                     default_working_directory: None,
+                    rules: Vec::new(),
                 }],
                 ..ExecutionConfig::default()
             },
@@ -283,6 +363,113 @@ mod tests {
         };
 
         let error = config.validate().expect_err("config should be invalid");
-        assert!(error.to_string().contains("execution.rules[0].command"));
+        assert!(error.to_string().contains("execution.commands[0].command"));
+    }
+
+    #[test]
+    fn reject_nested_command_rule_without_args_prefix() {
+        let config = AppConfig {
+            server: ServerConfig::default(),
+            execution: ExecutionConfig {
+                commands: vec![CommandPolicyConfig {
+                    command: "cargo".to_string(),
+                    action: PolicyAction::Allow,
+                    default_working_directory: None,
+                    rules: vec![CommandRuleConfig {
+                        args_prefix: Vec::new(),
+                        action: PolicyAction::Confirm,
+                        default_working_directory: None,
+                    }],
+                }],
+                ..ExecutionConfig::default()
+            },
+            logging: LoggingConfig::default(),
+        };
+
+        let error = config.validate().expect_err("config should be invalid");
+        assert!(error.to_string().contains(
+            "execution.commands[0].rules[0].args_prefix must contain at least one token"
+        ));
+    }
+
+    #[test]
+    fn reject_empty_nested_command_rule_token() {
+        let config = AppConfig {
+            server: ServerConfig::default(),
+            execution: ExecutionConfig {
+                commands: vec![CommandPolicyConfig {
+                    command: "cargo".to_string(),
+                    action: PolicyAction::Allow,
+                    default_working_directory: None,
+                    rules: vec![CommandRuleConfig {
+                        args_prefix: vec!["build".to_string(), "   ".to_string()],
+                        action: PolicyAction::Confirm,
+                        default_working_directory: None,
+                    }],
+                }],
+                ..ExecutionConfig::default()
+            },
+            logging: LoggingConfig::default(),
+        };
+
+        let error = config.validate().expect_err("config should be invalid");
+        assert!(
+            error
+                .to_string()
+                .contains("execution.commands[0].rules[0].args_prefix[1]")
+        );
+    }
+
+    #[test]
+    fn reject_legacy_default_policy_key_when_loading() {
+        let path = write_temp_config(
+            r#"[execution]
+default_policy = "allow"
+"#,
+        );
+
+        let error = AppConfig::load_with_path(Some(path.to_str().expect("valid temp path")))
+            .expect_err("legacy default_policy should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("execution.default_policy is no longer supported")
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reject_legacy_rules_key_when_loading() {
+        let path = write_temp_config(
+            r#"[execution]
+default_action = "confirm"
+
+[[execution.rules]]
+command = "cargo"
+action = "deny"
+args_prefix = ["publish"]
+"#,
+        );
+
+        let error = AppConfig::load_with_path(Some(path.to_str().expect("valid temp path")))
+            .expect_err("legacy execution.rules should be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("execution.rules is no longer supported")
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    fn write_temp_config(contents: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("host-bridge-config-{unique}.toml"));
+        fs::write(&path, contents).expect("temp config should be written");
+        path
     }
 }

@@ -231,16 +231,15 @@ impl ExecutionService {
             .map(|argument| self.path_mapper.map_argument_if_path(argument))
             .collect::<Vec<_>>();
 
-        let confirmation_request = (policy.decision == PolicyDecision::RequireConfirmation).then(|| {
-            ConfirmationRequest {
+        let confirmation_request =
+            (policy.decision == PolicyDecision::RequireConfirmation).then(|| ConfirmationRequest {
                 command_line: input.command.clone(),
                 executable: executable.clone(),
                 args: args.clone(),
                 working_directory: working_directory.display().to_string(),
                 timeout_ms,
                 env: input.env.clone(),
-            }
-        });
+            });
 
         Ok(PreparedExecution {
             run: RunExecution {
@@ -268,11 +267,15 @@ impl ExecutionService {
             .write()
             .await
             .insert(execution_id, record.clone());
-        self.spawn_execution(execution_id, record, prepared.run).await;
+        self.spawn_execution(execution_id, record, prepared.run)
+            .await;
 
         self.operator_console.push_log(
             ConsoleLogLevel::Info,
-            format!("Execution submitted [{}]: {command_line}", short_id(execution_id)),
+            format!(
+                "Execution submitted [{}]: {command_line}",
+                short_id(execution_id)
+            ),
         );
         tracing::info!(execution_id = %execution_id, "Execution submitted");
 
@@ -519,7 +522,10 @@ async fn run_execution(
     }
 }
 
-fn resolve_executable_for_spawn(executable: &str, environment: &HashMap<String, String>) -> PathBuf {
+fn resolve_executable_for_spawn(
+    executable: &str,
+    environment: &HashMap<String, String>,
+) -> PathBuf {
     if cfg!(windows) {
         return resolve_windows_executable_path(executable, environment)
             .unwrap_or_else(|| PathBuf::from(executable));
@@ -564,13 +570,33 @@ fn resolve_path_candidate(path: &Path, extensions: &[String]) -> Option<PathBuf>
     }
 
     for extension in extensions {
-        let candidate = PathBuf::from(format!("{}{}", path.display(), extension));
-        if candidate.is_file() {
-            return Some(candidate);
+        for candidate in extension_candidates(path, extension) {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
 
     None
+}
+
+fn extension_candidates(path: &Path, extension: &str) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let mut suffixes = vec![extension.to_string()];
+    let lowercase = extension.to_ascii_lowercase();
+    if lowercase != extension {
+        suffixes.push(lowercase);
+    }
+    let uppercase = extension.to_ascii_uppercase();
+    if uppercase != extension && uppercase != suffixes[0] {
+        suffixes.push(uppercase);
+    }
+
+    for suffix in suffixes {
+        candidates.push(PathBuf::from(format!("{}{}", path.display(), suffix)));
+    }
+
+    candidates
 }
 
 fn windows_path_extensions(environment: &HashMap<String, String>) -> Vec<String> {
@@ -687,7 +713,8 @@ fn log_execution_event(
     match event {
         ExecutionEvent::Status { message, .. } => {
             if let Some(message) = message {
-                operator_console.push_log(ConsoleLogLevel::Info, format!("[{execution_id}] {message}"));
+                operator_console
+                    .push_log(ConsoleLogLevel::Info, format!("[{execution_id}] {message}"));
             }
         }
         ExecutionEvent::Output { stream, text } => {
@@ -719,7 +746,10 @@ fn log_execution_event(
             );
         }
         ExecutionEvent::Error { message } => {
-            operator_console.push_log(ConsoleLogLevel::Error, format!("[{execution_id}] {message}"));
+            operator_console.push_log(
+                ConsoleLogLevel::Error,
+                format!("[{execution_id}] {message}"),
+            );
         }
     }
 }
@@ -731,7 +761,10 @@ fn short_id(execution_id: Uuid) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ExecutionConfig, ExecutionRule, LoggingConfig, PolicyAction, ServerConfig};
+    use crate::config::{
+        CommandPolicyConfig, CommandRuleConfig, ExecutionConfig, LoggingConfig, PolicyAction,
+        ServerConfig,
+    };
     use std::fs;
 
     #[test]
@@ -755,11 +788,15 @@ mod tests {
             server: ServerConfig::default(),
             execution: ExecutionConfig {
                 default_action: PolicyAction::Confirm,
-                rules: vec![ExecutionRule {
+                commands: vec![CommandPolicyConfig {
                     command: "cargo".to_string(),
-                    args_prefix: vec!["build".to_string()],
-                    action: PolicyAction::Confirm,
                     default_working_directory: None,
+                    action: PolicyAction::Confirm,
+                    rules: vec![CommandRuleConfig {
+                        args_prefix: vec!["build".to_string()],
+                        action: PolicyAction::Confirm,
+                        default_working_directory: None,
+                    }],
                 }],
                 ..ExecutionConfig::default()
             },
@@ -809,8 +846,9 @@ mod tests {
         fs::write(&tool_cmd, "").expect("test command file should be created");
 
         let environment = HashMap::from([("PATHEXT".to_string(), ".CMD".to_string())]);
-        let resolved = resolve_windows_executable_path(&tool_prefix.display().to_string(), &environment)
-            .expect("resolver should use PATHEXT for explicit path");
+        let resolved =
+            resolve_windows_executable_path(&tool_prefix.display().to_string(), &environment)
+                .expect("resolver should use PATHEXT for explicit path");
         assert_eq!(
             resolved.to_string_lossy().to_ascii_lowercase(),
             tool_cmd.to_string_lossy().to_ascii_lowercase()

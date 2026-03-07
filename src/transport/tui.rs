@@ -112,7 +112,8 @@ fn handle_input(
 
             match key.code {
                 KeyCode::Char('q') => {
-                    if key.modifiers == KeyModifiers::NONE && shutdown_controller.request_shutdown() {
+                    if key.modifiers == KeyModifiers::NONE && shutdown_controller.request_shutdown()
+                    {
                         console.push_log(ConsoleLogLevel::Warn, "Shutdown requested from TUI.");
                         return true;
                     }
@@ -172,7 +173,12 @@ fn handle_input(
     }
 }
 
-fn render(frame: &mut Frame, snapshot: &ConsoleSnapshot, state: &mut TuiState, console: &OperatorConsole) {
+fn render(
+    frame: &mut Frame,
+    snapshot: &ConsoleSnapshot,
+    state: &mut TuiState,
+    console: &OperatorConsole,
+) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -206,13 +212,22 @@ fn render_status_bar(frame: &mut Frame, area: ratatui::layout::Rect, snapshot: &
 
     let text = Line::from(vec![
         Span::raw(" Pending approvals: "),
-        Span::styled(snapshot.pending_approvals.len().to_string(), Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("  |  TUI: "),
         Span::styled(
-            if snapshot.interactive { "online" } else { "offline" },
+            snapshot.pending_approvals.len().to_string(),
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  |  Up/Down select  a approve  r reject  Wheel/PgUp/PgDn logs  Home/End head-tail  q shutdown"),
+        Span::raw("  |  TUI: "),
+        Span::styled(
+            if snapshot.interactive {
+                "online"
+            } else {
+                "offline"
+            },
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(
+            "  |  Up/Down select  a approve  r reject  Wheel/PgUp/PgDn logs  Home/End head-tail  q shutdown",
+        ),
     ]);
     frame.render_widget(Paragraph::new(text).style(style), area);
 }
@@ -258,11 +273,16 @@ fn render_approval_detail(
 ) {
     let lines = match state.selected_approval(snapshot) {
         Some(approval) => approval_detail_lines(approval),
-        None => vec![Line::from("Select a pending approval to inspect its details.")],
+        None => vec![Line::from(
+            "Select a pending approval to inspect its details.",
+        )],
     };
 
-    let detail = Paragraph::new(lines)
-        .block(Block::default().title("Selected Request").borders(Borders::ALL));
+    let detail = Paragraph::new(lines).block(
+        Block::default()
+            .title("Selected Request")
+            .borders(Borders::ALL),
+    );
     frame.render_widget(detail, area);
 }
 
@@ -290,8 +310,7 @@ fn render_logs(
         snapshot.total_log_count,
         snapshot.log_file_path
     );
-    let logs = Paragraph::new(log_lines)
-        .block(Block::default().title(title).borders(Borders::ALL));
+    let logs = Paragraph::new(log_lines).block(Block::default().title(title).borders(Borders::ALL));
     frame.render_widget(logs, area);
 }
 
@@ -301,7 +320,10 @@ fn approval_detail_lines(approval: &PendingApprovalView) -> Vec<Line<'static>> {
         Line::from(format!("commandLine: {}", approval.request.command_line)),
         Line::from(format!("executable : {}", approval.request.executable)),
         Line::from(format!("args       : {:?}", approval.request.args)),
-        Line::from(format!("workdir    : {}", approval.request.working_directory)),
+        Line::from(format!(
+            "workdir    : {}",
+            approval.request.working_directory
+        )),
         Line::from(format!("timeoutMs  : {}", approval.request.timeout_ms)),
         Line::from(format!("createdAt  : {:?}", approval.created_at)),
     ];
@@ -327,10 +349,7 @@ fn visible_logs(entries: &[ConsoleLogEntry]) -> Vec<Line<'static>> {
         return vec![Line::from("No log entries yet.")];
     }
 
-    entries
-        .iter()
-        .map(log_line)
-        .collect::<Vec<_>>()
+    entries.iter().map(log_line).collect::<Vec<_>>()
 }
 
 fn log_line(entry: &ConsoleLogEntry) -> Line<'static> {
@@ -341,7 +360,10 @@ fn log_line(entry: &ConsoleLogEntry) -> Line<'static> {
     };
 
     Line::from(vec![
-        Span::styled(format!("[{label}] "), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("[{label}] "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
         Span::raw(entry.message.clone()),
     ])
 }
@@ -386,7 +408,10 @@ impl TuiState {
         self.selected_approval_index = (self.selected_approval_index + 1).min(approval_count - 1);
     }
 
-    fn selected_approval<'a>(&self, snapshot: &'a ConsoleSnapshot) -> Option<&'a PendingApprovalView> {
+    fn selected_approval<'a>(
+        &self,
+        snapshot: &'a ConsoleSnapshot,
+    ) -> Option<&'a PendingApprovalView> {
         snapshot.pending_approvals.get(self.selected_approval_index)
     }
 
@@ -422,7 +447,9 @@ impl TuiState {
     }
 
     fn scroll_down(&mut self, snapshot: &ConsoleSnapshot, lines: usize) {
-        let max_start = snapshot.total_log_count.saturating_sub(self.log_page_size.max(1));
+        let max_start = snapshot
+            .total_log_count
+            .saturating_sub(self.log_page_size.max(1));
         let current = self.current_log_start(snapshot);
         let next = current.saturating_add(lines.max(1)).min(max_start);
         self.log_start_index = next;
@@ -444,7 +471,12 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), Show, DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            Show,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
     }
 }
 

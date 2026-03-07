@@ -38,54 +38,50 @@ enable_builtin_wsl_mapping = true
 # Optional global default working directory.
 # default_working_directory = "/workspace"
 
-# Ordered execution rules.
-# Each rule matches one command and an optional argument prefix.
+# Command execution strategy.
+# Group each command with its default action and optional subcommand overrides.
 
-[[execution.rules]]
+[[execution.commands]]
 command = "java"
 action = "confirm"
 
-[[execution.rules]]
+[[execution.commands]]
 command = "mvn"
 action = "allow"
 
-[[execution.rules]]
-command = "mvn"
+[[execution.commands.rules]]
 args_prefix = ["clean", "compile"]
 action = "confirm"
 
-[[execution.rules]]
-command = "mvn"
+[[execution.commands.rules]]
 args_prefix = ["deploy"]
 action = "deny"
 
-[[execution.rules]]
+[[execution.commands]]
 command = "gradle"
 action = "allow"
 
-[[execution.rules]]
+[[execution.commands]]
 command = "npm"
 action = "allow"
 
-[[execution.rules]]
-command = "npm"
+[[execution.commands.rules]]
 args_prefix = ["publish"]
 action = "confirm"
 
-[[execution.rules]]
+[[execution.commands]]
 command = "pnpm"
 action = "allow"
 
-[[execution.rules]]
+[[execution.commands]]
 command = "cargo"
 action = "allow"
 
-[[execution.rules]]
-command = "cargo"
+[[execution.commands.rules]]
 args_prefix = ["publish"]
 action = "confirm"
 
-[[execution.rules]]
+[[execution.commands]]
 command = "rustc"
 action = "allow"
 

@@ -20,7 +20,8 @@ pub enum CommandParseError {
     Empty,
     #[error("unclosed quote in command")]
     UnclosedQuote,
-    #[error("command must contain exactly one command; shell operators like &&, ||, ;, and | are not allowed"
+    #[error(
+        "command must contain exactly one command; shell operators like &&, ||, ;, and | are not allowed"
     )]
     MultipleCommandsNotAllowed,
 }
@@ -169,13 +170,15 @@ mod tests {
 
     #[test]
     fn rejects_shell_chaining() {
-        let error = parse_command_line("cargo build && cargo test").expect_err("should reject chaining");
+        let error =
+            parse_command_line("cargo build && cargo test").expect_err("should reject chaining");
         assert_eq!(error, CommandParseError::MultipleCommandsNotAllowed);
     }
 
     #[test]
     fn allows_separator_inside_quotes() {
-        let parsed = parse_command_line("python -c \"print('a && b')\"").expect("quoted operator should be allowed");
+        let parsed = parse_command_line("python -c \"print('a && b')\"")
+            .expect("quoted operator should be allowed");
         assert_eq!(parsed.program, "python");
         assert_eq!(parsed.args, vec!["-c", "print('a && b')"]);
     }

@@ -26,8 +26,8 @@ use axum::routing::get;
 use axum::{Json, Router};
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{
-    CallToolResult, Implementation, LoggingLevel, LoggingMessageNotificationParam,
-    ProtocolVersion, ServerCapabilities, ServerInfo, SetLevelRequestParams,
+    CallToolResult, Implementation, LoggingLevel, LoggingMessageNotificationParam, ProtocolVersion,
+    ServerCapabilities, ServerInfo, SetLevelRequestParams,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::{
@@ -125,7 +125,11 @@ impl HostBridgeMcpServer {
             )
                 .await;
 
-            let approved = match self.operator_console.request_confirmation(request.clone()).await {
+            let approved = match self
+                .operator_console
+                .request_confirmation(request.clone())
+                .await
+            {
                 Ok(approved) => approved,
                 Err(ConsoleApprovalError::Unavailable) => {
                     return Ok(CallToolResult::structured_error(json!({
@@ -156,7 +160,11 @@ impl HostBridgeMcpServer {
             }
         }
 
-        let (launch, mut receiver) = match self.execution_service.launch_prepared_command(prepared).await {
+        let (launch, mut receiver) = match self
+            .execution_service
+            .launch_prepared_command(prepared)
+            .await
+        {
             Ok(result) => result,
             Err(error) => {
                 return Ok(CallToolResult::structured_error(json!({
@@ -196,7 +204,10 @@ impl HostBridgeMcpServer {
                         )
                             .await;
 
-                        if matches!(final_state, ExecutionState::Completed | ExecutionState::Failed) {
+                        if matches!(
+                            final_state,
+                            ExecutionState::Completed | ExecutionState::Failed
+                        ) {
                             break;
                         }
                     }
@@ -369,8 +380,8 @@ async fn stream_execution(
     Path(execution_id): Path<String>,
     State(state): State<HttpState>,
 ) -> Result<impl IntoResponse, axum::http::StatusCode> {
-    let execution_id = Uuid::parse_str(&execution_id)
-        .map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
+    let execution_id =
+        Uuid::parse_str(&execution_id).map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
 
     let subscription = state
         .execution_service
@@ -381,12 +392,13 @@ async fn stream_execution(
             _ => axum::http::StatusCode::BAD_REQUEST,
         })?;
 
-    let initial_event = Event::default()
-        .event("status")
-        .data(serialize_event(&ExecutionEvent::Status {
-            state: subscription.current_state,
-            message: Some("Subscribed to execution stream".to_string()),
-        }));
+    let initial_event =
+        Event::default()
+            .event("status")
+            .data(serialize_event(&ExecutionEvent::Status {
+                state: subscription.current_state,
+                message: Some("Subscribed to execution stream".to_string()),
+            }));
 
     let initial_stream = once(Ok::<Event, Infallible>(initial_event));
     let updates = BroadcastStream::new(subscription.receiver).filter_map(|event| match event {
@@ -461,7 +473,8 @@ struct OutputSpool {
 
 impl OutputSpool {
     fn new(prefix: &str) -> io::Result<Self> {
-        let path = std::env::temp_dir().join(format!("host-bridge-mcp-{prefix}-{}.log", Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("host-bridge-mcp-{prefix}-{}.log", Uuid::new_v4()));
         let file = OpenOptions::new()
             .create(true)
             .truncate(true)

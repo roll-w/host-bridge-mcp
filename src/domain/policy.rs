@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-use crate::config::{AppConfig, ExecutionRule, PolicyAction};
-use std::path::Path;
+use crate::config::{AppConfig, CommandPolicyConfig, CommandRuleConfig, PolicyAction};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyDecision {
@@ -48,17 +47,12 @@ struct CompiledExecutionRule {
 
 impl PolicyEngine {
     pub fn new(config: AppConfig) -> Self {
-        let rules = config
-            .execution
-            .rules
-            .into_iter()
-            .enumerate()
-            .map(compile_rule)
-            .collect::<Vec<_>>();
+        let execution = config.execution;
+        let rules = compile_command_policies(&execution.commands);
 
         Self {
-            default_action: config.execution.default_action,
-            default_working_directory: config.execution.default_working_directory,
+            default_action: execution.default_action,
+            default_working_directory: execution.default_working_directory,
             rules,
         }
     }
@@ -72,7 +66,9 @@ impl PolicyEngine {
         let matching_rule = self
             .rules
             .iter()
-            .filter(|rule| rule.command == key && prefix_match(&rule.args_prefix, &normalized_arguments))
+            .filter(|rule| {
+                rule.command == key && prefix_match(&rule.args_prefix, &normalized_arguments)
+            })
             .max_by_key(|rule| (rule.args_prefix.len(), rule.order));
 
         let action = matching_rule
@@ -96,16 +92,46 @@ impl PolicyEngine {
     }
 }
 
-fn compile_rule((order, rule): (usize, ExecutionRule)) -> CompiledExecutionRule {
+fn compile_command_policies(commands: &[CommandPolicyConfig]) -> Vec<CompiledExecutionRule> {
+    let mut compiled_rules = Vec::new();
+    let mut order = 0;
+
+    for command_policy in commands {
+        compiled_rules.push(CompiledExecutionRule {
+            command: normalize_command(&command_policy.command),
+            args_prefix: Vec::new(),
+            action: command_policy.action,
+            default_working_directory: command_policy.default_working_directory.clone(),
+            order,
+        });
+        order += 1;
+
+        for rule in &command_policy.rules {
+            compiled_rules.push(compile_nested_rule(order, command_policy, rule));
+            order += 1;
+        }
+    }
+
+    compiled_rules
+}
+
+fn compile_nested_rule(
+    order: usize,
+    command_policy: &CommandPolicyConfig,
+    rule: &CommandRuleConfig,
+) -> CompiledExecutionRule {
     CompiledExecutionRule {
-        command: normalize_command(&rule.command),
+        command: normalize_command(&command_policy.command),
         args_prefix: rule
             .args_prefix
             .iter()
             .map(|token| normalize_subcommand_token(token))
             .collect(),
         action: rule.action,
-        default_working_directory: rule.default_working_directory,
+        default_working_directory: rule
+            .default_working_directory
+            .clone()
+            .or_else(|| command_policy.default_working_directory.clone()),
         order,
     }
 }
@@ -138,10 +164,7 @@ pub fn normalize_command(command_token: &str) -> String {
         return String::new();
     }
 
-    let name = Path::new(trimmed)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or(trimmed);
+    let name = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed);
 
     strip_windows_suffix(name).to_ascii_lowercase()
 }
@@ -172,7 +195,10 @@ fn strip_ascii_case_suffix<'a>(value: &'a str, suffix: &str) -> Option<&'a str> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ExecutionConfig, ExecutionRule, LoggingConfig, PolicyAction, ServerConfig};
+    use crate::config::{
+        CommandPolicyConfig, CommandRuleConfig, ExecutionConfig, LoggingConfig, PolicyAction,
+        ServerConfig,
+    };
 
     #[test]
     fn normalize_command_removes_windows_suffix() {
@@ -201,20 +227,16 @@ mod tests {
             server: ServerConfig::default(),
             execution: ExecutionConfig {
                 default_action: PolicyAction::Allow,
-                rules: vec![
-                    ExecutionRule {
-                        command: "mvn".to_string(),
-                        args_prefix: Vec::new(),
-                        action: PolicyAction::Allow,
-                        default_working_directory: None,
-                    },
-                    ExecutionRule {
-                        command: "mvn".to_string(),
+                commands: vec![CommandPolicyConfig {
+                    command: "mvn".to_string(),
+                    action: PolicyAction::Allow,
+                    default_working_directory: None,
+                    rules: vec![CommandRuleConfig {
                         args_prefix: vec!["clean".to_string(), "install".to_string()],
                         action: PolicyAction::Deny,
                         default_working_directory: None,
-                    },
-                ],
+                    }],
+                }],
                 ..ExecutionConfig::default()
             },
             logging: LoggingConfig::default(),
@@ -231,20 +253,23 @@ mod tests {
             server: ServerConfig::default(),
             execution: ExecutionConfig {
                 default_action: PolicyAction::Confirm,
-                rules: vec![
-                    ExecutionRule {
-                        command: "npm".to_string(),
-                        args_prefix: vec!["run".to_string()],
-                        action: PolicyAction::Allow,
-                        default_working_directory: None,
-                    },
-                    ExecutionRule {
-                        command: "npm".to_string(),
-                        args_prefix: vec!["run".to_string(), "build".to_string()],
-                        action: PolicyAction::Deny,
-                        default_working_directory: None,
-                    },
-                ],
+                commands: vec![CommandPolicyConfig {
+                    command: "npm".to_string(),
+                    action: PolicyAction::Confirm,
+                    default_working_directory: None,
+                    rules: vec![
+                        CommandRuleConfig {
+                            args_prefix: vec!["run".to_string()],
+                            action: PolicyAction::Allow,
+                            default_working_directory: None,
+                        },
+                        CommandRuleConfig {
+                            args_prefix: vec!["run".to_string(), "build".to_string()],
+                            action: PolicyAction::Deny,
+                            default_working_directory: None,
+                        },
+                    ],
+                }],
                 ..ExecutionConfig::default()
             },
             logging: LoggingConfig::default(),
@@ -261,20 +286,23 @@ mod tests {
             server: ServerConfig::default(),
             execution: ExecutionConfig {
                 default_action: PolicyAction::Confirm,
-                rules: vec![
-                    ExecutionRule {
-                        command: "cargo".to_string(),
-                        args_prefix: vec!["build".to_string()],
-                        action: PolicyAction::Allow,
-                        default_working_directory: None,
-                    },
-                    ExecutionRule {
-                        command: "cargo".to_string(),
-                        args_prefix: vec!["build".to_string()],
-                        action: PolicyAction::Deny,
-                        default_working_directory: None,
-                    },
-                ],
+                commands: vec![CommandPolicyConfig {
+                    command: "cargo".to_string(),
+                    action: PolicyAction::Confirm,
+                    default_working_directory: None,
+                    rules: vec![
+                        CommandRuleConfig {
+                            args_prefix: vec!["build".to_string()],
+                            action: PolicyAction::Allow,
+                            default_working_directory: None,
+                        },
+                        CommandRuleConfig {
+                            args_prefix: vec!["build".to_string()],
+                            action: PolicyAction::Deny,
+                            default_working_directory: None,
+                        },
+                    ],
+                }],
                 ..ExecutionConfig::default()
             },
             logging: LoggingConfig::default(),
@@ -283,5 +311,43 @@ mod tests {
         let engine = PolicyEngine::new(config);
         let result = engine.evaluate("cargo", &["build".to_string()]);
         assert_eq!(result.decision, PolicyDecision::Deny);
+    }
+
+    #[test]
+    fn grouped_command_policy_uses_command_action_and_nested_override() {
+        let config = AppConfig {
+            server: ServerConfig::default(),
+            execution: ExecutionConfig {
+                default_action: PolicyAction::Confirm,
+                commands: vec![CommandPolicyConfig {
+                    command: "npm".to_string(),
+                    action: PolicyAction::Allow,
+                    default_working_directory: Some("/workspace/frontend".to_string()),
+                    rules: vec![CommandRuleConfig {
+                        args_prefix: vec!["publish".to_string()],
+                        action: PolicyAction::Deny,
+                        default_working_directory: None,
+                    }],
+                }],
+                ..ExecutionConfig::default()
+            },
+            logging: LoggingConfig::default(),
+        };
+
+        let engine = PolicyEngine::new(config);
+
+        let install_result = engine.evaluate("npm", &["install".to_string()]);
+        assert_eq!(install_result.decision, PolicyDecision::Allow);
+        assert_eq!(
+            install_result.default_working_directory,
+            Some("/workspace/frontend".to_string())
+        );
+
+        let publish_result = engine.evaluate("npm", &["publish".to_string()]);
+        assert_eq!(publish_result.decision, PolicyDecision::Deny);
+        assert_eq!(
+            publish_result.default_working_directory,
+            Some("/workspace/frontend".to_string())
+        );
     }
 }

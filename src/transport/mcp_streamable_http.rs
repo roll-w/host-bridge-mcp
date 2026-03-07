@@ -15,9 +15,10 @@
  */
 
 use crate::application::execution_service::{
-    ConfirmationRequest, ExecuteCommandInput, ExecutionError, ExecutionEvent, ExecutionService,
-    ExecutionState, OutputKind,
+    ExecuteCommandInput, ExecutionError, ExecutionEvent, ExecutionService, ExecutionState,
+    OutputKind,
 };
+use crate::application::operator_console::{ConsoleApprovalError, OperatorConsole};
 use axum::extract::{Path, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
@@ -25,9 +26,8 @@ use axum::routing::get;
 use axum::{Json, Router};
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{
-    CallToolResult, CreateElicitationRequestParams, ElicitationAction, ElicitationSchema,
-    Implementation, LoggingLevel, LoggingMessageNotificationParam, ProtocolVersion,
-    ServerCapabilities, ServerInfo, SetLevelRequestParams,
+    CallToolResult, Implementation, LoggingLevel, LoggingMessageNotificationParam,
+    ProtocolVersion, ServerCapabilities, ServerInfo, SetLevelRequestParams,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::{
@@ -38,6 +38,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::path::PathBuf;
 use std::time::Duration;
 use tokio_stream::once;
 use tokio_stream::wrappers::BroadcastStream;
@@ -52,11 +55,18 @@ pub struct HttpState {
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct ExecuteCommandToolArgs {
+    /// Run exactly one executable plus its arguments.
+    /// Shell chaining operators such as `&&`, `||`, `;`, and `|` are rejected.
     command: String,
+    /// Optional host working directory.
+    /// The server applies configured path mappings before execution.
     #[serde(default)]
     working_directory: Option<String>,
+    /// Optional environment variables injected into the child process.
     #[serde(default)]
     env: HashMap<String, String>,
+    /// Optional timeout in milliseconds.
+    /// Values above the server maximum are clamped.
     #[serde(default)]
     timeout_ms: Option<u64>,
 }
@@ -64,19 +74,25 @@ struct ExecuteCommandToolArgs {
 #[derive(Clone)]
 struct HostBridgeMcpServer {
     execution_service: ExecutionService,
+    operator_console: OperatorConsole,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl HostBridgeMcpServer {
-    pub fn new(execution_service: ExecutionService) -> Self {
+    pub fn new(execution_service: ExecutionService, operator_console: OperatorConsole) -> Self {
         Self {
             execution_service,
+            operator_console,
             tool_router: Self::tool_router(),
         }
     }
 
-    #[tool(description = "Execute a single command string on host toolchains and stream output.")]
+    #[tool(
+        description = "Execute exactly one host command without shell chaining. If approval is required, the call stays \
+        pending until the TUI operator approves or rejects it, then returns the full stdout and stderr after the process \
+        exits."
+    )]
     async fn execute_command(
         &self,
         Parameters(args): Parameters<ExecuteCommandToolArgs>,
@@ -89,126 +105,151 @@ impl HostBridgeMcpServer {
             timeout_ms: args.timeout_ms,
         };
 
-        let (_launch, mut receiver) =
-            match self.execution_service.submit_command_stream(input.clone()).await {
-                Ok(result) => result,
-                Err(ExecutionError::ConfirmationRequired(request)) => {
-                    let _ = notify_mcp_log(
-                        &context.peer,
-                        LoggingLevel::Info,
-                        json!({
-                        "type": "confirmation_required",
-                        "preview": request,
-                    }),
-                    )
-                        .await;
-
-                    let approved = match request_user_confirmation(&context.peer, &request).await {
-                        Ok(approved) => approved,
-                        Err(message) => {
-                            return Ok(CallToolResult::structured_error(json!({ "message": message })));
-                        }
-                    };
-
-                    if !approved {
-                        return Ok(CallToolResult::structured_error(json!({
-                        "message": "command confirmation was rejected"
-                    })));
-                    }
-
-                    match self.execution_service.submit_command_stream(input.clone()).await {
-                        Ok(result) => result,
-                        Err(error) => {
-                            return Ok(CallToolResult::structured_error(json!({
-                            "message": error.to_string()
-                        })));
-                        }
-                    }
-                }
-                Err(error) => {
-                    return Ok(CallToolResult::structured_error(json!({
+        let prepared = match self.execution_service.prepare_command(input).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return Ok(CallToolResult::structured_error(json!({
                     "message": error.to_string()
                 })));
+            }
+        };
+
+        if let Some(request) = prepared.confirmation_request().cloned() {
+            let _ = notify_mcp_log(
+                &context.peer,
+                LoggingLevel::Info,
+                json!({
+                    "type": "approval_pending",
+                    "preview": request,
+                }),
+            )
+                .await;
+
+            let approved = match self.operator_console.request_confirmation(request.clone()).await {
+                Ok(approved) => approved,
+                Err(ConsoleApprovalError::Unavailable) => {
+                    return Ok(CallToolResult::structured_error(json!({
+                        "message": "command requires confirmation but the TUI is unavailable"
+                    })));
+                }
+                Err(ConsoleApprovalError::Cancelled) => {
+                    return Ok(CallToolResult::structured_error(json!({
+                        "message": "command confirmation was cancelled before completion"
+                    })));
                 }
             };
+
+            let _ = notify_mcp_log(
+                &context.peer,
+                LoggingLevel::Info,
+                json!({
+                    "type": "approval_resolved",
+                    "approved": approved,
+                }),
+            )
+                .await;
+
+            if !approved {
+                return Ok(CallToolResult::structured_error(json!({
+                    "message": "command confirmation was rejected"
+                })));
+            }
+        }
+
+        let (launch, mut receiver) = match self.execution_service.launch_prepared_command(prepared).await {
+            Ok(result) => result,
+            Err(error) => {
+                return Ok(CallToolResult::structured_error(json!({
+                    "message": error.to_string()
+                })));
+            }
+        };
 
         let mut final_state = ExecutionState::Running;
         let mut exit_code: Option<i32> = None;
         let mut exit_success: Option<bool> = None;
         let mut exit_timed_out: Option<bool> = None;
         let mut last_status_message: Option<String> = None;
+        let mut output_accumulator = match OutputAccumulator::new() {
+            Ok(accumulator) => accumulator,
+            Err(error) => {
+                return Ok(CallToolResult::structured_error(json!({
+                    "message": format!("failed to initialize output spool files: {error}")
+                })));
+            }
+        };
 
         loop {
             match receiver.recv().await {
-                Ok(event) => {
-                    match event {
-                        ExecutionEvent::Status { state, message } => {
-                            final_state = state;
-                            last_status_message = message.clone();
-                            let _ = notify_mcp_log(
-                                &context.peer,
-                                LoggingLevel::Info,
-                                json!({
-                                    "type": "status",
-                                    "state": final_state,
-                                    "message": message,
-                                }),
-                            )
-                                .await;
+                Ok(event) => match event {
+                    ExecutionEvent::Status { state, message } => {
+                        final_state = state;
+                        last_status_message = message.clone();
+                        let _ = notify_mcp_log(
+                            &context.peer,
+                            LoggingLevel::Info,
+                            json!({
+                                "type": "status",
+                                "state": final_state,
+                                "message": message,
+                            }),
+                        )
+                            .await;
 
-                            if matches!(final_state, ExecutionState::Completed | ExecutionState::Failed) {
-                                break;
-                            }
-                        }
-                        ExecutionEvent::Output { stream, text } => {
-                            let level = match stream {
-                                OutputKind::Stdout => LoggingLevel::Info,
-                                OutputKind::Stderr => LoggingLevel::Error,
-                            };
-                            let _ = notify_mcp_log(
-                                &context.peer,
-                                level,
-                                json!({
-                                    "type": "output",
-                                    "stream": stream,
-                                    "text": text,
-                                }),
-                            )
-                                .await;
-                        }
-                        ExecutionEvent::Exit {
-                            code,
-                            success,
-                            timed_out,
-                        } => {
-                            exit_code = Some(code);
-                            exit_success = Some(success);
-                            exit_timed_out = Some(timed_out);
-                            let _ = notify_mcp_log(
-                                &context.peer,
-                                LoggingLevel::Info,
-                                json!({
-                                    "type": "exit",
-                                    "code": code,
-                                    "success": success,
-                                    "timedOut": timed_out,
-                                }),
-                            )
-                                .await;
-                        }
-                        ExecutionEvent::Error { message } => {
-                            let _ = notify_mcp_log(
-                                &context.peer,
-                                LoggingLevel::Error,
-                                json!({
-                                    "type": "error",
-                                    "message": message,
-                                }),
-                            )
-                                .await;
+                        if matches!(final_state, ExecutionState::Completed | ExecutionState::Failed) {
+                            break;
                         }
                     }
-                }
+                    ExecutionEvent::Output { stream, text } => {
+                        output_accumulator.push(&stream, &text);
+
+                        let level = match stream {
+                            OutputKind::Stdout => LoggingLevel::Info,
+                            OutputKind::Stderr => LoggingLevel::Error,
+                        };
+                        let _ = notify_mcp_log(
+                            &context.peer,
+                            level,
+                            json!({
+                                "type": "output",
+                                "stream": stream,
+                                "text": text,
+                            }),
+                        )
+                            .await;
+                    }
+                    ExecutionEvent::Exit {
+                        code,
+                        success,
+                        timed_out,
+                    } => {
+                        exit_code = Some(code);
+                        exit_success = Some(success);
+                        exit_timed_out = Some(timed_out);
+                        let _ = notify_mcp_log(
+                            &context.peer,
+                            LoggingLevel::Info,
+                            json!({
+                                "type": "exit",
+                                "code": code,
+                                "success": success,
+                                "timedOut": timed_out,
+                            }),
+                        )
+                            .await;
+                    }
+                    ExecutionEvent::Error { message } => {
+                        let _ = notify_mcp_log(
+                            &context.peer,
+                            LoggingLevel::Error,
+                            json!({
+                                "type": "error",
+                                "message": message,
+                            }),
+                        )
+                            .await;
+                    }
+                },
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     let _ = notify_mcp_log(
                         &context.peer,
@@ -226,7 +267,10 @@ impl HostBridgeMcpServer {
             }
         }
 
+        let (stdout, stderr) = output_accumulator.finish();
+
         Ok(CallToolResult::structured(json!({
+            "executionId": launch.execution_id,
             "status": final_state,
             "exit": {
                 "code": exit_code.unwrap_or(-1),
@@ -234,12 +278,23 @@ impl HostBridgeMcpServer {
                 "timedOut": exit_timed_out.unwrap_or(false)
             },
             "message": last_status_message,
+            "stdout": stdout,
+            "stderr": stderr,
         })))
     }
 }
 
 #[tool_handler]
 impl ServerHandler for HostBridgeMcpServer {
+    async fn set_level(
+        &self,
+        request: SetLevelRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        tracing::debug!(level = ?request.level, "Client set MCP logging level");
+        Ok(())
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder()
@@ -250,18 +305,9 @@ impl ServerHandler for HostBridgeMcpServer {
             .with_server_info(Implementation::from_build_env())
             .with_protocol_version(ProtocolVersion::LATEST)
             .with_instructions(
-                "Host bridge MCP server exposing execute_command tool with real-time command output stream."
+                "Host bridge MCP server exposing execute_command with TUI approvals, blocking completion, and full stdout/stderr return."
                     .to_string(),
             )
-    }
-
-    async fn set_level(
-        &self,
-        request: SetLevelRequestParams,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<(), McpError> {
-        tracing::debug!(level = ?request.level, "Client set MCP logging level");
-        Ok(())
     }
 }
 
@@ -284,72 +330,13 @@ async fn notify_mcp_log(
     Ok(())
 }
 
-async fn request_user_confirmation(
-    peer: &rmcp::service::Peer<RoleServer>,
-    request: &ConfirmationRequest,
-) -> Result<bool, String> {
-    let message = format_confirmation_message(request);
-    let requested_schema = ElicitationSchema::builder()
-        .required_bool("approved")
-        .build()
-        .map_err(|error| format!("invalid confirmation schema: {error}"))?;
-    let params = CreateElicitationRequestParams::FormElicitationParams {
-        meta: None,
-        message,
-        requested_schema,
-    };
-
-    let result = peer
-        .create_elicitation(params)
-        .await
-        .map_err(|error| format!("confirmation required but elicitation failed: {error}"))?;
-
-    if result.action != ElicitationAction::Accept {
-        return Ok(false);
-    }
-
-    let approved = result
-        .content
-        .as_ref()
-        .and_then(|value| value.get("approved"))
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
-    Ok(approved)
-}
-
-fn format_confirmation_message(request: &ConfirmationRequest) -> String {
-    let mut lines = Vec::new();
-    lines.push("Command requires confirmation.".to_string());
-    lines.push("".to_string());
-    lines.push(format!("commandLine: {}", request.command_line));
-    lines.push(format!("executable : {}", request.executable));
-    lines.push(format!("args       : {:?}", request.args));
-    lines.push(format!("workdir    : {}", request.working_directory));
-    lines.push(format!("timeoutMs  : {}", request.timeout_ms));
-
-    if request.env.is_empty() {
-        lines.push("env        : <none>".to_string());
-    } else {
-        lines.push("env        :".to_string());
-        let mut keys = request.env.keys().collect::<Vec<_>>();
-        keys.sort();
-        for key in keys {
-            let value = request.env.get(key).map(String::as_str).unwrap_or("");
-            lines.push(format!("  {key}={value}"));
-        }
-    }
-
-    lines.push("".to_string());
-    lines.push("Approve execution?".to_string());
-    lines.join("\n")
-}
-
-pub fn router(execution_service: ExecutionService) -> Router {
+pub fn router(execution_service: ExecutionService, operator_console: OperatorConsole) -> Router {
     let stream_state = HttpState {
         execution_service: execution_service.clone(),
     };
 
     let mcp_execution_service = execution_service.clone();
+    let mcp_operator_console = operator_console.clone();
     let mcp_config = StreamableHttpServerConfig {
         stateful_mode: true,
         json_response: false,
@@ -358,7 +345,10 @@ pub fn router(execution_service: ExecutionService) -> Router {
     let mcp_service: StreamableHttpService<HostBridgeMcpServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || {
-                Ok(HostBridgeMcpServer::new(mcp_execution_service.clone()))
+                Ok(HostBridgeMcpServer::new(
+                    mcp_execution_service.clone(),
+                    mcp_operator_console.clone(),
+                ))
             },
             LocalSessionManager::default().into(),
             mcp_config,
@@ -435,4 +425,65 @@ fn serialize_event(event: &ExecutionEvent) -> String {
         })
             .to_string()
     })
+}
+
+struct OutputAccumulator {
+    stdout: OutputSpool,
+    stderr: OutputSpool,
+}
+
+impl OutputAccumulator {
+    fn new() -> io::Result<Self> {
+        Ok(Self {
+            stdout: OutputSpool::new("stdout")?,
+            stderr: OutputSpool::new("stderr")?,
+        })
+    }
+
+    fn push(&mut self, stream: &OutputKind, text: &str) {
+        let spool = match stream {
+            OutputKind::Stdout => &mut self.stdout,
+            OutputKind::Stderr => &mut self.stderr,
+        };
+
+        spool.append(text);
+    }
+
+    fn finish(self) -> (String, String) {
+        (self.stdout.read_all(), self.stderr.read_all())
+    }
+}
+
+struct OutputSpool {
+    path: PathBuf,
+    file: File,
+}
+
+impl OutputSpool {
+    fn new(prefix: &str) -> io::Result<Self> {
+        let path = std::env::temp_dir().join(format!("host-bridge-mcp-{prefix}-{}.log", Uuid::new_v4()));
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&path)?;
+
+        Ok(Self { path, file })
+    }
+
+    fn append(&mut self, text: &str) {
+        let _ = self.file.write_all(text.as_bytes());
+    }
+
+    fn read_all(mut self) -> String {
+        let _ = self.file.flush();
+        fs::read_to_string(&self.path).unwrap_or_default()
+    }
+}
+
+impl Drop for OutputSpool {
+    fn drop(&mut self) {
+        let _ = self.file.flush();
+        let _ = fs::remove_file(&self.path);
+    }
 }

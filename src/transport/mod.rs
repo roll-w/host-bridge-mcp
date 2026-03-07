@@ -15,3 +15,4 @@
  */
 
 pub mod mcp_streamable_http;
+pub mod tui;

@@ -15,7 +15,6 @@
  */
 
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::path::Path;
 
 const CONFIG_ENV_KEY: &str = "HOST_BRIDGE_CONFIG";
@@ -26,6 +25,7 @@ const DEFAULT_CONFIG_FILE: &str = "host-bridge.toml";
 pub struct AppConfig {
     pub server: ServerConfig,
     pub execution: ExecutionConfig,
+    pub logging: LoggingConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -36,9 +36,18 @@ pub struct ServerConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+pub struct LoggingConfig {
+    pub memory_buffer_lines: usize,
+    pub file_path: Option<String>,
+    pub persist_file: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct ExecutionConfig {
-    pub default_policy: PolicyAction,
-    pub command_policies: HashMap<String, CommandPolicy>,
+    #[serde(alias = "default_policy")]
+    pub default_action: PolicyAction,
+    pub rules: Vec<ExecutionRule>,
     pub default_working_directory: Option<String>,
     pub path_mappings: Vec<PathMappingRule>,
     pub target_platform: TargetPlatform,
@@ -48,16 +57,10 @@ pub struct ExecutionConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct CommandPolicy {
-    pub action: Option<PolicyAction>,
-    pub default_working_directory: Option<String>,
-    pub subcommand_policies: Vec<SubcommandPolicy>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct SubcommandPolicy {
-    pub when: String,
+pub struct ExecutionRule {
+    pub command: String,
+    #[serde(default)]
+    pub args_prefix: Vec<String>,
     pub action: PolicyAction,
     pub default_working_directory: Option<String>,
 }
@@ -121,6 +124,7 @@ impl Default for AppConfig {
         Self {
             server: ServerConfig::default(),
             execution: ExecutionConfig::default(),
+            logging: LoggingConfig::default(),
         }
     }
 }
@@ -133,27 +137,27 @@ impl Default for ServerConfig {
     }
 }
 
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            memory_buffer_lines: 2_000,
+            file_path: None,
+            persist_file: false,
+        }
+    }
+}
+
 impl Default for ExecutionConfig {
     fn default() -> Self {
         Self {
-            default_policy: PolicyAction::Confirm,
-            command_policies: HashMap::new(),
+            default_action: PolicyAction::Confirm,
+            rules: Vec::new(),
             default_working_directory: None,
             path_mappings: Vec::new(),
             target_platform: TargetPlatform::Auto,
             enable_builtin_wsl_mapping: true,
             default_timeout_ms: 30 * 60 * 1000,
             max_timeout_ms: 2 * 60 * 60 * 1000,
-        }
-    }
-}
-
-impl Default for CommandPolicy {
-    fn default() -> Self {
-        Self {
-            action: None,
-            default_working_directory: None,
-            subcommand_policies: Vec::new(),
         }
     }
 }
@@ -204,19 +208,24 @@ impl AppConfig {
             ));
         }
 
-        for (command, _) in &self.execution.command_policies {
-            if command.trim().is_empty() {
-                return Err(ConfigError::Validation(
-                    "execution.command_policies key cannot be empty".to_string(),
-                ));
-            }
+        if self.execution.max_timeout_ms < self.execution.default_timeout_ms {
+            return Err(ConfigError::Validation(
+                "execution.max_timeout_ms must be greater than or equal to execution.default_timeout_ms"
+                    .to_string(),
+            ));
         }
 
-        for (command, policy) in &self.execution.command_policies {
-            for subcommand_policy in &policy.subcommand_policies {
-                if subcommand_policy.when.trim().is_empty() {
+        for (index, rule) in self.execution.rules.iter().enumerate() {
+            if rule.command.trim().is_empty() {
+                return Err(ConfigError::Validation(
+                    format!("execution.rules[{index}].command cannot be empty"),
+                ));
+            }
+
+            for (arg_index, token) in rule.args_prefix.iter().enumerate() {
+                if token.trim().is_empty() {
                     return Err(ConfigError::Validation(format!(
-                        "execution.command_policies.{command}.subcommand_policies.when cannot be empty"
+                        "execution.rules[{index}].args_prefix[{arg_index}] cannot be empty"
                     )));
                 }
             }
@@ -226,6 +235,20 @@ impl AppConfig {
             if rule.from.trim().is_empty() || rule.to.trim().is_empty() {
                 return Err(ConfigError::Validation(
                     "execution.path_mappings entries require non-empty from/to".to_string(),
+                ));
+            }
+        }
+
+        if self.logging.memory_buffer_lines == 0 {
+            return Err(ConfigError::Validation(
+                "logging.memory_buffer_lines must be greater than zero".to_string(),
+            ));
+        }
+
+        if let Some(path) = &self.logging.file_path {
+            if path.trim().is_empty() {
+                return Err(ConfigError::Validation(
+                    "logging.file_path cannot be empty when provided".to_string(),
                 ));
             }
         }
@@ -241,5 +264,25 @@ mod tests {
     #[test]
     fn default_config_is_valid() {
         assert!(AppConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn reject_rule_with_empty_command() {
+        let config = AppConfig {
+            server: ServerConfig::default(),
+            execution: ExecutionConfig {
+                rules: vec![ExecutionRule {
+                    command: "   ".to_string(),
+                    args_prefix: Vec::new(),
+                    action: PolicyAction::Allow,
+                    default_working_directory: None,
+                }],
+                ..ExecutionConfig::default()
+            },
+            logging: LoggingConfig::default(),
+        };
+
+        let error = config.validate().expect_err("config should be invalid");
+        assert!(error.to_string().contains("execution.rules[0].command"));
     }
 }

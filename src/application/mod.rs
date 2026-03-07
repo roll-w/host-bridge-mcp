@@ -16,3 +16,5 @@
 
 pub mod command_parser;
 pub mod execution_service;
+pub mod operator_console;
+pub mod shutdown_controller;

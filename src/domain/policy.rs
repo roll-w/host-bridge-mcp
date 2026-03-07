@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-use crate::config::{AppConfig, CommandPolicy, PolicyAction, SubcommandPolicy};
-use std::collections::HashMap;
+use crate::config::{AppConfig, ExecutionRule, PolicyAction};
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,34 +34,49 @@ pub struct PolicyResult {
 pub struct PolicyEngine {
     default_action: PolicyAction,
     default_working_directory: Option<String>,
-    command_policies: HashMap<String, CommandPolicy>,
+    rules: Vec<CompiledExecutionRule>,
+}
+
+#[derive(Debug, Clone)]
+struct CompiledExecutionRule {
+    command: String,
+    args_prefix: Vec<String>,
+    action: PolicyAction,
+    default_working_directory: Option<String>,
+    order: usize,
 }
 
 impl PolicyEngine {
     pub fn new(config: AppConfig) -> Self {
-        let command_policies = config
+        let rules = config
             .execution
-            .command_policies
+            .rules
             .into_iter()
-            .map(|(key, policy)| (normalize_command(&key), policy))
-            .collect::<HashMap<_, _>>();
+            .enumerate()
+            .map(compile_rule)
+            .collect::<Vec<_>>();
 
         Self {
-            default_action: config.execution.default_policy,
+            default_action: config.execution.default_action,
             default_working_directory: config.execution.default_working_directory,
-            command_policies,
+            rules,
         }
     }
 
     pub fn evaluate(&self, command_token: &str, command_arguments: &[String]) -> PolicyResult {
         let key = normalize_command(command_token);
-        let command_policy = self.command_policies.get(&key);
-        let subcommand_policy =
-            command_policy.and_then(|policy| best_subcommand_policy(policy, command_arguments));
+        let normalized_arguments = command_arguments
+            .iter()
+            .map(|argument| normalize_subcommand_token(argument))
+            .collect::<Vec<_>>();
+        let matching_rule = self
+            .rules
+            .iter()
+            .filter(|rule| rule.command == key && prefix_match(&rule.args_prefix, &normalized_arguments))
+            .max_by_key(|rule| (rule.args_prefix.len(), rule.order));
 
-        let action = subcommand_policy
-            .map(|policy| policy.action)
-            .or_else(|| command_policy.and_then(|policy| policy.action))
+        let action = matching_rule
+            .map(|rule| rule.action)
             .unwrap_or(self.default_action);
 
         let decision = match action {
@@ -71,9 +85,8 @@ impl PolicyEngine {
             PolicyAction::Confirm => PolicyDecision::RequireConfirmation,
         };
 
-        let default_working_directory = subcommand_policy
-            .and_then(extract_subcommand_working_directory)
-            .or_else(|| command_policy.and_then(extract_working_directory))
+        let default_working_directory = matching_rule
+            .and_then(extract_working_directory)
             .or_else(|| self.default_working_directory.clone());
 
         PolicyResult {
@@ -83,40 +96,18 @@ impl PolicyEngine {
     }
 }
 
-fn best_subcommand_policy<'a>(
-    command_policy: &'a CommandPolicy,
-    command_arguments: &[String],
-) -> Option<&'a SubcommandPolicy> {
-    let normalized_arguments = command_arguments
-        .iter()
-        .map(|argument| normalize_subcommand_token(argument))
-        .collect::<Vec<_>>();
-
-    let mut best_match: Option<(&SubcommandPolicy, usize)> = None;
-    for subcommand_policy in &command_policy.subcommand_policies {
-        let pattern_tokens = tokenize_subcommand_pattern(&subcommand_policy.when);
-        if pattern_tokens.is_empty() || !prefix_match(&pattern_tokens, &normalized_arguments) {
-            continue;
-        }
-
-        let should_replace = match best_match {
-            Some((_, current_len)) => pattern_tokens.len() > current_len,
-            None => true,
-        };
-        if should_replace {
-            best_match = Some((subcommand_policy, pattern_tokens.len()));
-        }
+fn compile_rule((order, rule): (usize, ExecutionRule)) -> CompiledExecutionRule {
+    CompiledExecutionRule {
+        command: normalize_command(&rule.command),
+        args_prefix: rule
+            .args_prefix
+            .iter()
+            .map(|token| normalize_subcommand_token(token))
+            .collect(),
+        action: rule.action,
+        default_working_directory: rule.default_working_directory,
+        order,
     }
-
-    best_match.map(|(policy, _)| policy)
-}
-
-fn tokenize_subcommand_pattern(pattern: &str) -> Vec<String> {
-    pattern
-        .split_whitespace()
-        .map(normalize_subcommand_token)
-        .filter(|token| !token.is_empty())
-        .collect::<Vec<_>>()
 }
 
 fn normalize_subcommand_token(value: &str) -> String {
@@ -137,11 +128,7 @@ fn prefix_match(pattern_tokens: &[String], input_tokens: &[String]) -> bool {
     true
 }
 
-fn extract_working_directory(policy: &CommandPolicy) -> Option<String> {
-    policy.default_working_directory.clone()
-}
-
-fn extract_subcommand_working_directory(policy: &SubcommandPolicy) -> Option<String> {
+fn extract_working_directory(policy: &CompiledExecutionRule) -> Option<String> {
     policy.default_working_directory.clone()
 }
 
@@ -185,8 +172,7 @@ fn strip_ascii_case_suffix<'a>(value: &'a str, suffix: &str) -> Option<&'a str> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ExecutionConfig, PolicyAction, ServerConfig, SubcommandPolicy};
-    use std::collections::HashMap;
+    use crate::config::{ExecutionConfig, ExecutionRule, LoggingConfig, PolicyAction, ServerConfig};
 
     #[test]
     fn normalize_command_removes_windows_suffix() {
@@ -198,10 +184,10 @@ mod tests {
         let config = AppConfig {
             server: ServerConfig::default(),
             execution: ExecutionConfig {
-                default_policy: PolicyAction::Confirm,
-                command_policies: HashMap::new(),
+                default_action: PolicyAction::Confirm,
                 ..ExecutionConfig::default()
             },
+            logging: LoggingConfig::default(),
         };
         let engine = PolicyEngine::new(config);
 
@@ -211,27 +197,27 @@ mod tests {
 
     #[test]
     fn subcommand_policy_overrides_command_policy() {
-        let mut command_policies = HashMap::new();
-        command_policies.insert(
-            "mvn".to_string(),
-            CommandPolicy {
-                action: Some(PolicyAction::Allow),
-                default_working_directory: None,
-                subcommand_policies: vec![SubcommandPolicy {
-                    when: "clean install".to_string(),
-                    action: PolicyAction::Deny,
-                    default_working_directory: None,
-                }],
-            },
-        );
-
         let config = AppConfig {
             server: ServerConfig::default(),
             execution: ExecutionConfig {
-                default_policy: PolicyAction::Allow,
-                command_policies,
+                default_action: PolicyAction::Allow,
+                rules: vec![
+                    ExecutionRule {
+                        command: "mvn".to_string(),
+                        args_prefix: Vec::new(),
+                        action: PolicyAction::Allow,
+                        default_working_directory: None,
+                    },
+                    ExecutionRule {
+                        command: "mvn".to_string(),
+                        args_prefix: vec!["clean".to_string(), "install".to_string()],
+                        action: PolicyAction::Deny,
+                        default_working_directory: None,
+                    },
+                ],
                 ..ExecutionConfig::default()
             },
+            logging: LoggingConfig::default(),
         };
         let engine = PolicyEngine::new(config);
 
@@ -241,38 +227,61 @@ mod tests {
 
     #[test]
     fn longest_subcommand_pattern_wins() {
-        let mut command_policies = HashMap::new();
-        command_policies.insert(
-            "npm".to_string(),
-            CommandPolicy {
-                action: Some(PolicyAction::Confirm),
-                default_working_directory: None,
-                subcommand_policies: vec![
-                    SubcommandPolicy {
-                        when: "run".to_string(),
+        let config = AppConfig {
+            server: ServerConfig::default(),
+            execution: ExecutionConfig {
+                default_action: PolicyAction::Confirm,
+                rules: vec![
+                    ExecutionRule {
+                        command: "npm".to_string(),
+                        args_prefix: vec!["run".to_string()],
                         action: PolicyAction::Allow,
                         default_working_directory: None,
                     },
-                    SubcommandPolicy {
-                        when: "run build".to_string(),
+                    ExecutionRule {
+                        command: "npm".to_string(),
+                        args_prefix: vec!["run".to_string(), "build".to_string()],
                         action: PolicyAction::Deny,
                         default_working_directory: None,
                     },
                 ],
-            },
-        );
-
-        let config = AppConfig {
-            server: ServerConfig::default(),
-            execution: ExecutionConfig {
-                default_policy: PolicyAction::Confirm,
-                command_policies,
                 ..ExecutionConfig::default()
             },
+            logging: LoggingConfig::default(),
         };
         let engine = PolicyEngine::new(config);
 
         let result = engine.evaluate("npm", &["run".to_string(), "build".to_string()]);
+        assert_eq!(result.decision, PolicyDecision::Deny);
+    }
+
+    #[test]
+    fn later_rule_wins_when_specificity_matches() {
+        let config = AppConfig {
+            server: ServerConfig::default(),
+            execution: ExecutionConfig {
+                default_action: PolicyAction::Confirm,
+                rules: vec![
+                    ExecutionRule {
+                        command: "cargo".to_string(),
+                        args_prefix: vec!["build".to_string()],
+                        action: PolicyAction::Allow,
+                        default_working_directory: None,
+                    },
+                    ExecutionRule {
+                        command: "cargo".to_string(),
+                        args_prefix: vec!["build".to_string()],
+                        action: PolicyAction::Deny,
+                        default_working_directory: None,
+                    },
+                ],
+                ..ExecutionConfig::default()
+            },
+            logging: LoggingConfig::default(),
+        };
+
+        let engine = PolicyEngine::new(config);
+        let result = engine.evaluate("cargo", &["build".to_string()]);
         assert_eq!(result.decision, PolicyDecision::Deny);
     }
 }

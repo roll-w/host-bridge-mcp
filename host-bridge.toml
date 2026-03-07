@@ -7,12 +7,24 @@
 # HTTP bind address for the server.
 bind_address = "0.0.0.0:8787"
 
+[logging]
+# Number of most recent log lines kept hot in memory for fast TUI reads.
+memory_buffer_lines = 2000
+
+# Optional on-disk log file path.
+# When omitted and persist_file = false, the server uses a temporary file and deletes it on exit.
+# When omitted and persist_file = true, the server writes to ./host-bridge-mcp.log.
+# file_path = "./host-bridge-mcp.log"
+
+# Keep the log file after process exit.
+persist_file = false
+
 [execution]
 # Default action when command has no explicit policy.
 # allow   = run directly
-# confirm = require user confirmation from the MCP client
+# confirm = require user confirmation from the TUI operator
 # deny    = reject
-default_policy = "confirm"
+default_action = "confirm"
 
 # Default timeout for each command (milliseconds).
 default_timeout_ms = 1800000
@@ -26,43 +38,55 @@ enable_builtin_wsl_mapping = true
 # Optional global default working directory.
 # default_working_directory = "/workspace"
 
-# Per-command policy examples.
-[execution.command_policies.java]
-action = "allow"
+# Ordered execution rules.
+# Each rule matches one command and an optional argument prefix.
 
-[execution.command_policies.mvn]
-action = "allow"
-
-# Subcommand strategy examples for mvn.
-[[execution.command_policies.mvn.subcommand_policies]]
-when = "clean compile"
+[[execution.rules]]
+command = "java"
 action = "confirm"
 
-[[execution.command_policies.mvn.subcommand_policies]]
-when = "deploy"
+[[execution.rules]]
+command = "mvn"
+action = "allow"
+
+[[execution.rules]]
+command = "mvn"
+args_prefix = ["clean", "compile"]
+action = "confirm"
+
+[[execution.rules]]
+command = "mvn"
+args_prefix = ["deploy"]
 action = "deny"
 
-[execution.command_policies.gradle]
+[[execution.rules]]
+command = "gradle"
 action = "allow"
 
-[execution.command_policies.npm]
+[[execution.rules]]
+command = "npm"
 action = "allow"
 
-[[execution.command_policies.npm.subcommand_policies]]
-when = "publish"
+[[execution.rules]]
+command = "npm"
+args_prefix = ["publish"]
 action = "confirm"
 
-[execution.command_policies.pnpm]
+[[execution.rules]]
+command = "pnpm"
 action = "allow"
 
-[execution.command_policies.cargo]
+[[execution.rules]]
+command = "cargo"
 action = "allow"
 
-[[execution.command_policies.cargo.subcommand_policies]]
-when = "publish"
+[[execution.rules]]
+command = "cargo"
+args_prefix = ["publish"]
 action = "confirm"
 
-[execution.command_policies.rustc]
+[[execution.rules]]
+command = "rustc"
 action = "allow"
 
 # Path mapping is platform-agnostic.

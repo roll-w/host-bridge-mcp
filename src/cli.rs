@@ -17,6 +17,8 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliOptions {
     pub config_path: Option<String>,
+    pub show_help: bool,
+    pub show_version: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -37,6 +39,8 @@ where
     let usage = usage_text(&program_name);
 
     let mut config_path: Option<String> = None;
+    let mut show_help = false;
+    let mut show_version = false;
 
     while let Some(argument) = iterator.next() {
         match argument.as_str() {
@@ -48,6 +52,12 @@ where
                     });
                 };
                 config_path = Some(value);
+            }
+            "-h" | "--help" => {
+                show_help = true;
+            }
+            "-V" | "--version" => {
+                show_version = true;
             }
             _ => {
                 if let Some(value) = argument.strip_prefix("--config=") {
@@ -68,13 +78,25 @@ where
         }
     }
 
-    Ok(CliOptions { config_path })
+    Ok(CliOptions {
+        config_path,
+        show_help,
+        show_version,
+    })
+}
+
+pub fn help_text(program_name: &str) -> String {
+    format!(
+        "Usage:\n  {program_name} [OPTIONS]\n\nOptions:\n  -c, --config <PATH>   Set configuration file path\n  -h, --help            Show help\n  -V, --version         Show version"
+    )
+}
+
+pub fn version_text() -> String {
+    format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
 }
 
 fn usage_text(program_name: &str) -> String {
-    format!(
-        "Usage:\n  {program_name} [OPTIONS]\n\nOptions:\n  -c, --config <PATH>   Set configuration file path"
-    )
+    help_text(program_name)
 }
 
 #[cfg(test)]
@@ -94,14 +116,25 @@ mod tests {
             outcome,
             CliOptions {
                 config_path: Some("custom.toml".to_string()),
+                show_help: false,
+                show_version: false,
             }
         );
     }
 
     #[test]
-    fn reject_help_argument() {
-        let error = parse_args(vec!["host-bridge-mcp".to_string(), "--help".to_string()])
-            .expect_err("--help is not supported");
-        assert!(error.message.contains("unknown argument"));
+    fn parse_help_argument() {
+        let options = parse_args(vec!["host-bridge-mcp".to_string(), "--help".to_string()])
+            .expect("--help should parse");
+        assert!(options.show_help);
+        assert!(!options.show_version);
+    }
+
+    #[test]
+    fn parse_version_argument() {
+        let options = parse_args(vec!["host-bridge-mcp".to_string(), "--version".to_string()])
+            .expect("--version should parse");
+        assert!(options.show_version);
+        assert!(!options.show_help);
     }
 }

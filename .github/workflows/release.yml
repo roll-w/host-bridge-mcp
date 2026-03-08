@@ -1,0 +1,270 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - '[0-9]*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  DARWIN_SDK_VERSION: "12.3"
+  ZIG_VERSION: "0.15.2"
+
+jobs:
+  prepare_release:
+    name: Prepare Release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import tomllib
+          from pathlib import Path
+
+          data = tomllib.loads(Path('Cargo.toml').read_text(encoding='utf-8'))
+          print(f"version={data['package']['version']}")
+          PY
+
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_tag="${GITHUB_REF_NAME#v}"
+          expected_version="${{ steps.meta.outputs.version }}"
+
+          if [[ "$release_tag" != "$expected_version" ]]; then
+            printf 'Release tag %s does not match Cargo.toml version %s\n' "$GITHUB_REF_NAME" "$expected_version" >&2
+            exit 1
+          fi
+
+      - name: Generate release notes
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.meta.outputs.version }}"
+          note_file="release-notes.md"
+          assets=(
+            "host-bridge-mcp-linux-x64-gnu-${version}.tar.gz"
+            "host-bridge-mcp-linux-arm64-gnu-${version}.tar.gz"
+            "host-bridge-mcp-windows-x64-${version}.zip"
+            "host-bridge-mcp-windows-arm64-${version}.zip"
+            "host-bridge-mcp-darwin-x64-${version}.zip"
+            "host-bridge-mcp-darwin-arm64-${version}.zip"
+          )
+
+          {
+            echo "# ${GITHUB_REF_NAME}"
+            echo
+            echo "Release for Host Bridge MCP version \`${version}\`."
+            echo
+            echo "## Artifacts"
+            echo
+            for asset in "${assets[@]}"; do
+              echo "- ${asset}"
+            done
+          } > "$note_file"
+
+          printf 'note_file=%s\n' "$note_file" >> "$GITHUB_OUTPUT"
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Host Bridge MCP ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          body_path: ${{ steps.notes.outputs.note_file }}
+          draft: true
+
+  build:
+    name: ${{ matrix.platform }}-${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    needs: prepare_release
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - platform: linux
+            arch: x86_64
+            artifact_os: linux
+            artifact_arch: x64
+            artifact_abi: gnu
+            target: x86_64-unknown-linux-gnu
+            build_tool: cargo
+            archive: tar.gz
+            binary_path: target/x86_64-unknown-linux-gnu/release/host-bridge-mcp
+            package_binary_name: host-bridge-mcp
+
+          - platform: linux
+            arch: arm64
+            artifact_os: linux
+            artifact_arch: arm64
+            artifact_abi: gnu
+            target: aarch64-unknown-linux-gnu
+            build_tool: cargo
+            archive: tar.gz
+            binary_path: target/aarch64-unknown-linux-gnu/release/host-bridge-mcp
+            package_binary_name: host-bridge-mcp
+
+          - platform: windows
+            arch: x86_64
+            artifact_os: windows
+            artifact_arch: x64
+            artifact_abi: ""
+            target: x86_64-pc-windows-msvc
+            build_tool: xwin
+            archive: zip
+            binary_path: target/x86_64-pc-windows-msvc/release/host-bridge-mcp.exe
+            package_binary_name: host-bridge-mcp.exe
+
+          - platform: windows
+            arch: arm64
+            artifact_os: windows
+            artifact_arch: arm64
+            artifact_abi: ""
+            target: aarch64-pc-windows-msvc
+            build_tool: xwin
+            archive: zip
+            binary_path: target/aarch64-pc-windows-msvc/release/host-bridge-mcp.exe
+            package_binary_name: host-bridge-mcp.exe
+
+          - platform: darwin
+            arch: x86_64
+            artifact_os: darwin
+            artifact_arch: x64
+            artifact_abi: ""
+            target: x86_64-apple-darwin
+            build_tool: zigbuild
+            archive: zip
+            binary_path: target/x86_64-apple-darwin/release/host-bridge-mcp
+            package_binary_name: host-bridge-mcp
+
+          - platform: darwin
+            arch: arm64
+            artifact_os: darwin
+            artifact_arch: arm64
+            artifact_abi: ""
+            target: aarch64-apple-darwin
+            build_tool: zigbuild
+            archive: zip
+            binary_path: target/aarch64-apple-darwin/release/host-bridge-mcp
+            package_binary_name: host-bridge-mcp
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set artifact name
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_name="host-bridge-mcp-${{ matrix.artifact_os }}-${{ matrix.artifact_arch }}"
+          if [[ -n "${{ matrix.artifact_abi }}" ]]; then
+            artifact_name+="-${{ matrix.artifact_abi }}"
+          fi
+          artifact_name+="-${{ needs.prepare_release.outputs.version }}"
+          printf 'ARTIFACT_NAME=%s\n' "$artifact_name" >> "$GITHUB_ENV"
+
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          rustflags: ""
+          cache: true
+          cache-key: release-${{ matrix.target }}
+
+      - name: Cache cross-compilation tool data
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/cargo-xwin
+            ~/.local/zig
+            ~/.cache/macos-sdk
+          key: ${{ runner.os }}-cross-tools-zig-${{ env.ZIG_VERSION }}-sdk-${{ env.DARWIN_SDK_VERSION }}
+
+      - name: Install Linux arm64 cross compiler
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install cargo-xwin
+        if: matrix.build_tool == 'xwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          if ! command -v cargo-xwin >/dev/null 2>&1; then
+            cargo install cargo-xwin --locked
+          fi
+
+      - name: Setup Darwin zigbuild
+        if: matrix.build_tool == 'zigbuild'
+        shell: bash
+        run: bash ./.github/ci/setup-zigbuild-darwin.sh "$DARWIN_SDK_VERSION" "$ZIG_VERSION"
+
+      - name: Build with xwin
+        if: matrix.build_tool == 'xwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo xwin build --release --locked --target ${{ matrix.target }}
+
+      - name: Build with cargo
+        if: matrix.build_tool == 'cargo'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+
+          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+          fi
+
+          cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Build with zigbuild
+        if: matrix.build_tool == 'zigbuild'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          cargo zigbuild --release --locked --target ${{ matrix.target }}
+
+      - name: Package artifact
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_path=$(bash ./.github/ci/package-release.sh \
+            --binary "${{ matrix.binary_path }}" \
+            --binary-name "${{ matrix.package_binary_name }}" \
+            --archive "${{ matrix.archive }}" \
+            --artifact-name "$ARTIFACT_NAME" \
+            --output-dir dist)
+          printf 'artifact_path=%s\n' "$artifact_path" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          draft: true
+          files: ${{ steps.package.outputs.artifact_path }}
+          overwrite_files: true
+          fail_on_unmatched_files: true

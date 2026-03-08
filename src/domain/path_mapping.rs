@@ -15,14 +15,7 @@
  */
 
 use crate::config::{PathMappingRule, Platform, TargetPlatform};
-use std::fs;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimePlatform {
-    Windows,
-    Linux,
-    Macos,
-}
+use crate::domain::platform::runtime::{current_is_wsl, resolve_target_platform, RuntimePlatform};
 
 #[derive(Debug, Clone)]
 pub struct PathMapper {
@@ -42,7 +35,7 @@ impl PathMapper {
             rules,
             target_platform: resolve_target_platform(target),
             enable_builtin_wsl_mapping,
-            running_inside_wsl: is_wsl_runtime(),
+            running_inside_wsl: current_is_wsl(),
         }
     }
 
@@ -95,23 +88,6 @@ impl PathMapper {
             Platform::Macos => self.target_platform == RuntimePlatform::Macos,
             Platform::Wsl => self.running_inside_wsl,
         })
-    }
-}
-
-pub fn resolve_target_platform(target: TargetPlatform) -> RuntimePlatform {
-    match target {
-        TargetPlatform::Auto => {
-            if cfg!(target_os = "windows") {
-                RuntimePlatform::Windows
-            } else if cfg!(target_os = "macos") {
-                RuntimePlatform::Macos
-            } else {
-                RuntimePlatform::Linux
-            }
-        }
-        TargetPlatform::Windows => RuntimePlatform::Windows,
-        TargetPlatform::Linux => RuntimePlatform::Linux,
-        TargetPlatform::Macos => RuntimePlatform::Macos,
     }
 }
 
@@ -170,17 +146,6 @@ fn apply_rule(input: &str, rule: &PathMappingRule) -> Option<String> {
     }
 
     Some(format!("{}{}", rule.to, normalized_remainder))
-}
-
-fn is_wsl_runtime() -> bool {
-    if !cfg!(target_os = "linux") {
-        return false;
-    }
-
-    match fs::read_to_string("/proc/sys/kernel/osrelease") {
-        Ok(value) => value.to_ascii_lowercase().contains("microsoft"),
-        Err(_) => false,
-    }
 }
 
 fn map_wsl_to_windows(input: &str) -> Option<String> {

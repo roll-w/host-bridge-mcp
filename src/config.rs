@@ -199,8 +199,10 @@ impl AppConfig {
             path: path.clone(),
             source,
         })?;
-        let value = toml::from_str::<toml::Value>(&raw)
-            .map_err(|source| ConfigError::Parse { path: path.clone(), source })?;
+        let value = toml::from_str::<toml::Value>(&raw).map_err(|source| ConfigError::Parse {
+            path: path.clone(),
+            source,
+        })?;
         reject_legacy_execution_keys(&value)?;
         let config = value
             .try_into::<Self>()

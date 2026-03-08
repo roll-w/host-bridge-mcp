@@ -14,6 +14,22 @@
  * limitations under the License.
  */
 
-pub mod path_mapping;
-pub mod platform;
-pub mod policy;
+use std::io;
+
+#[cfg(unix)]
+pub async fn wait_for_termination_signal() -> io::Result<&'static str> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+    tokio::select! {
+        _ = sigint.recv() => Ok("SIGINT"),
+        _ = sigterm.recv() => Ok("SIGTERM"),
+    }
+}
+
+#[cfg(not(unix))]
+pub async fn wait_for_termination_signal() -> io::Result<&'static str> {
+    tokio::signal::ctrl_c().await?;
+    Ok("CTRL_C")
+}

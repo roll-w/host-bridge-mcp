@@ -25,6 +25,7 @@ use application::operator_console::{ConsoleLogLevel, OperatorConsole};
 use application::shutdown_controller::ShutdownController;
 use cli::{help_text, parse_args, version_text};
 use config::AppConfig;
+use domain::platform::signal::wait_for_termination_signal;
 use std::io::{self, Write};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -78,6 +79,18 @@ async fn main() -> ExitCode {
         }
     };
 
+    let execution_service = ExecutionService::new(config.clone(), operator_console.clone());
+    let app = router(execution_service, operator_console.clone());
+    let listener = match bind_server_listener(&config.server.bind_address).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            let message = format_bind_error(&config.server.bind_address, &error);
+            operator_console.push_log(ConsoleLogLevel::Error, message.clone());
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let shutdown_controller = ShutdownController::default();
     let tui_active = tui::start(operator_console.clone(), shutdown_controller.clone());
     init_logging(operator_console.clone(), !tui_active);
@@ -92,20 +105,6 @@ async fn main() -> ExitCode {
         );
     }
 
-    let execution_service = ExecutionService::new(config.clone(), operator_console.clone());
-    let app = router(execution_service, operator_console.clone());
-    let listener = match tokio::net::TcpListener::bind(&config.server.bind_address).await {
-        Ok(listener) => listener,
-        Err(error) => {
-            tracing::error!(
-                bind_address = %config.server.bind_address,
-                error = %error,
-                "Failed to bind server"
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-
     tracing::info!(bind_address = %config.server.bind_address, "host-bridge-mcp listening");
     let shutdown_waiter = shutdown_controller.clone();
     let server = axum::serve(listener, app).with_graceful_shutdown(async move {
@@ -118,6 +117,20 @@ async fn main() -> ExitCode {
 
     tracing::info!("Server shutdown completed");
     ExitCode::SUCCESS
+}
+
+async fn bind_server_listener(bind_address: &str) -> io::Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::bind(bind_address).await
+}
+
+fn format_bind_error(bind_address: &str, error: &io::Error) -> String {
+    if error.kind() == io::ErrorKind::AddrInUse {
+        return format!(
+            "Failed to bind {bind_address}: the port is already in use. Stop the other process or change `server.bind_address` in the config."
+        );
+    }
+
+    format!("Failed to bind {bind_address}: {error}")
 }
 
 fn init_logging(operator_console: OperatorConsole, mirror_to_stderr: bool) {
@@ -200,6 +213,38 @@ impl Drop for ConsoleTracingWriter {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_bind_error_highlights_addr_in_use() {
+        let error = io::Error::new(io::ErrorKind::AddrInUse, "address in use");
+        let message = format_bind_error("127.0.0.1:8787", &error);
+
+        assert!(message.contains("127.0.0.1:8787"));
+        assert!(message.contains("already in use"));
+        assert!(message.contains("server.bind_address"));
+    }
+
+    #[tokio::test]
+    async fn bind_server_listener_returns_addr_in_use() {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("test listener should bind to an ephemeral port");
+        let bind_address = occupied
+            .local_addr()
+            .expect("test listener should expose its bound address")
+            .to_string();
+
+        let error = bind_server_listener(&bind_address)
+            .await
+            .expect_err("second bind should fail while the first listener is active");
+
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert!(format_bind_error(&bind_address, &error).contains("already in use"));
+    }
+}
+
 fn spawn_system_signal_handler(
     shutdown_controller: ShutdownController,
     operator_console: OperatorConsole,
@@ -221,22 +266,4 @@ fn spawn_system_signal_handler(
             }
         }
     });
-}
-
-#[cfg(unix)]
-async fn wait_for_termination_signal() -> io::Result<&'static str> {
-    use tokio::signal::unix::{signal, SignalKind};
-
-    let mut sigint = signal(SignalKind::interrupt())?;
-    let mut sigterm = signal(SignalKind::terminate())?;
-    tokio::select! {
-        _ = sigint.recv() => Ok("SIGINT"),
-        _ = sigterm.recv() => Ok("SIGTERM"),
-    }
-}
-
-#[cfg(not(unix))]
-async fn wait_for_termination_signal() -> io::Result<&'static str> {
-    tokio::signal::ctrl_c().await?;
-    Ok("CTRL_C")
 }

@@ -104,15 +104,10 @@ archive_path="$repo_root/$output_dir/$artifact_name.$archive_format"
 
 rm -rf "$staging_dir"
 rm -f "$archive_path"
-mkdir -p "$staging_dir/docs"
 
 cp "$binary_path" "$staging_dir/$binary_name"
 
 for relative_path in host-bridge.toml README.md LICENSE; do
-  cp "$repo_root/$relative_path" "$staging_dir/$relative_path"
-done
-
-for relative_path in docs/configuration.md docs/usage.md; do
   cp "$repo_root/$relative_path" "$staging_dir/$relative_path"
 done
 

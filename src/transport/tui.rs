@@ -18,17 +18,18 @@ use crate::application::operator_console::{
     ConsoleLogEntry, ConsoleLogLevel, ConsoleSnapshot, OperatorConsole, PendingApprovalView,
 };
 use crate::application::shutdown_controller::ShutdownController;
+use arboard::Clipboard;
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseEventKind,
+    MouseButton, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
@@ -62,9 +63,9 @@ pub fn start(console: OperatorConsole, shutdown_controller: ShutdownController) 
 }
 
 fn run(console: OperatorConsole, shutdown_controller: ShutdownController) -> io::Result<()> {
+    let mut state = TuiState::default();
     let mut terminal = setup_terminal()?;
     let _guard = TerminalGuard;
-    let mut state = TuiState::default();
 
     loop {
         let snapshot = console.snapshot();
@@ -93,7 +94,8 @@ fn run(console: OperatorConsole, shutdown_controller: ShutdownController) -> io:
 fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, Hide)?;
+    execute!(stdout, EnterAlternateScreen, Hide)?;
+    set_mouse_capture(true)?;
     Terminal::new(CrosstermBackend::new(stdout))
 }
 
@@ -159,12 +161,39 @@ fn handle_input(
             }
         }
         Event::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                state.begin_log_selection(mouse.column, mouse.row);
+                false
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                state.extend_log_selection(mouse.column, mouse.row);
+                false
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                state.extend_log_selection(mouse.column, mouse.row);
+                if let Some((start, end)) = state.selected_log_range() {
+                    match copy_logs_to_clipboard(console, start, end) {
+                        Ok(copied_lines) => console.push_log(
+                            ConsoleLogLevel::Info,
+                            format!("Copied {copied_lines} log line(s) to clipboard."),
+                        ),
+                        Err(error) => console.push_log(
+                            ConsoleLogLevel::Error,
+                            format!("Failed to copy selected logs: {error}"),
+                        ),
+                    }
+                }
+                state.clear_log_selection();
+                false
+            }
             MouseEventKind::ScrollUp => {
                 state.scroll_up(snapshot, 3);
+                state.clear_log_selection();
                 false
             }
             MouseEventKind::ScrollDown => {
                 state.scroll_down(snapshot, 3);
+                state.clear_log_selection();
                 false
             }
             _ => false,
@@ -226,7 +255,7 @@ fn render_status_bar(frame: &mut Frame, area: ratatui::layout::Rect, snapshot: &
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::raw(
-            "  |  Up/Down select  a approve  r reject  Wheel/PgUp/PgDn logs  Home/End head-tail  q shutdown",
+            "  |  Up/Down select  a approve  r reject  Wheel/PgUp/PgDn logs  drag logs copies  Home/End head-tail  q shutdown",
         ),
     ]);
     frame.render_widget(Paragraph::new(text).style(style), area);
@@ -297,7 +326,8 @@ fn render_logs(
     state.set_log_page_size(visible_height.max(1));
     let start = state.log_start(snapshot, visible_height.max(1));
     let log_entries = console.read_logs(start, visible_height.max(1));
-    let log_lines = visible_logs(&log_entries);
+    state.set_visible_logs(area, start, log_entries.len());
+    let log_lines = visible_logs(&log_entries, state, start);
     let end = if log_entries.is_empty() {
         start
     } else {
@@ -344,41 +374,102 @@ fn approval_detail_lines(approval: &PendingApprovalView) -> Vec<Line<'static>> {
     lines
 }
 
-fn visible_logs(entries: &[ConsoleLogEntry]) -> Vec<Line<'static>> {
+fn visible_logs(entries: &[ConsoleLogEntry], state: &TuiState, start: usize) -> Vec<Line<'static>> {
     if entries.is_empty() {
         return vec![Line::from("No log entries yet.")];
     }
 
-    entries.iter().map(log_line).collect::<Vec<_>>()
+    entries
+        .iter()
+        .enumerate()
+        .map(|(offset, entry)| log_line(entry, state.is_log_line_selected(start + offset)))
+        .collect::<Vec<_>>()
 }
 
-fn log_line(entry: &ConsoleLogEntry) -> Line<'static> {
+fn log_line(entry: &ConsoleLogEntry, selected: bool) -> Line<'static> {
     let (label, color) = match entry.level {
         ConsoleLogLevel::Info => ("INFO", Color::Cyan),
         ConsoleLogLevel::Warn => ("WARN", Color::Yellow),
         ConsoleLogLevel::Error => ("ERROR", Color::Red),
     };
 
+    let line_style = if selected {
+        Style::default().bg(Color::DarkGray)
+    } else {
+        Style::default()
+    };
+
     Line::from(vec![
         Span::styled(
             format!("[{label}] "),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
+            line_style.fg(color).add_modifier(Modifier::BOLD),
         ),
-        Span::raw(entry.message.clone()),
+        Span::styled(entry.message.clone(), line_style),
     ])
+}
+
+fn copy_logs_to_clipboard(
+    console: &OperatorConsole,
+    start: usize,
+    end: usize,
+) -> Result<usize, arboard::Error> {
+    let entries = console.read_logs(start, end.saturating_sub(start).saturating_add(1));
+    let copied_lines = entries.len();
+    let text = entries
+        .iter()
+        .map(log_line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut clipboard = Clipboard::new()?;
+    clipboard.set_text(text)?;
+    Ok(copied_lines)
+}
+
+fn log_line_text(entry: &ConsoleLogEntry) -> String {
+    let label = match entry.level {
+        ConsoleLogLevel::Info => "INFO",
+        ConsoleLogLevel::Warn => "WARN",
+        ConsoleLogLevel::Error => "ERROR",
+    };
+    format!("[{label}] {}", entry.message)
 }
 
 fn short_id(id: uuid::Uuid) -> String {
     id.to_string().chars().take(8).collect()
 }
 
-#[derive(Default)]
 struct TuiState {
     selected_approval_index: usize,
     log_start_index: usize,
     log_page_size: usize,
     follow_logs: bool,
     last_pending_count: usize,
+    logs_area: Option<Rect>,
+    visible_log_start: usize,
+    visible_log_count: usize,
+    active_log_selection: Option<LogSelection>,
+}
+
+impl Default for TuiState {
+    fn default() -> Self {
+        Self {
+            selected_approval_index: 0,
+            log_start_index: 0,
+            log_page_size: 0,
+            follow_logs: false,
+            last_pending_count: 0,
+            logs_area: None,
+            visible_log_start: 0,
+            visible_log_count: 0,
+            active_log_selection: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LogSelection {
+    anchor_line: usize,
+    focus_line: usize,
 }
 
 impl TuiState {
@@ -417,6 +508,15 @@ impl TuiState {
 
     fn set_log_page_size(&mut self, page_size: usize) {
         self.log_page_size = page_size.max(1);
+    }
+
+    fn set_visible_logs(&mut self, area: Rect, start: usize, count: usize) {
+        self.logs_area = Some(area);
+        self.visible_log_start = start;
+        self.visible_log_count = count;
+        if count == 0 {
+            self.active_log_selection = None;
+        }
     }
 
     fn log_start(&self, snapshot: &ConsoleSnapshot, visible_height: usize) -> usize {
@@ -463,6 +563,74 @@ impl TuiState {
 
     fn follow_tail(&mut self) {
         self.follow_logs = true;
+    }
+
+    fn begin_log_selection(&mut self, column: u16, row: u16) {
+        self.active_log_selection = self
+            .log_index_at(column, row)
+            .map(|line_index| LogSelection {
+                anchor_line: line_index,
+                focus_line: line_index,
+            });
+    }
+
+    fn extend_log_selection(&mut self, column: u16, row: u16) {
+        let Some(line_index) = self.log_index_at(column, row) else {
+            return;
+        };
+        if let Some(selection) = self.active_log_selection.as_mut() {
+            selection.focus_line = line_index;
+        }
+    }
+
+    fn clear_log_selection(&mut self) {
+        self.active_log_selection = None;
+    }
+
+    fn selected_log_range(&self) -> Option<(usize, usize)> {
+        let selection = self.active_log_selection?;
+        Some((
+            selection.anchor_line.min(selection.focus_line),
+            selection.anchor_line.max(selection.focus_line),
+        ))
+    }
+
+    fn is_log_line_selected(&self, line_index: usize) -> bool {
+        let Some((start, end)) = self.selected_log_range() else {
+            return false;
+        };
+        (start..=end).contains(&line_index)
+    }
+
+    fn log_index_at(&self, column: u16, row: u16) -> Option<usize> {
+        let area = self.logs_area?;
+        if area.width <= 2 || area.height <= 2 {
+            return None;
+        }
+
+        let inner_left = area.x.saturating_add(1);
+        let inner_top = area.y.saturating_add(1);
+        let inner_right = area.x.saturating_add(area.width.saturating_sub(1));
+        let inner_bottom = area.y.saturating_add(area.height.saturating_sub(1));
+        if column < inner_left || column >= inner_right || row < inner_top || row >= inner_bottom {
+            return None;
+        }
+
+        let relative_row = row.saturating_sub(inner_top) as usize;
+        if relative_row >= self.visible_log_count {
+            return None;
+        }
+
+        Some(self.visible_log_start + relative_row)
+    }
+}
+
+fn set_mouse_capture(enabled: bool) -> io::Result<()> {
+    let mut stdout = io::stdout();
+    if enabled {
+        execute!(stdout, EnableMouseCapture)
+    } else {
+        execute!(stdout, DisableMouseCapture)
     }
 }
 
@@ -538,5 +706,18 @@ mod tests {
 
         assert!(!should_quit);
         assert!(shutdown_controller.request_shutdown());
+    }
+
+    #[test]
+    fn drag_selection_tracks_visible_log_range() {
+        let mut state = TuiState::default();
+        state.set_visible_logs(Rect::new(0, 0, 40, 6), 10, 4);
+
+        state.begin_log_selection(2, 2);
+        state.extend_log_selection(2, 4);
+
+        assert_eq!(state.selected_log_range(), Some((11, 13)));
+        assert!(state.is_log_line_selected(12));
+        assert!(!state.is_log_line_selected(14));
     }
 }

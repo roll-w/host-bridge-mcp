@@ -127,12 +127,12 @@ fn ensure_single_command(input: &str) -> Result<(), CommandParseError> {
             continue;
         }
 
-        if in_single_quote || in_double_quote {
-            continue;
-        }
-
         if ch == ';' || ch == '|' || ch == '\n' || ch == '\r' {
             return Err(CommandParseError::MultipleCommandsNotAllowed);
+        }
+
+        if in_single_quote || in_double_quote {
+            continue;
         }
 
         if ch == '&' && matches!(chars.peek(), Some('&')) {
@@ -181,5 +181,12 @@ mod tests {
             .expect("quoted operator should be allowed");
         assert_eq!(parsed.program, "python");
         assert_eq!(parsed.args, vec!["-c", "print('a && b')"]);
+    }
+
+    #[test]
+    fn rejects_newline_inside_quotes() {
+        let error = parse_command_line("python -c \"line1\nline2\"")
+            .expect_err("newline should be rejected even inside quotes");
+        assert_eq!(error, CommandParseError::MultipleCommandsNotAllowed);
     }
 }

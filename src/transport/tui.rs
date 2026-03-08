@@ -18,7 +18,6 @@ use crate::application::operator_console::{
     ConsoleLogEntry, ConsoleLogLevel, ConsoleSnapshot, OperatorConsole, PendingApprovalView,
 };
 use crate::application::shutdown_controller::ShutdownController;
-use arboard::Clipboard;
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -175,7 +174,7 @@ fn handle_input(
                     match copy_logs_to_clipboard(console, start, end) {
                         Ok(copied_lines) => console.push_log(
                             ConsoleLogLevel::Info,
-                            format!("Copied {copied_lines} log line(s) to clipboard."),
+                            format!("Sent {copied_lines} log line(s) to the terminal clipboard."),
                         ),
                         Err(error) => console.push_log(
                             ConsoleLogLevel::Error,
@@ -255,7 +254,7 @@ fn render_status_bar(frame: &mut Frame, area: ratatui::layout::Rect, snapshot: &
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::raw(
-            "  |  Up/Down select  a approve  r reject  Wheel/PgUp/PgDn logs  drag logs copies  Home/End head-tail  q shutdown",
+            "  |  Up/Down select  a approve  r reject  Wheel/PgUp/PgDn logs  drag logs clip  Home/End head-tail  q shutdown",
         ),
     ]);
     frame.render_widget(Paragraph::new(text).style(style), area);
@@ -412,7 +411,7 @@ fn copy_logs_to_clipboard(
     console: &OperatorConsole,
     start: usize,
     end: usize,
-) -> Result<usize, arboard::Error> {
+) -> io::Result<usize> {
     let entries = console.read_logs(start, end.saturating_sub(start).saturating_add(1));
     let copied_lines = entries.len();
     let text = entries
@@ -420,9 +419,48 @@ fn copy_logs_to_clipboard(
         .map(log_line_text)
         .collect::<Vec<_>>()
         .join("\n");
-    let mut clipboard = Clipboard::new()?;
-    clipboard.set_text(text)?;
+    write_terminal_clipboard(&text)?;
     Ok(copied_lines)
+}
+
+fn write_terminal_clipboard(text: &str) -> io::Result<()> {
+    let encoded = base64_encode(text.as_bytes());
+    print!("\x1b]52;c;{encoded}\x07");
+    io::stdout().flush()
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut index = 0;
+
+    while index < bytes.len() {
+        let first = bytes[index];
+        let second = bytes.get(index + 1).copied();
+        let third = bytes.get(index + 2).copied();
+
+        encoded.push(ALPHABET[(first >> 2) as usize] as char);
+        encoded.push(
+            ALPHABET[((first & 0b0000_0011) << 4 | second.unwrap_or(0) >> 4) as usize] as char,
+        );
+
+        match second {
+            Some(second) => encoded.push(
+                ALPHABET[((second & 0b0000_1111) << 2 | third.unwrap_or(0) >> 6) as usize] as char,
+            ),
+            None => encoded.push('='),
+        }
+
+        match third {
+            Some(third) => encoded.push(ALPHABET[(third & 0b0011_1111) as usize] as char),
+            None => encoded.push('='),
+        }
+
+        index += 3;
+    }
+
+    encoded
 }
 
 fn log_line_text(entry: &ConsoleLogEntry) -> String {
@@ -719,5 +757,14 @@ mod tests {
         assert_eq!(state.selected_log_range(), Some((11, 13)));
         assert!(state.is_log_line_selected(12));
         assert!(!state.is_log_line_selected(14));
+    }
+
+    #[test]
+    fn base64_encoder_matches_expected_padding() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
     }
 }

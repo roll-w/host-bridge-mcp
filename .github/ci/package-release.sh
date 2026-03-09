@@ -109,7 +109,7 @@ mkdir -p "$staging_dir"
 
 cp "$binary_path" "$staging_dir/$binary_name"
 
-for relative_path in host-bridge.toml README.md LICENSE; do
+for relative_path in host-bridge.yaml README.md LICENSE; do
   cp "$repo_root/$relative_path" "$staging_dir/$relative_path"
 done
 

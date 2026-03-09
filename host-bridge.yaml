@@ -41,6 +41,25 @@ execution:
   # Optional global default working directory.
   # default-working-directory: /workspace
 
+  # Default execution server. The implicit local execution target is always named host.
+  default-server: host
+
+  # Optional additional execution servers.
+  # Remote servers use the local ssh client and intentionally do not accept plaintext passwords.
+  # Prefer ssh-agent, or provide an identity-file and known-hosts-file.
+  servers:
+    - name: build-linux
+      transport: ssh
+      host: build-linux.internal
+      user: dev
+      port: 22
+      target-platform: linux
+      identity-file: /home/dev/.ssh/id_ed25519
+      known-hosts-file: /home/dev/.ssh/known_hosts
+      path-mappings:
+        - from: /workspace
+          to: /srv/workspace
+
   # Command execution strategy.
   # Group each command with its default action and optional subcommand overrides.
   commands:
@@ -81,9 +100,9 @@ execution:
     - command: rustc
       action: allow
 
-  # Path mapping is platform-agnostic.
-  # You can map container paths, WSL paths, remote mount paths, or host paths.
+  # Host path mappings are platform-agnostic.
   # Rules are prefix-based and are applied in order.
+  # Additional remote servers can define their own server-scoped path-mappings above.
   path-mappings:
     - from: /workspace/mnt/d
       to: D:\

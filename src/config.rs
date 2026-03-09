@@ -15,10 +15,13 @@
  */
 
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::path::Path;
 
 const CONFIG_ENV_KEY: &str = "HOST_BRIDGE_CONFIG";
 const DEFAULT_CONFIG_FILE: &str = "host-bridge.yaml";
+const DEFAULT_EXECUTION_SERVER: &str = "host";
+const DEFAULT_SSH_PORT: u16 = 22;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
@@ -57,11 +60,45 @@ pub struct ExecutionConfig {
     #[serde(default)]
     pub commands: Vec<CommandPolicyConfig>,
     pub default_working_directory: Option<String>,
+    pub default_server: String,
+    #[serde(default)]
+    pub servers: Vec<ExecutionServerConfig>,
     pub path_mappings: Vec<PathMappingRule>,
     pub target_platform: TargetPlatform,
     pub enable_builtin_wsl_mapping: bool,
     pub default_timeout_ms: u64,
     pub max_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "transport", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ExecutionServerConfig {
+    Host {
+        name: String,
+        #[serde(default)]
+        target_platform: TargetPlatform,
+        #[serde(default = "default_true")]
+        enable_builtin_wsl_mapping: bool,
+        #[serde(default)]
+        path_mappings: Vec<PathMappingRule>,
+    },
+    Ssh {
+        name: String,
+        host: String,
+        #[serde(default = "default_ssh_port")]
+        port: u16,
+        #[serde(default)]
+        user: Option<String>,
+        target_platform: TargetPlatform,
+        #[serde(default)]
+        enable_builtin_wsl_mapping: bool,
+        #[serde(default)]
+        path_mappings: Vec<PathMappingRule>,
+        #[serde(default)]
+        identity_file: Option<String>,
+        #[serde(default)]
+        known_hosts_file: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -178,6 +215,8 @@ impl Default for ExecutionConfig {
             default_action: PolicyAction::Confirm,
             commands: Vec::new(),
             default_working_directory: None,
+            default_server: DEFAULT_EXECUTION_SERVER.to_string(),
+            servers: Vec::new(),
             path_mappings: Vec::new(),
             target_platform: TargetPlatform::Auto,
             enable_builtin_wsl_mapping: true,
@@ -195,6 +234,22 @@ impl Default for PathMappingRule {
             platforms: Vec::new(),
         }
     }
+}
+
+impl ExecutionServerConfig {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Host { name, .. } | Self::Ssh { name, .. } => name,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_ssh_port() -> u16 {
+    DEFAULT_SSH_PORT
 }
 
 impl AppConfig {
@@ -249,6 +304,8 @@ impl AppConfig {
 
         validate_server_access(&self.server.access, "server.access")?;
 
+        validate_server_name(&self.execution.default_server, "execution.default-server")?;
+
         if self.execution.default_timeout_ms == 0 {
             return Err(ConfigError::Validation(
                 "execution.default-timeout-ms must be greater than zero".to_string(),
@@ -298,12 +355,84 @@ impl AppConfig {
             }
         }
 
-        for rule in &self.execution.path_mappings {
-            if rule.from.trim().is_empty() || rule.to.trim().is_empty() {
-                return Err(ConfigError::Validation(
-                    "execution.path-mappings entries require non-empty from/to".to_string(),
-                ));
+        validate_path_mappings(&self.execution.path_mappings, "execution.path-mappings")?;
+
+        let mut server_names = HashSet::new();
+        for (index, server) in self.execution.servers.iter().enumerate() {
+            let name = server.name();
+            validate_server_name(name, &format!("execution.servers[{index}].name"))?;
+            if !server_names.insert(name.to_string()) {
+                return Err(ConfigError::Validation(format!(
+                    "execution.servers[{index}].name duplicates server '{name}'"
+                )));
             }
+
+            match server {
+                ExecutionServerConfig::Host { path_mappings, .. } => {
+                    validate_path_mappings(
+                        path_mappings,
+                        &format!("execution.servers[{index}].path-mappings"),
+                    )?;
+                }
+                ExecutionServerConfig::Ssh {
+                    name,
+                    host,
+                    port,
+                    user,
+                    target_platform,
+                    path_mappings,
+                    identity_file,
+                    known_hosts_file,
+                    ..
+                } => {
+                    if name == DEFAULT_EXECUTION_SERVER {
+                        return Err(ConfigError::Validation(
+                            "execution.servers[*].name 'host' is reserved for the local host transport"
+                                .to_string(),
+                        ));
+                    }
+                    if host.trim().is_empty() {
+                        return Err(ConfigError::Validation(format!(
+                            "execution.servers[{index}].host cannot be empty"
+                        )));
+                    }
+                    if *port == 0 {
+                        return Err(ConfigError::Validation(format!(
+                            "execution.servers[{index}].port must be greater than zero"
+                        )));
+                    }
+                    if *target_platform == TargetPlatform::Auto {
+                        return Err(ConfigError::Validation(format!(
+                            "execution.servers[{index}].target-platform must be explicit for ssh servers"
+                        )));
+                    }
+                    validate_optional_non_empty(
+                        user.as_deref(),
+                        &format!("execution.servers[{index}].user"),
+                    )?;
+                    validate_optional_non_empty(
+                        identity_file.as_deref(),
+                        &format!("execution.servers[{index}].identity-file"),
+                    )?;
+                    validate_optional_non_empty(
+                        known_hosts_file.as_deref(),
+                        &format!("execution.servers[{index}].known-hosts-file"),
+                    )?;
+                    validate_path_mappings(
+                        path_mappings,
+                        &format!("execution.servers[{index}].path-mappings"),
+                    )?;
+                }
+            }
+        }
+
+        if self.execution.default_server != DEFAULT_EXECUTION_SERVER
+            && !server_names.contains(&self.execution.default_server)
+        {
+            return Err(ConfigError::Validation(format!(
+                "execution.default-server '{}' must reference a configured server",
+                self.execution.default_server
+            )));
         }
 
         if self.logging.memory_buffer_lines == 0 {
@@ -320,6 +449,16 @@ impl AppConfig {
 
 fn validate_command_name(command: &str, location: &str) -> Result<(), ConfigError> {
     if command.trim().is_empty() {
+        return Err(ConfigError::Validation(format!(
+            "{location} cannot be empty"
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_server_name(name: &str, location: &str) -> Result<(), ConfigError> {
+    if name.trim().is_empty() {
         return Err(ConfigError::Validation(format!(
             "{location} cannot be empty"
         )));
@@ -382,6 +521,33 @@ fn validate_working_directory(path: Option<&str>, location: &str) -> Result<(), 
         if path.trim().is_empty() {
             return Err(ConfigError::Validation(format!(
                 "{location} cannot be empty when provided"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_optional_non_empty(value: Option<&str>, location: &str) -> Result<(), ConfigError> {
+    if let Some(value) = value {
+        if value.trim().is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "{location} cannot be empty when provided"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_path_mappings(
+    path_mappings: &[PathMappingRule],
+    location: &str,
+) -> Result<(), ConfigError> {
+    for (index, rule) in path_mappings.iter().enumerate() {
+        if rule.from.trim().is_empty() || rule.to.trim().is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "{location}[{index}] entries require non-empty from/to"
             )));
         }
     }
@@ -531,6 +697,116 @@ mod tests {
 
         assert_eq!(config.server.bind_address, "127.0.0.1:8787");
         assert_eq!(config.server.access, AccessConfig::default());
+        assert_eq!(config.execution.default_server, "host");
+        assert!(config.execution.servers.is_empty());
+    }
+
+    #[test]
+    fn reject_default_server_when_missing_from_configured_servers() {
+        let config = AppConfig {
+            execution: ExecutionConfig {
+                default_server: "prod".to_string(),
+                servers: vec![ExecutionServerConfig::Ssh {
+                    name: "staging".to_string(),
+                    host: "staging.example.com".to_string(),
+                    port: 22,
+                    user: Some("deploy".to_string()),
+                    target_platform: TargetPlatform::Linux,
+                    enable_builtin_wsl_mapping: false,
+                    path_mappings: Vec::new(),
+                    identity_file: None,
+                    known_hosts_file: None,
+                }],
+                ..ExecutionConfig::default()
+            },
+            ..AppConfig::default()
+        };
+
+        let error = config.validate().expect_err("config should be invalid");
+        assert!(
+            error
+                .to_string()
+                .contains("execution.default-server 'prod'")
+        );
+    }
+
+    #[test]
+    fn reject_duplicate_server_names() {
+        let config = AppConfig {
+            execution: ExecutionConfig {
+                servers: vec![
+                    ExecutionServerConfig::Host {
+                        name: "build".to_string(),
+                        target_platform: TargetPlatform::Auto,
+                        enable_builtin_wsl_mapping: true,
+                        path_mappings: Vec::new(),
+                    },
+                    ExecutionServerConfig::Host {
+                        name: "build".to_string(),
+                        target_platform: TargetPlatform::Auto,
+                        enable_builtin_wsl_mapping: true,
+                        path_mappings: Vec::new(),
+                    },
+                ],
+                ..ExecutionConfig::default()
+            },
+            ..AppConfig::default()
+        };
+
+        let error = config.validate().expect_err("config should be invalid");
+        assert!(error.to_string().contains("duplicates server 'build'"));
+    }
+
+    #[test]
+    fn reject_ssh_server_with_auto_target_platform() {
+        let config = AppConfig {
+            execution: ExecutionConfig {
+                servers: vec![ExecutionServerConfig::Ssh {
+                    name: "prod".to_string(),
+                    host: "prod.example.com".to_string(),
+                    port: 22,
+                    user: None,
+                    target_platform: TargetPlatform::Auto,
+                    enable_builtin_wsl_mapping: false,
+                    path_mappings: Vec::new(),
+                    identity_file: None,
+                    known_hosts_file: None,
+                }],
+                ..ExecutionConfig::default()
+            },
+            ..AppConfig::default()
+        };
+
+        let error = config.validate().expect_err("config should be invalid");
+        assert!(
+            error
+                .to_string()
+                .contains("target-platform must be explicit for ssh servers")
+        );
+    }
+
+    #[test]
+    fn reject_ssh_server_named_host() {
+        let config = AppConfig {
+            execution: ExecutionConfig {
+                servers: vec![ExecutionServerConfig::Ssh {
+                    name: "host".to_string(),
+                    host: "prod.example.com".to_string(),
+                    port: 22,
+                    user: None,
+                    target_platform: TargetPlatform::Linux,
+                    enable_builtin_wsl_mapping: false,
+                    path_mappings: Vec::new(),
+                    identity_file: None,
+                    known_hosts_file: None,
+                }],
+                ..ExecutionConfig::default()
+            },
+            ..AppConfig::default()
+        };
+
+        let error = config.validate().expect_err("config should be invalid");
+        assert!(error.to_string().contains("'host' is reserved"));
     }
 
     #[test]

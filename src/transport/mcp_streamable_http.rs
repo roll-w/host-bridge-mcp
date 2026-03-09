@@ -58,6 +58,11 @@ struct ExecuteCommandToolArgs {
     command: String,
     #[serde(default)]
     #[schemars(
+        description = "Optional configured execution server name. Omit this field to use the default server, which is usually 'host'."
+    )]
+    server: Option<String>,
+    #[serde(default)]
+    #[schemars(
         description = "Optional working directory for the child process. If omitted, the server uses the current directory or a policy default after path mapping."
     )]
     working_directory: Option<String>,
@@ -106,7 +111,7 @@ impl HostBridgeMcpServer {
     }
 
     #[tool(
-        description = "Execute exactly one host command without shell chaining. If approval is required, the call stays pending until the TUI operator approves or rejects it."
+        description = "Execute exactly one command in the selected execution server without shell chaining. If approval is required, the call stays pending until the TUI operator approves or rejects it."
     )]
     async fn execute_command(
         &self,
@@ -117,11 +122,13 @@ impl HostBridgeMcpServer {
     }
 
     #[tool(
-        description = "Return the specific platform name where commands currently execute, so agents can choose the right command syntax and path format."
+        description = "Return the default execution server, its platform, and the list of configured execution servers so agents can choose the right command syntax and path format."
     )]
     async fn get_execution_environment(&self) -> Result<CallToolResult, McpError> {
         Ok(CallToolResult::structured(json!({
             "environment": self.execution_service.command_environment_name(),
+            "defaultServer": self.execution_service.default_server_name(),
+            "availableServers": self.execution_service.available_server_names(),
         })))
     }
 }
@@ -164,6 +171,7 @@ mod tests {
     fn deserializes_output_limit_arguments() {
         let args: ExecuteCommandToolArgs = serde_json::from_value(json!({
             "command": "cargo test",
+            "server": "prod",
             "workingDirectory": "/workspace/project",
             "timeoutMs": 120000,
             "headLines": 12,
@@ -176,6 +184,7 @@ mod tests {
             .expect("arguments should deserialize");
 
         assert_eq!(args.command, "cargo test");
+        assert_eq!(args.server.as_deref(), Some("prod"));
         assert_eq!(
             args.working_directory.as_deref(),
             Some("/workspace/project")

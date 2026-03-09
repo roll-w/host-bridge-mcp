@@ -38,6 +38,14 @@ impl RuntimePlatform {
     pub fn is_windows(self) -> bool {
         matches!(self, Self::Windows)
     }
+
+    pub fn as_name(self) -> &'static str {
+        match self {
+            Self::Windows => "windows",
+            Self::Linux => "linux",
+            Self::Macos => "macos",
+        }
+    }
 }
 
 pub fn resolve_target_platform(target: TargetPlatform) -> RuntimePlatform {

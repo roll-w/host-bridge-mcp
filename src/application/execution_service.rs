@@ -17,10 +17,12 @@
 use crate::application::command_parser::{parse_command_line, CommandParseError};
 use crate::application::data_dir::execution_output_path;
 use crate::config::AppConfig;
-use crate::domain::path_mapping::PathMapper;
-use crate::domain::platform::runtime::{resolve_target_platform, RuntimePlatform};
+use crate::domain::execution_target::{
+    ExecutionTarget, ExecutionTargetRegistry, ExecutionTransport,
+};
 use crate::domain::platform::spawn::{apply_spawn_plan, SpawnPlanner};
 use crate::domain::policy::{PolicyDecision, PolicyEngine};
+use crate::domain::ssh::build_ssh_invocation;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
@@ -48,6 +50,8 @@ pub enum ExecutionError {
     Parse(#[from] CommandParseError),
     #[error("command execution is denied by policy")]
     Denied,
+    #[error("unknown execution server '{0}'")]
+    UnknownServer(String),
     #[error("timeoutMs must be greater than zero")]
     InvalidTimeout,
     #[error("failed to initialize execution output store: {0}")]
@@ -63,6 +67,8 @@ pub enum ExecutionError {
 pub struct ExecuteCommandInput {
     pub command: String,
     #[serde(default)]
+    pub server: Option<String>,
+    #[serde(default)]
     pub working_directory: Option<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -73,10 +79,12 @@ pub struct ExecuteCommandInput {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfirmationRequest {
+    pub server: String,
+    pub platform: String,
     pub command_line: String,
     pub executable: String,
     pub args: Vec<String>,
-    pub working_directory: String,
+    pub working_directory: Option<String>,
     pub timeout_ms: u64,
     pub env: HashMap<String, String>,
 }
@@ -136,7 +144,7 @@ pub struct PreparedExecution {
 pub struct ExecutionService {
     config: Arc<AppConfig>,
     policy_engine: Arc<PolicyEngine>,
-    path_mapper: Arc<PathMapper>,
+    targets: Arc<ExecutionTargetRegistry>,
     spawn_planner: SpawnPlanner,
     records: Arc<RwLock<HashMap<Uuid, Arc<ExecutionRecord>>>>,
 }
@@ -144,11 +152,12 @@ pub struct ExecutionService {
 #[derive(Debug, Clone)]
 struct RunExecution {
     command_line: String,
-    executable: String,
+    program: String,
     args: Vec<String>,
     working_directory: PathBuf,
     env: HashMap<String, String>,
     timeout_ms: u64,
+    server_name: String,
 }
 
 struct ExecutionRecord {
@@ -279,25 +288,27 @@ impl Drop for RawOutputStore {
 impl ExecutionService {
     pub fn new(config: Arc<AppConfig>) -> Self {
         let policy_engine = PolicyEngine::new((*config).clone());
-        let path_mapper = PathMapper::new(
-            config.execution.path_mappings.clone(),
-            config.execution.target_platform,
-            config.execution.enable_builtin_wsl_mapping,
-        );
+        let targets = ExecutionTargetRegistry::from_config(&config.execution);
 
         Self {
             config,
             policy_engine: Arc::new(policy_engine),
-            path_mapper: Arc::new(path_mapper),
+            targets: Arc::new(targets),
             spawn_planner: SpawnPlanner::current(),
             records: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     pub fn command_environment_name(&self) -> &'static str {
-        runtime_platform_name(resolve_target_platform(
-            self.config.execution.target_platform,
-        ))
+        self.targets.default_target().target_platform.as_name()
+    }
+
+    pub fn default_server_name(&self) -> &str {
+        &self.targets.default_target().name
+    }
+
+    pub fn available_server_names(&self) -> Vec<String> {
+        self.targets.target_names()
     }
 
     pub async fn prepare_command(
@@ -312,25 +323,65 @@ impl ExecutionService {
             return Err(ExecutionError::Denied);
         }
 
+        let target = self.resolve_target(input.server.as_deref())?;
         let timeout_ms = self.resolve_timeout(input.timeout_ms)?;
-        let working_directory = self.resolve_working_directory(
-            input.working_directory.as_deref(),
-            policy.default_working_directory.as_deref(),
-        )?;
-
-        let executable = self.path_mapper.map_command_if_path(&parsed.program);
+        let executable = target.path_mapper.map_command_if_path(&parsed.program);
         let args = parsed
             .args
             .iter()
-            .map(|argument| self.path_mapper.map_argument_if_path(argument))
+            .map(|argument| target.path_mapper.map_argument_if_path(argument))
             .collect::<Vec<_>>();
+
+        let (program, program_args, working_directory, preview_working_directory, local_env) =
+            match &target.transport {
+                ExecutionTransport::Host => {
+                    let working_directory = self.resolve_local_working_directory(
+                        target,
+                        input.working_directory.as_deref(),
+                        policy.default_working_directory.as_deref(),
+                    )?;
+                    (
+                        executable.clone(),
+                        args.clone(),
+                        working_directory.clone(),
+                        Some(working_directory.display().to_string()),
+                        input.env.clone(),
+                    )
+                }
+                ExecutionTransport::Ssh(ssh_target) => {
+                    let remote_working_directory = self.resolve_remote_working_directory(
+                        target,
+                        input.working_directory.as_deref(),
+                        policy.default_working_directory.as_deref(),
+                    );
+                    let invocation = build_ssh_invocation(
+                        ssh_target,
+                        target.target_platform,
+                        &executable,
+                        &args,
+                        &input.env,
+                        remote_working_directory.as_deref(),
+                    );
+                    (
+                        invocation.program,
+                        invocation.args,
+                        env::current_dir().map_err(|error| {
+                            ExecutionError::InvalidWorkingDirectory(error.to_string())
+                        })?,
+                        remote_working_directory,
+                        HashMap::new(),
+                    )
+                }
+            };
 
         let confirmation_request =
             (policy.decision == PolicyDecision::RequireConfirmation).then(|| ConfirmationRequest {
+                server: target.name.clone(),
+                platform: target.target_platform.as_name().to_string(),
                 command_line: input.command.clone(),
                 executable: executable.clone(),
                 args: args.clone(),
-                working_directory: working_directory.display().to_string(),
+                working_directory: preview_working_directory.clone(),
                 timeout_ms,
                 env: input.env.clone(),
             });
@@ -338,11 +389,12 @@ impl ExecutionService {
         Ok(PreparedExecution {
             run: RunExecution {
                 command_line: input.command,
-                executable,
-                args,
+                program,
+                args: program_args,
                 working_directory,
-                env: input.env,
+                env: local_env,
                 timeout_ms,
+                server_name: target.name.clone(),
             },
             confirmation_request,
         })
@@ -432,28 +484,29 @@ impl ExecutionService {
         Ok(timeout_ms.min(self.config.execution.max_timeout_ms))
     }
 
-    fn resolve_working_directory(
+    fn resolve_target(
         &self,
+        requested_server: Option<&str>,
+    ) -> Result<&ExecutionTarget, ExecutionError> {
+        self.targets.resolve(requested_server).ok_or_else(|| {
+            ExecutionError::UnknownServer(requested_server.unwrap_or_default().to_string())
+        })
+    }
+
+    fn resolve_local_working_directory(
+        &self,
+        target: &ExecutionTarget,
         requested: Option<&str>,
         default_from_policy: Option<&str>,
     ) -> Result<PathBuf, ExecutionError> {
         let current_directory = env::current_dir()
             .map_err(|error| ExecutionError::InvalidWorkingDirectory(error.to_string()))?;
 
-        let selected = requested
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .or_else(|| {
-                default_from_policy
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-            });
-
-        let Some(raw_path) = selected else {
+        let Some(raw_path) = self.selected_working_directory(requested, default_from_policy) else {
             return Ok(current_directory);
         };
 
-        let mapped = self.path_mapper.map_path(raw_path);
+        let mapped = target.path_mapper.map_path(&raw_path);
         let candidate = PathBuf::from(mapped);
         let resolved = if candidate.is_relative() {
             current_directory.join(candidate)
@@ -477,13 +530,31 @@ impl ExecutionService {
 
         Ok(resolved)
     }
-}
 
-fn runtime_platform_name(platform: RuntimePlatform) -> &'static str {
-    match platform {
-        RuntimePlatform::Windows => "windows",
-        RuntimePlatform::Linux => "linux",
-        RuntimePlatform::Macos => "macos",
+    fn resolve_remote_working_directory(
+        &self,
+        target: &ExecutionTarget,
+        requested: Option<&str>,
+        default_from_policy: Option<&str>,
+    ) -> Option<String> {
+        self.selected_working_directory(requested, default_from_policy)
+            .map(|path| target.path_mapper.map_path(&path))
+    }
+
+    fn selected_working_directory(
+        &self,
+        requested: Option<&str>,
+        default_from_policy: Option<&str>,
+    ) -> Option<String> {
+        requested
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                default_from_policy
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            })
+            .map(ToOwned::to_owned)
     }
 }
 
@@ -498,12 +569,14 @@ async fn run_execution(
         &record,
         ExecutionEvent::Status {
             state: ExecutionState::Running,
-            message: Some(format!("Executing: {}", run.command_line)),
+            message: Some(format!(
+                "Executing on {}: {}",
+                run.server_name, run.command_line
+            )),
         },
     );
 
-    let spawn_plan =
-        spawn_planner.build(&run.executable, &run.args, &run.env, &run.working_directory);
+    let spawn_plan = spawn_planner.build(&run.program, &run.args, &run.env, &run.working_directory);
     let mut command = Command::new(&spawn_plan.program);
     command
         .args(&spawn_plan.args)
@@ -527,7 +600,7 @@ async fn run_execution(
                 execution_id,
                 &record,
                 ExecutionEvent::Error {
-                    message: format!("Failed to spawn '{}': {error}", run.executable),
+                    message: format!("Failed to spawn '{}': {error}", run.program),
                 },
             );
             emit_event(
@@ -769,7 +842,8 @@ fn short_id(execution_id: Uuid) -> String {
 mod tests {
     use super::*;
     use crate::config::{
-        CommandPolicyConfig, CommandRuleConfig, ExecutionConfig, PolicyAction, TargetPlatform,
+        CommandPolicyConfig, CommandRuleConfig, ExecutionConfig, ExecutionServerConfig,
+        PathMappingRule, PolicyAction, TargetPlatform,
     };
 
     fn test_config(execution: ExecutionConfig) -> Arc<AppConfig> {
@@ -810,6 +884,7 @@ mod tests {
         let prepared = service
             .prepare_command(ExecuteCommandInput {
                 command: "cargo build".to_string(),
+                server: None,
                 working_directory: None,
                 env: HashMap::new(),
                 timeout_ms: None,
@@ -817,7 +892,93 @@ mod tests {
             .await
             .expect("command should prepare");
 
-        assert!(prepared.confirmation_request().is_some());
+        let confirmation = prepared
+            .confirmation_request()
+            .expect("confirmation should exist");
+        assert_eq!(confirmation.server, "host");
+        assert_eq!(confirmation.platform, service.command_environment_name());
+    }
+
+    #[tokio::test]
+    async fn prepare_command_rejects_unknown_server() {
+        let service = ExecutionService::new(test_config(ExecutionConfig {
+            default_action: PolicyAction::Allow,
+            ..ExecutionConfig::default()
+        }));
+
+        let error = service
+            .prepare_command(ExecuteCommandInput {
+                command: "cargo build".to_string(),
+                server: Some("missing".to_string()),
+                working_directory: None,
+                env: HashMap::new(),
+                timeout_ms: None,
+            })
+            .await
+            .expect_err("unknown server should fail");
+
+        assert!(matches!(error, ExecutionError::UnknownServer(name) if name == "missing"));
+    }
+
+    #[tokio::test]
+    async fn prepare_command_builds_ssh_invocation_for_remote_server() {
+        let service = ExecutionService::new(test_config(ExecutionConfig {
+            default_action: PolicyAction::Confirm,
+            servers: vec![ExecutionServerConfig::Ssh {
+                name: "prod".to_string(),
+                host: "prod.example.com".to_string(),
+                port: 2222,
+                user: Some("deploy".to_string()),
+                target_platform: TargetPlatform::Linux,
+                enable_builtin_wsl_mapping: false,
+                path_mappings: vec![PathMappingRule {
+                    from: "/workspace".to_string(),
+                    to: "/srv/workspace".to_string(),
+                    platforms: Vec::new(),
+                }],
+                identity_file: Some("/home/dev/.ssh/id_ed25519".to_string()),
+                known_hosts_file: Some("/home/dev/.ssh/known_hosts".to_string()),
+            }],
+            ..ExecutionConfig::default()
+        }));
+
+        let prepared = service
+            .prepare_command(ExecuteCommandInput {
+                command: "cargo build".to_string(),
+                server: Some("prod".to_string()),
+                working_directory: Some("/workspace/app".to_string()),
+                env: HashMap::from([("RUST_LOG".to_string(), "debug".to_string())]),
+                timeout_ms: Some(5_000),
+            })
+            .await
+            .expect("remote command should prepare");
+
+        let confirmation = prepared
+            .confirmation_request()
+            .expect("confirmation should exist");
+        assert_eq!(confirmation.server, "prod");
+        assert_eq!(confirmation.platform, "linux");
+        assert_eq!(
+            confirmation.working_directory.as_deref(),
+            Some("/srv/workspace/app")
+        );
+        assert_eq!(prepared.run.program, "ssh");
+        assert!(prepared.run.args.contains(&"-p".to_string()));
+        assert!(prepared.run.args.contains(&"2222".to_string()));
+        assert!(
+            prepared
+                .run
+                .args
+                .contains(&"deploy@prod.example.com".to_string())
+        );
+        let remote_command = prepared
+            .run
+            .args
+            .last()
+            .expect("remote command should be present");
+        assert!(remote_command.contains("/srv/workspace/app"));
+        assert!(remote_command.contains("RUST_LOG=debug"));
+        assert!(remote_command.contains("cargo"));
     }
 
     #[test]

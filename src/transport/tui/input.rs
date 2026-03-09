@@ -19,7 +19,7 @@ use crate::application::shutdown_controller::ShutdownController;
 use crate::transport::tui::render::log_line_text;
 use crate::transport::tui::state::TuiState;
 use crate::transport::tui::terminal::write_terminal_clipboard;
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
+use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
 use std::io;
 
 pub(super) fn handle_input(
@@ -36,9 +36,8 @@ pub(super) fn handle_input(
             }
 
             match key.code {
-                KeyCode::Char('q') => {
-                    if key.modifiers == KeyModifiers::NONE && shutdown_controller.request_shutdown()
-                    {
+                KeyCode::Char(character) if character.eq_ignore_ascii_case(&'q') => {
+                    if shutdown_controller.request_shutdown() {
                         console.push_log(ConsoleLogLevel::Warn, "Shutdown requested from TUI.");
                         return true;
                     }
@@ -96,10 +95,7 @@ pub(super) fn handle_input(
                 state.extend_log_selection(mouse.column, mouse.row);
                 if let Some((start, end)) = state.selected_log_range() {
                     match copy_logs_to_clipboard(console, start, end) {
-                        Ok(copied_lines) => console.push_log(
-                            ConsoleLogLevel::Info,
-                            format!("Sent {copied_lines} log line(s) to the terminal clipboard."),
-                        ),
+                        Ok(_lines) => {}
                         Err(error) => console.push_log(
                             ConsoleLogLevel::Error,
                             format!("Failed to copy selected logs: {error}"),

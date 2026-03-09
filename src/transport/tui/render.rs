@@ -73,7 +73,7 @@ pub(super) fn log_line_text(entry: &ConsoleLogEntry) -> String {
         ConsoleLogLevel::Warn => "WARN",
         ConsoleLogLevel::Error => "ERROR",
     };
-    format!("[{label}] {}", entry.message)
+    format!("{} {:>5} {}", entry.timestamp, label, entry.message)
 }
 
 fn render_status_bar(frame: &mut Frame, area: Rect, snapshot: &ConsoleSnapshot) {
@@ -233,14 +233,48 @@ fn log_line(entry: &ConsoleLogEntry, selected: bool) -> Line<'static> {
     } else {
         Style::default()
     };
+    let timestamp_style = if selected {
+        line_style.fg(Color::Gray)
+    } else {
+        line_style.fg(Color::DarkGray)
+    };
 
     Line::from(vec![
+        Span::styled(format!("{} ", entry.timestamp), timestamp_style),
         Span::styled(
-            format!("[{label}] "),
+            format!("{label:>5}"),
             line_style.fg(color).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(entry.message.clone(), line_style),
+        Span::styled(format!(" {}", entry.message), line_style),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_line_text_uses_timestamp_and_aligned_level() {
+        let info_entry = ConsoleLogEntry {
+            timestamp: "2026-03-09T16:16:21.751592Z".to_string(),
+            level: ConsoleLogLevel::Info,
+            message: "Execution submitted".to_string(),
+        };
+        let error_entry = ConsoleLogEntry {
+            timestamp: "2026-03-09T16:16:21.751592Z".to_string(),
+            level: ConsoleLogLevel::Error,
+            message: "Execution failed".to_string(),
+        };
+
+        assert_eq!(
+            log_line_text(&info_entry),
+            "2026-03-09T16:16:21.751592Z  INFO Execution submitted"
+        );
+        assert_eq!(
+            log_line_text(&error_entry),
+            "2026-03-09T16:16:21.751592Z ERROR Execution failed"
+        );
+    }
 }
 
 fn short_id(id: uuid::Uuid) -> String {

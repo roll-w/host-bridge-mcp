@@ -195,10 +195,13 @@ fn strip_ascii_case_suffix<'a>(value: &'a str, suffix: &str) -> Option<&'a str> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{
-        CommandPolicyConfig, CommandRuleConfig, ExecutionConfig, LoggingConfig, PolicyAction,
-        ServerConfig,
-    };
+    use crate::config::{CommandPolicyConfig, CommandRuleConfig, ExecutionConfig, PolicyAction};
+
+    fn test_config(execution: ExecutionConfig) -> AppConfig {
+        let mut config = AppConfig::default();
+        config.execution = execution;
+        config
+    }
 
     #[test]
     fn normalize_command_removes_windows_suffix() {
@@ -207,14 +210,10 @@ mod tests {
 
     #[test]
     fn confirm_policy_requires_confirmation() {
-        let config = AppConfig {
-            server: ServerConfig::default(),
-            execution: ExecutionConfig {
-                default_action: PolicyAction::Confirm,
-                ..ExecutionConfig::default()
-            },
-            logging: LoggingConfig::default(),
-        };
+        let config = test_config(ExecutionConfig {
+            default_action: PolicyAction::Confirm,
+            ..ExecutionConfig::default()
+        });
         let engine = PolicyEngine::new(config);
 
         let result = engine.evaluate("mvn", &[]);
@@ -223,24 +222,20 @@ mod tests {
 
     #[test]
     fn subcommand_policy_overrides_command_policy() {
-        let config = AppConfig {
-            server: ServerConfig::default(),
-            execution: ExecutionConfig {
-                default_action: PolicyAction::Allow,
-                commands: vec![CommandPolicyConfig {
-                    command: "mvn".to_string(),
-                    action: PolicyAction::Allow,
+        let config = test_config(ExecutionConfig {
+            default_action: PolicyAction::Allow,
+            commands: vec![CommandPolicyConfig {
+                command: "mvn".to_string(),
+                action: PolicyAction::Allow,
+                default_working_directory: None,
+                rules: vec![CommandRuleConfig {
+                    args_prefix: vec!["clean".to_string(), "install".to_string()],
+                    action: PolicyAction::Deny,
                     default_working_directory: None,
-                    rules: vec![CommandRuleConfig {
-                        args_prefix: vec!["clean".to_string(), "install".to_string()],
-                        action: PolicyAction::Deny,
-                        default_working_directory: None,
-                    }],
                 }],
-                ..ExecutionConfig::default()
-            },
-            logging: LoggingConfig::default(),
-        };
+            }],
+            ..ExecutionConfig::default()
+        });
         let engine = PolicyEngine::new(config);
 
         let result = engine.evaluate("mvn", &["clean".to_string(), "install".to_string()]);
@@ -249,31 +244,27 @@ mod tests {
 
     #[test]
     fn longest_subcommand_pattern_wins() {
-        let config = AppConfig {
-            server: ServerConfig::default(),
-            execution: ExecutionConfig {
-                default_action: PolicyAction::Confirm,
-                commands: vec![CommandPolicyConfig {
-                    command: "npm".to_string(),
-                    action: PolicyAction::Confirm,
-                    default_working_directory: None,
-                    rules: vec![
-                        CommandRuleConfig {
-                            args_prefix: vec!["run".to_string()],
-                            action: PolicyAction::Allow,
-                            default_working_directory: None,
-                        },
-                        CommandRuleConfig {
-                            args_prefix: vec!["run".to_string(), "build".to_string()],
-                            action: PolicyAction::Deny,
-                            default_working_directory: None,
-                        },
-                    ],
-                }],
-                ..ExecutionConfig::default()
-            },
-            logging: LoggingConfig::default(),
-        };
+        let config = test_config(ExecutionConfig {
+            default_action: PolicyAction::Confirm,
+            commands: vec![CommandPolicyConfig {
+                command: "npm".to_string(),
+                action: PolicyAction::Confirm,
+                default_working_directory: None,
+                rules: vec![
+                    CommandRuleConfig {
+                        args_prefix: vec!["run".to_string()],
+                        action: PolicyAction::Allow,
+                        default_working_directory: None,
+                    },
+                    CommandRuleConfig {
+                        args_prefix: vec!["run".to_string(), "build".to_string()],
+                        action: PolicyAction::Deny,
+                        default_working_directory: None,
+                    },
+                ],
+            }],
+            ..ExecutionConfig::default()
+        });
         let engine = PolicyEngine::new(config);
 
         let result = engine.evaluate("npm", &["run".to_string(), "build".to_string()]);
@@ -282,31 +273,27 @@ mod tests {
 
     #[test]
     fn later_rule_wins_when_specificity_matches() {
-        let config = AppConfig {
-            server: ServerConfig::default(),
-            execution: ExecutionConfig {
-                default_action: PolicyAction::Confirm,
-                commands: vec![CommandPolicyConfig {
-                    command: "cargo".to_string(),
-                    action: PolicyAction::Confirm,
-                    default_working_directory: None,
-                    rules: vec![
-                        CommandRuleConfig {
-                            args_prefix: vec!["build".to_string()],
-                            action: PolicyAction::Allow,
-                            default_working_directory: None,
-                        },
-                        CommandRuleConfig {
-                            args_prefix: vec!["build".to_string()],
-                            action: PolicyAction::Deny,
-                            default_working_directory: None,
-                        },
-                    ],
-                }],
-                ..ExecutionConfig::default()
-            },
-            logging: LoggingConfig::default(),
-        };
+        let config = test_config(ExecutionConfig {
+            default_action: PolicyAction::Confirm,
+            commands: vec![CommandPolicyConfig {
+                command: "cargo".to_string(),
+                action: PolicyAction::Confirm,
+                default_working_directory: None,
+                rules: vec![
+                    CommandRuleConfig {
+                        args_prefix: vec!["build".to_string()],
+                        action: PolicyAction::Allow,
+                        default_working_directory: None,
+                    },
+                    CommandRuleConfig {
+                        args_prefix: vec!["build".to_string()],
+                        action: PolicyAction::Deny,
+                        default_working_directory: None,
+                    },
+                ],
+            }],
+            ..ExecutionConfig::default()
+        });
 
         let engine = PolicyEngine::new(config);
         let result = engine.evaluate("cargo", &["build".to_string()]);
@@ -315,24 +302,20 @@ mod tests {
 
     #[test]
     fn grouped_command_policy_uses_command_action_and_nested_override() {
-        let config = AppConfig {
-            server: ServerConfig::default(),
-            execution: ExecutionConfig {
-                default_action: PolicyAction::Confirm,
-                commands: vec![CommandPolicyConfig {
-                    command: "npm".to_string(),
-                    action: PolicyAction::Allow,
-                    default_working_directory: Some("/workspace/frontend".to_string()),
-                    rules: vec![CommandRuleConfig {
-                        args_prefix: vec!["publish".to_string()],
-                        action: PolicyAction::Deny,
-                        default_working_directory: None,
-                    }],
+        let config = test_config(ExecutionConfig {
+            default_action: PolicyAction::Confirm,
+            commands: vec![CommandPolicyConfig {
+                command: "npm".to_string(),
+                action: PolicyAction::Allow,
+                default_working_directory: Some("/workspace/frontend".to_string()),
+                rules: vec![CommandRuleConfig {
+                    args_prefix: vec!["publish".to_string()],
+                    action: PolicyAction::Deny,
+                    default_working_directory: None,
                 }],
-                ..ExecutionConfig::default()
-            },
-            logging: LoggingConfig::default(),
-        };
+            }],
+            ..ExecutionConfig::default()
+        });
 
         let engine = PolicyEngine::new(config);
 

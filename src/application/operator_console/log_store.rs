@@ -14,13 +14,19 @@
  * limitations under the License.
  */
 
+use crate::application::data_dir::default_persisted_log_path;
 use crate::application::operator_console::{ConsoleLogEntry, ConsoleLogLevel};
 use crate::config::LoggingConfig;
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use tracing_subscriber::fmt::format::Writer;
+use tracing_subscriber::fmt::time::{FormatTime, SystemTime as TracingSystemTime};
 use uuid::Uuid;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 pub(super) struct LogStore {
     buffer_limit: usize,
@@ -39,11 +45,14 @@ struct LogFileStorage {
 
 impl LogStore {
     pub(super) fn new(logging: LoggingConfig) -> io::Result<Self> {
+        let buffer_limit = logging.memory_buffer_lines;
+        let storage = LogFileStorage::new(logging)?;
+
         Ok(Self {
-            buffer_limit: logging.memory_buffer_lines,
-            buffered_logs: VecDeque::with_capacity(logging.memory_buffer_lines),
-            total_log_count: 0,
-            storage: LogFileStorage::new(logging)?,
+            buffer_limit,
+            buffered_logs: VecDeque::with_capacity(buffer_limit),
+            total_log_count: storage.line_count(),
+            storage,
         })
     }
 
@@ -56,7 +65,11 @@ impl LogStore {
     }
 
     pub(super) fn append(&mut self, level: ConsoleLogLevel, message: String) {
-        let entry = ConsoleLogEntry { level, message };
+        let entry = ConsoleLogEntry {
+            timestamp: current_log_timestamp(),
+            level,
+            message,
+        };
         if self.buffered_logs.len() >= self.buffer_limit {
             self.buffered_logs.pop_front();
         }
@@ -96,36 +109,41 @@ impl LogStore {
 
 impl LogFileStorage {
     fn new(logging: LoggingConfig) -> io::Result<Self> {
-        let path = resolve_log_path(&logging);
+        let path = resolve_log_path(&logging)?;
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)?;
             }
         }
 
-        let writer = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&path)?;
+        let append_mode = logging.persist_file;
+        let (line_offsets, next_offset) = if append_mode {
+            index_log_file(&path)?
+        } else {
+            (Vec::new(), 0)
+        };
+        let writer = open_private_write_file(&path, append_mode)?;
 
         Ok(Self {
             path,
             writer: Some(writer),
-            line_offsets: Vec::new(),
-            next_offset: 0,
+            line_offsets,
+            next_offset,
             delete_on_drop: !logging.persist_file,
         })
     }
 
+    fn line_count(&self) -> usize {
+        self.line_offsets.len()
+    }
+
     fn append(&mut self, entry: &ConsoleLogEntry) {
-        let serialized = format!("{}\t{}\n", log_level_tag(entry.level), entry.message);
-        self.line_offsets.push(self.next_offset);
-        self.next_offset += serialized.len() as u64;
+        let serialized = serialize_log_entry(entry);
 
         if let Some(writer) = self.writer.as_mut() {
-            if writer.write_all(serialized.as_bytes()).is_ok() {
-                let _ = writer.flush();
+            if writer.write_all(serialized.as_bytes()).is_ok() && writer.flush().is_ok() {
+                self.line_offsets.push(self.next_offset);
+                self.next_offset += serialized.len() as u64;
             }
         }
     }
@@ -188,24 +206,95 @@ impl Drop for LogFileStorage {
     }
 }
 
-fn resolve_log_path(logging: &LoggingConfig) -> PathBuf {
+fn resolve_log_path(logging: &LoggingConfig) -> io::Result<PathBuf> {
     if let Some(path) = &logging.file_path {
-        return PathBuf::from(path);
+        return Ok(PathBuf::from(path));
     }
 
     if logging.persist_file {
-        return PathBuf::from("host-bridge-mcp.log");
+        return default_persisted_log_path();
     }
 
-    std::env::temp_dir().join(format!("host-bridge-mcp-{}.log", Uuid::new_v4()))
+    Ok(std::env::temp_dir().join(format!("host-bridge-mcp-{}.log", Uuid::new_v4())))
+}
+
+fn open_private_write_file(path: &Path, append_mode: bool) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).write(true);
+
+    if append_mode {
+        options.append(true);
+    } else {
+        options.truncate(true);
+    }
+
+    #[cfg(unix)]
+    options.mode(0o600);
+
+    options.open(path)
+}
+
+fn index_log_file(path: &Path) -> io::Result<(Vec<u64>, u64)> {
+    if !path.exists() {
+        return Ok((Vec::new(), 0));
+    }
+
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut line_offsets = Vec::new();
+    let mut next_offset = 0_u64;
+    let mut buffer = Vec::new();
+
+    loop {
+        buffer.clear();
+        let read = reader.read_until(b'\n', &mut buffer)?;
+        if read == 0 {
+            break;
+        }
+
+        line_offsets.push(next_offset);
+        next_offset += read as u64;
+    }
+
+    Ok((line_offsets, next_offset))
 }
 
 fn parse_log_line(raw: &str) -> Option<ConsoleLogEntry> {
-    let (tag, message) = raw.split_once('\t')?;
+    let (timestamp, remainder) = raw.split_once(' ')?;
+    if remainder.len() < 6 {
+        return None;
+    }
+
+    let (level_field, message_field) = remainder.split_at(5);
+    let message = message_field.strip_prefix(' ')?;
+
     Some(ConsoleLogEntry {
-        level: parse_log_level(tag)?,
+        timestamp: timestamp.to_string(),
+        level: parse_log_level(level_field.trim())?,
         message: message.to_string(),
     })
+}
+
+fn current_log_timestamp() -> String {
+    let timer = TracingSystemTime::default();
+    let mut output = String::new();
+    let mut writer = Writer::new(&mut output);
+
+    if timer.format_time(&mut writer).is_err() {
+        return "1970-01-01T00:00:00.000000Z".to_string();
+    }
+
+    output.truncate(output.trim_end().len());
+    output
+}
+
+fn serialize_log_entry(entry: &ConsoleLogEntry) -> String {
+    format!(
+        "{} {:>5} {}\n",
+        entry.timestamp,
+        log_level_tag(entry.level),
+        entry.message
+    )
 }
 
 fn log_level_tag(level: ConsoleLogLevel) -> &'static str {
@@ -222,5 +311,48 @@ fn parse_log_level(tag: &str) -> Option<ConsoleLogLevel> {
         "WARN" => Some(ConsoleLogLevel::Warn),
         "ERROR" => Some(ConsoleLogLevel::Error),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_log_timestamp_matches_expected_utc_shape() {
+        let timestamp = current_log_timestamp();
+        let bytes = timestamp.as_bytes();
+
+        assert_eq!(timestamp.len(), 27);
+        assert_eq!(bytes[4], b'-');
+        assert_eq!(bytes[7], b'-');
+        assert_eq!(bytes[10], b'T');
+        assert_eq!(bytes[13], b':');
+        assert_eq!(bytes[16], b':');
+        assert_eq!(bytes[19], b'.');
+        assert_eq!(bytes[26], b'Z');
+    }
+
+    #[test]
+    fn serialize_log_entry_aligns_info_and_error_levels() {
+        let info_entry = ConsoleLogEntry {
+            timestamp: "2026-03-09T16:16:21.751592Z".to_string(),
+            level: ConsoleLogLevel::Info,
+            message: "submitted".to_string(),
+        };
+        let error_entry = ConsoleLogEntry {
+            timestamp: "2026-03-09T16:16:21.751592Z".to_string(),
+            level: ConsoleLogLevel::Error,
+            message: "failed".to_string(),
+        };
+
+        assert_eq!(
+            serialize_log_entry(&info_entry),
+            "2026-03-09T16:16:21.751592Z  INFO submitted\n"
+        );
+        assert_eq!(
+            serialize_log_entry(&error_entry),
+            "2026-03-09T16:16:21.751592Z ERROR failed\n"
+        );
     }
 }

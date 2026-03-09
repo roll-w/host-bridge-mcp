@@ -1,0 +1,100 @@
+# host-bridge-mcp default configuration
+#
+# Override this file location by setting:
+#   HOST_BRIDGE_CONFIG=/path/to/host-bridge.yaml
+
+server:
+  bind-process: 127.0.0.1:8787
+  access:
+  # Set api-key-env to require:
+  # Authorization: Bearer <value from HOST_BRIDGE_API_KEY>
+  # api-key-env: HOST_BRIDGE_API_KEY
+
+logging:
+  memory-buffer-lines: 2000
+
+  # Optional on-disk log file path.
+  # When omitted and persist-file = false, the server uses a temporary file and deletes it on exit.
+  # When omitted and persist-file = true, the server writes under its host-bridge data directory.
+  # file-path: /absolute/path/to/host-bridge-mcp.log
+
+  persist-file: false
+
+execution:
+  # Merged execution output files are stored under the host-bridge data directory as executions/<executionId>.log.
+
+  # Default action when command has no explicit policy.
+  # allow   = run directly
+  # confirm = require user confirmation from the TUI operator
+  # deny    = reject
+  default-action: confirm
+
+  # Default timeout for each command (milliseconds).
+  default-timeout-ms: 1800000
+
+  # Hard cap for timeoutMs passed from tool calls.
+  max-timeout-ms: 7200000
+
+  # Enable built-in /mnt/<drive>/... -> <DRIVE>:\... mapping for Windows targets.
+  enable-builtin-wsl-mapping: true
+
+  # Optional global default working directory.
+  # default-working-directory: /workspace
+
+  # Command execution strategy.
+  # Group each command with its default action and optional subcommand overrides.
+  commands:
+    - command: java
+      action: confirm
+
+    - command: mvn
+      action: allow
+      rules:
+        - args-prefix:
+            - clean
+            - compile
+          action: confirm
+        - args-prefix:
+            - deploy
+          action: deny
+
+    - command: gradle
+      action: allow
+
+    - command: npm
+      action: allow
+      rules:
+        - args-prefix:
+            - publish
+          action: confirm
+
+    - command: pnpm
+      action: allow
+
+    - command: cargo
+      action: allow
+      rules:
+        - args-prefix:
+            - publish
+          action: confirm
+
+    - command: rustc
+      action: allow
+
+  # Path mapping is platform-agnostic.
+  # You can map container paths, WSL paths, remote mount paths, or host paths.
+  # Rules are prefix-based and are applied in order.
+  path-mappings:
+    - from: /workspace/mnt/d
+      to: D:\
+      platforms:
+        - windows
+        - wsl
+
+    - from: /app/workspace
+      to: /Users/Shared/workspace
+
+    - from: /src
+      to: /Users/dev/src
+      platforms:
+        - macos

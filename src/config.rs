@@ -18,10 +18,10 @@ use serde::Deserialize;
 use std::path::Path;
 
 const CONFIG_ENV_KEY: &str = "HOST_BRIDGE_CONFIG";
-const DEFAULT_CONFIG_FILE: &str = "host-bridge.toml";
+const DEFAULT_CONFIG_FILE: &str = "host-bridge.yaml";
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct AppConfig {
     pub server: ServerConfig,
     pub execution: ExecutionConfig,
@@ -29,13 +29,21 @@ pub struct AppConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ServerConfig {
+    #[serde(rename = "bind-process")]
     pub bind_address: String,
+    pub access: AccessConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct AccessConfig {
+    pub api_key_env: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct LoggingConfig {
     pub memory_buffer_lines: usize,
     pub file_path: Option<String>,
@@ -43,7 +51,7 @@ pub struct LoggingConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ExecutionConfig {
     pub default_action: PolicyAction,
     #[serde(default)]
@@ -57,6 +65,7 @@ pub struct ExecutionConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct CommandPolicyConfig {
     pub command: String,
     pub action: PolicyAction,
@@ -66,6 +75,7 @@ pub struct CommandPolicyConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct CommandRuleConfig {
     #[serde(default)]
     pub args_prefix: Vec<String>,
@@ -74,7 +84,7 @@ pub struct CommandRuleConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct PathMappingRule {
     pub from: String,
     pub to: String,
@@ -121,7 +131,7 @@ pub enum ConfigError {
     Parse {
         path: String,
         #[source]
-        source: toml::de::Error,
+        source: serde_yaml::Error,
     },
     #[error("invalid config: {0}")]
     Validation(String),
@@ -140,8 +150,15 @@ impl Default for AppConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            bind_address: "0.0.0.0:8787".to_string(),
+            bind_address: "127.0.0.1:8787".to_string(),
+            access: AccessConfig::default(),
         }
+    }
+}
+
+impl Default for AccessConfig {
+    fn default() -> Self {
+        Self { api_key_env: None }
     }
 }
 
@@ -186,47 +203,67 @@ impl AppConfig {
     }
 
     pub fn load_with_path(config_path: Option<&str>) -> Result<Self, ConfigError> {
-        let path = config_path
+        let explicit_path = config_path
             .map(|value| value.to_string())
-            .unwrap_or_else(|| {
-                std::env::var(CONFIG_ENV_KEY).unwrap_or_else(|_| DEFAULT_CONFIG_FILE.to_string())
-            });
+            .or_else(|| std::env::var(CONFIG_ENV_KEY).ok());
+        let path = explicit_path
+            .clone()
+            .unwrap_or_else(|| DEFAULT_CONFIG_FILE.to_string());
         if !Path::new(&path).exists() {
-            return Ok(Self::default());
+            return if explicit_path.is_some() {
+                Err(ConfigError::Read {
+                    path,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "configuration file was not found",
+                    ),
+                })
+            } else {
+                Ok(Self::default())
+            };
         }
 
         let raw = std::fs::read_to_string(&path).map_err(|source| ConfigError::Read {
             path: path.clone(),
             source,
         })?;
-        let value = toml::from_str::<toml::Value>(&raw).map_err(|source| ConfigError::Parse {
-            path: path.clone(),
-            source,
+        let value = serde_yaml::from_str::<serde_yaml::Value>(&raw).map_err(|source| {
+            ConfigError::Parse {
+                path: path.clone(),
+                source,
+            }
         })?;
         reject_legacy_execution_keys(&value)?;
-        let config = value
-            .try_into::<Self>()
+        let config = serde_yaml::from_str::<Self>(&raw)
             .map_err(|source| ConfigError::Parse { path, source })?;
         config.validate()?;
         Ok(config)
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        if self.server.bind_address.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "server.bind-process cannot be empty".to_string(),
+            ));
+        }
+
+        validate_server_access(&self.server.access, "server.access")?;
+
         if self.execution.default_timeout_ms == 0 {
             return Err(ConfigError::Validation(
-                "execution.default_timeout_ms must be greater than zero".to_string(),
+                "execution.default-timeout-ms must be greater than zero".to_string(),
             ));
         }
 
         if self.execution.max_timeout_ms == 0 {
             return Err(ConfigError::Validation(
-                "execution.max_timeout_ms must be greater than zero".to_string(),
+                "execution.max-timeout-ms must be greater than zero".to_string(),
             ));
         }
 
         if self.execution.max_timeout_ms < self.execution.default_timeout_ms {
             return Err(ConfigError::Validation(
-                "execution.max_timeout_ms must be greater than or equal to execution.default_timeout_ms"
+                "execution.max-timeout-ms must be greater than or equal to execution.default-timeout-ms"
                     .to_string(),
             ));
         }
@@ -238,24 +275,24 @@ impl AppConfig {
             )?;
             validate_working_directory(
                 command.default_working_directory.as_deref(),
-                &format!("execution.commands[{index}].default_working_directory"),
+                &format!("execution.commands[{index}].default-working-directory"),
             )?;
 
             for (rule_index, rule) in command.rules.iter().enumerate() {
                 if rule.args_prefix.is_empty() {
                     return Err(ConfigError::Validation(format!(
-                        "execution.commands[{index}].rules[{rule_index}].args_prefix must contain at least one token"
+                        "execution.commands[{index}].rules[{rule_index}].args-prefix must contain at least one token"
                     )));
                 }
 
                 validate_args_prefix(
                     &rule.args_prefix,
-                    &format!("execution.commands[{index}].rules[{rule_index}].args_prefix"),
+                    &format!("execution.commands[{index}].rules[{rule_index}].args-prefix"),
                 )?;
                 validate_working_directory(
                     rule.default_working_directory.as_deref(),
                     &format!(
-                        "execution.commands[{index}].rules[{rule_index}].default_working_directory"
+                        "execution.commands[{index}].rules[{rule_index}].default-working-directory"
                     ),
                 )?;
             }
@@ -264,18 +301,18 @@ impl AppConfig {
         for rule in &self.execution.path_mappings {
             if rule.from.trim().is_empty() || rule.to.trim().is_empty() {
                 return Err(ConfigError::Validation(
-                    "execution.path_mappings entries require non-empty from/to".to_string(),
+                    "execution.path-mappings entries require non-empty from/to".to_string(),
                 ));
             }
         }
 
         if self.logging.memory_buffer_lines == 0 {
             return Err(ConfigError::Validation(
-                "logging.memory_buffer_lines must be greater than zero".to_string(),
+                "logging.memory-buffer-lines must be greater than zero".to_string(),
             ));
         }
 
-        validate_working_directory(self.logging.file_path.as_deref(), "logging.file_path")?;
+        validate_working_directory(self.logging.file_path.as_deref(), "logging.file-path")?;
 
         Ok(())
     }
@@ -291,22 +328,38 @@ fn validate_command_name(command: &str, location: &str) -> Result<(), ConfigErro
     Ok(())
 }
 
-fn reject_legacy_execution_keys(value: &toml::Value) -> Result<(), ConfigError> {
-    let Some(execution) = value.get("execution").and_then(toml::Value::as_table) else {
+fn reject_legacy_execution_keys(value: &serde_yaml::Value) -> Result<(), ConfigError> {
+    let Some(execution) = value
+        .as_mapping()
+        .and_then(|root| root.get(serde_yaml::Value::String("execution".to_string())))
+        .and_then(serde_yaml::Value::as_mapping)
+    else {
         return Ok(());
     };
 
-    if execution.contains_key("default_policy") {
+    if execution.contains_key(&serde_yaml::Value::String("default_policy".to_string())) {
         return Err(ConfigError::Validation(
-            "execution.default_policy is no longer supported; use execution.default_action"
+            "execution.default-policy is no longer supported; use execution.default-action"
                 .to_string(),
         ));
     }
 
-    if execution.contains_key("rules") {
+    if execution.contains_key(&serde_yaml::Value::String("rules".to_string())) {
         return Err(ConfigError::Validation(
             "execution.rules is no longer supported; migrate to execution.commands".to_string(),
         ));
+    }
+
+    Ok(())
+}
+
+fn validate_server_access(access: &AccessConfig, location: &str) -> Result<(), ConfigError> {
+    if let Some(api_key_env) = access.api_key_env.as_deref() {
+        if api_key_env.trim().is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "{location}.api-key-env cannot be empty when provided"
+            )));
+        }
     }
 
     Ok(())
@@ -351,7 +404,6 @@ mod tests {
     #[test]
     fn reject_command_policy_with_empty_command() {
         let config = AppConfig {
-            server: ServerConfig::default(),
             execution: ExecutionConfig {
                 commands: vec![CommandPolicyConfig {
                     command: "   ".to_string(),
@@ -361,7 +413,7 @@ mod tests {
                 }],
                 ..ExecutionConfig::default()
             },
-            logging: LoggingConfig::default(),
+            ..AppConfig::default()
         };
 
         let error = config.validate().expect_err("config should be invalid");
@@ -371,7 +423,6 @@ mod tests {
     #[test]
     fn reject_nested_command_rule_without_args_prefix() {
         let config = AppConfig {
-            server: ServerConfig::default(),
             execution: ExecutionConfig {
                 commands: vec![CommandPolicyConfig {
                     command: "cargo".to_string(),
@@ -385,19 +436,18 @@ mod tests {
                 }],
                 ..ExecutionConfig::default()
             },
-            logging: LoggingConfig::default(),
+            ..AppConfig::default()
         };
 
         let error = config.validate().expect_err("config should be invalid");
         assert!(error.to_string().contains(
-            "execution.commands[0].rules[0].args_prefix must contain at least one token"
+            "execution.commands[0].rules[0].args-prefix must contain at least one token"
         ));
     }
 
     #[test]
     fn reject_empty_nested_command_rule_token() {
         let config = AppConfig {
-            server: ServerConfig::default(),
             execution: ExecutionConfig {
                 commands: vec![CommandPolicyConfig {
                     command: "cargo".to_string(),
@@ -411,22 +461,22 @@ mod tests {
                 }],
                 ..ExecutionConfig::default()
             },
-            logging: LoggingConfig::default(),
+            ..AppConfig::default()
         };
 
         let error = config.validate().expect_err("config should be invalid");
         assert!(
             error
                 .to_string()
-                .contains("execution.commands[0].rules[0].args_prefix[1]")
+                .contains("execution.commands[0].rules[0].args-prefix[1]")
         );
     }
 
     #[test]
     fn reject_legacy_default_policy_key_when_loading() {
         let path = write_temp_config(
-            r#"[execution]
-default_policy = "allow"
+            r#"execution:
+  default_policy: allow
 "#,
         );
 
@@ -435,7 +485,7 @@ default_policy = "allow"
         assert!(
             error
                 .to_string()
-                .contains("execution.default_policy is no longer supported")
+                .contains("execution.default-policy is no longer supported")
         );
 
         let _ = fs::remove_file(path);
@@ -444,13 +494,13 @@ default_policy = "allow"
     #[test]
     fn reject_legacy_rules_key_when_loading() {
         let path = write_temp_config(
-            r#"[execution]
-default_action = "confirm"
-
-[[execution.rules]]
-command = "cargo"
-action = "deny"
-args_prefix = ["publish"]
+            r#"execution:
+  default-action: confirm
+  rules:
+    - command: cargo
+      action: deny
+      args-prefix:
+        - publish
 "#,
         );
 
@@ -470,8 +520,58 @@ args_prefix = ["publish"]
             .duration_since(UNIX_EPOCH)
             .expect("system time should be after unix epoch")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("host-bridge-config-{unique}.toml"));
+        let path = std::env::temp_dir().join(format!("host-bridge-config-{unique}.yaml"));
         fs::write(&path, contents).expect("temp config should be written");
         path
+    }
+
+    #[test]
+    fn default_config_uses_single_server() {
+        let config = AppConfig::default();
+
+        assert_eq!(config.server.bind_address, "127.0.0.1:8787");
+        assert_eq!(config.server.access, AccessConfig::default());
+    }
+
+    #[test]
+    fn explicit_missing_config_path_fails_to_load() {
+        let error = AppConfig::load_with_path(Some("definitely-missing-config.yaml"))
+            .expect_err("missing explicit config should fail");
+
+        assert!(matches!(error, ConfigError::Read { .. }));
+    }
+
+    #[test]
+    fn unknown_yaml_fields_are_rejected() {
+        let path = write_temp_config(
+            r#"server:
+  bind-process: 127.0.0.1:8787
+    unexpected: true
+"#,
+        );
+
+        let error = AppConfig::load_with_path(Some(path.to_str().expect("valid temp path")))
+            .expect_err("unknown fields should be rejected");
+
+        assert!(matches!(error, ConfigError::Parse { .. }));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_access_header_fields_are_rejected() {
+        let path = write_temp_config(
+            r#"server:
+  bind-process: 127.0.0.1:8787
+  access:
+    api-key-env: HOST_BRIDGE_API_KEY
+    header-name: Authorization
+"#,
+        );
+
+        let error = AppConfig::load_with_path(Some(path.to_str().expect("valid temp path")))
+            .expect_err("legacy auth header config should be rejected");
+
+        assert!(matches!(error, ConfigError::Parse { .. }));
+        let _ = fs::remove_file(path);
     }
 }

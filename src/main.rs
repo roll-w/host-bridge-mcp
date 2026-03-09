@@ -26,11 +26,14 @@ use application::shutdown_controller::ShutdownController;
 use cli::{help_text, parse_args, version_text};
 use config::AppConfig;
 use domain::platform::signal::wait_for_termination_signal;
-use std::io::{self, Write};
+use std::fmt;
+use std::io;
 use std::process::ExitCode;
 use std::sync::Arc;
-use tracing_subscriber::fmt::MakeWriter;
-use tracing_subscriber::EnvFilter;
+use tracing::{Event, Level, Subscriber};
+use tracing_subscriber::field::Visit;
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::{fmt as tracing_fmt, util::SubscriberInitExt, EnvFilter, Layer};
 use transport::mcp_streamable_http::router;
 use transport::tui;
 
@@ -79,33 +82,46 @@ async fn main() -> ExitCode {
         }
     };
 
-    let execution_service = ExecutionService::new(config.clone(), operator_console.clone());
-    let app = router(execution_service, operator_console.clone());
-    let listener = match bind_server_listener(&config.server.bind_address).await {
+    let shutdown_controller = ShutdownController::default();
+    let tui_active = tui::start(operator_console.clone(), shutdown_controller.clone());
+    init_logging(operator_console.clone(), !tui_active);
+
+    if tui_active {
+        tracing::info!("Interactive TUI ready");
+    } else {
+        tracing::warn!(
+            "Interactive TUI unavailable; confirmation-required commands will be rejected"
+        );
+    }
+
+    spawn_system_signal_handler(shutdown_controller.clone());
+
+    let execution_service = ExecutionService::new(config.clone());
+    let app = match router(
+        execution_service,
+        operator_console.clone(),
+        config.server.access.clone(),
+    ) {
+        Ok(app) => app,
+        Err(error) => {
+            tracing::error!(error = %error, "Failed to initialize request authentication");
+            return ExitCode::FAILURE;
+        }
+    };
+    let bind_address = &config.server.bind_address;
+    let listener = match bind_server_listener(bind_address).await {
         Ok(listener) => listener,
         Err(error) => {
-            let message = format_bind_error(&config.server.bind_address, &error);
-            operator_console.push_log(ConsoleLogLevel::Error, message.clone());
-            eprintln!("{message}");
+            let message = format_bind_error(bind_address, &error);
+            tracing::error!("{message}");
             return ExitCode::FAILURE;
         }
     };
 
-    let shutdown_controller = ShutdownController::default();
-    let tui_active = tui::start(operator_console.clone(), shutdown_controller.clone());
-    init_logging(operator_console.clone(), !tui_active);
-    spawn_system_signal_handler(shutdown_controller.clone(), operator_console.clone());
-
-    if tui_active {
-        operator_console.push_log(ConsoleLogLevel::Info, "Interactive TUI ready.");
-    } else {
-        operator_console.push_log(
-            ConsoleLogLevel::Warn,
-            "Interactive TUI unavailable; confirmation-required commands will be rejected.",
-        );
-    }
-
-    tracing::info!(bind_address = %config.server.bind_address, "host-bridge-mcp listening");
+    tracing::info!(
+        bind_address = %bind_address,
+        "host-bridge-mcp listening"
+    );
     let shutdown_waiter = shutdown_controller.clone();
     let server = axum::serve(listener, app).with_graceful_shutdown(async move {
         shutdown_waiter.wait_for_shutdown().await;
@@ -126,7 +142,7 @@ async fn bind_server_listener(bind_address: &str) -> io::Result<tokio::net::TcpL
 fn format_bind_error(bind_address: &str, error: &io::Error) -> String {
     if error.kind() == io::ErrorKind::AddrInUse {
         return format!(
-            "Failed to bind {bind_address}: the port is already in use. Stop the other process or change `server.bind_address` in the config."
+            "Failed to bind {bind_address}: the port is already in use. Stop the other process or change `server.bind-process` in the config."
         );
     }
 
@@ -135,81 +151,74 @@ fn format_bind_error(bind_address: &str, error: &io::Error) -> String {
 
 fn init_logging(operator_console: OperatorConsole, mirror_to_stderr: bool) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_writer(ConsoleTracingWriterFactory {
-            operator_console,
-            mirror_to_stderr,
-        })
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(OperatorConsoleLayer { operator_console })
+        .with(mirror_to_stderr.then(|| {
+            tracing_fmt::layer()
+                .with_timer(tracing_fmt::time::SystemTime::default())
+                .with_target(false)
+                .with_writer(io::stderr)
+        }))
         .init();
 }
 
-#[derive(Clone)]
-struct ConsoleTracingWriterFactory {
+struct OperatorConsoleLayer {
     operator_console: OperatorConsole,
-    mirror_to_stderr: bool,
 }
 
-struct ConsoleTracingWriter {
-    operator_console: OperatorConsole,
-    stderr: Option<io::Stderr>,
-    buffer: Vec<u8>,
+impl<S> Layer<S> for OperatorConsoleLayer
+where
+    S: Subscriber,
+{
+    fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+        let level = match *event.metadata().level() {
+            Level::ERROR => ConsoleLogLevel::Error,
+            Level::WARN => ConsoleLogLevel::Warn,
+            Level::INFO | Level::DEBUG | Level::TRACE => ConsoleLogLevel::Info,
+        };
+
+        let mut visitor = EventFieldVisitor::default();
+        event.record(&mut visitor);
+        self.operator_console.push_log(level, visitor.finish());
+    }
 }
 
-impl<'a> MakeWriter<'a> for ConsoleTracingWriterFactory {
-    type Writer = ConsoleTracingWriter;
+#[derive(Default)]
+struct EventFieldVisitor {
+    message: Option<String>,
+    fields: Vec<String>,
+}
 
-    fn make_writer(&'a self) -> Self::Writer {
-        ConsoleTracingWriter {
-            operator_console: self.operator_console.clone(),
-            stderr: self.mirror_to_stderr.then(io::stderr),
-            buffer: Vec::with_capacity(256),
+impl EventFieldVisitor {
+    fn finish(self) -> String {
+        match (self.message, self.fields.is_empty()) {
+            (Some(message), true) => message,
+            (Some(message), false) => format!("{message} {}", self.fields.join(" ")),
+            (None, false) => self.fields.join(" "),
+            (None, true) => String::new(),
         }
     }
 }
 
-impl Write for ConsoleTracingWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if let Some(stderr) = self.stderr.as_mut() {
-            stderr.write_all(buf)?;
+impl Visit for EventFieldVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.message = Some(value.to_string());
+            return;
         }
 
-        self.buffer.extend_from_slice(buf);
-        self.flush_complete_lines();
-        Ok(buf.len())
+        self.fields.push(format!("{}={value}", field.name()));
     }
 
-    fn flush(&mut self) -> io::Result<()> {
-        if let Some(stderr) = self.stderr.as_mut() {
-            stderr.flush()?;
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+        let rendered = format!("{value:?}");
+        if field.name() == "message" {
+            self.message = Some(rendered.trim_matches('"').to_string());
+            return;
         }
 
-        self.flush_complete_lines();
-        Ok(())
-    }
-}
-
-impl ConsoleTracingWriter {
-    fn flush_complete_lines(&mut self) {
-        while let Some(position) = self.buffer.iter().position(|byte| *byte == b'\n') {
-            let line = self.buffer.drain(..=position).collect::<Vec<_>>();
-            let text = String::from_utf8_lossy(&line);
-            let trimmed = text.trim_end_matches(['\n', '\r']);
-            self.operator_console
-                .push_log(ConsoleLogLevel::Info, trimmed.to_string());
-        }
-    }
-}
-
-impl Drop for ConsoleTracingWriter {
-    fn drop(&mut self) {
-        if !self.buffer.is_empty() {
-            let text = String::from_utf8_lossy(&self.buffer);
-            self.operator_console
-                .push_log(ConsoleLogLevel::Info, text.to_string());
-            self.buffer.clear();
-        }
+        self.fields.push(format!("{}={rendered}", field.name()));
     }
 }
 
@@ -224,7 +233,7 @@ mod tests {
 
         assert!(message.contains("127.0.0.1:8787"));
         assert!(message.contains("already in use"));
-        assert!(message.contains("server.bind_address"));
+        assert!(message.contains("server.bind-process"));
     }
 
     #[tokio::test]
@@ -245,24 +254,15 @@ mod tests {
     }
 }
 
-fn spawn_system_signal_handler(
-    shutdown_controller: ShutdownController,
-    operator_console: OperatorConsole,
-) {
+fn spawn_system_signal_handler(shutdown_controller: ShutdownController) {
     tokio::spawn(async move {
         match wait_for_termination_signal().await {
             Ok(signal_name) => {
-                operator_console.push_log(
-                    ConsoleLogLevel::Warn,
-                    format!("System signal received: {signal_name}. Shutting down server."),
-                );
+                tracing::warn!(signal = %signal_name, "System signal received. Shutting down server");
                 let _ = shutdown_controller.request_shutdown();
             }
             Err(error) => {
-                operator_console.push_log(
-                    ConsoleLogLevel::Error,
-                    format!("Failed to install termination signal handler: {error}"),
-                );
+                tracing::error!(error = %error, "Failed to install termination signal handler");
             }
         }
     });

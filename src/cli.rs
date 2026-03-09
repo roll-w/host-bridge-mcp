@@ -108,14 +108,14 @@ mod tests {
         let outcome = parse_args(vec![
             "host-bridge-mcp".to_string(),
             "--config".to_string(),
-            "custom.toml".to_string(),
+            "custom.yaml".to_string(),
         ])
             .expect("should parse");
 
         assert_eq!(
             outcome,
             CliOptions {
-                config_path: Some("custom.toml".to_string()),
+                config_path: Some("custom.yaml".to_string()),
                 show_help: false,
                 show_version: false,
             }

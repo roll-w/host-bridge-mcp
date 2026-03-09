@@ -14,11 +14,9 @@
  * limitations under the License.
  */
 
-use crate::application::execution_service::{
-    ExecuteCommandInput, ExecutionEvent, ExecutionState, OutputKind,
-};
+use crate::application::execution_service::{ExecuteCommandInput, ExecutionEvent, ExecutionState};
 use crate::application::operator_console::ConsoleApprovalError;
-use crate::transport::mcp_streamable_http::output::{OutputAccumulator, OutputRenderOptions};
+use crate::transport::mcp_streamable_http::output::OutputRenderOptions;
 use crate::transport::mcp_streamable_http::{ExecuteCommandToolArgs, HostBridgeMcpServer};
 use rmcp::model::{CallToolResult, LoggingLevel, LoggingMessageNotificationParam};
 use rmcp::service::{RequestContext, RoleServer};
@@ -101,14 +99,6 @@ pub(super) async fn execute_command_tool(
     let mut exit_success: Option<bool> = None;
     let mut exit_timed_out: Option<bool> = None;
     let mut last_status_message: Option<String> = None;
-    let mut output_accumulator = match OutputAccumulator::new(output_options) {
-        Ok(accumulator) => accumulator,
-        Err(error) => {
-            return Ok(structured_error(format!(
-                "failed to initialize output spool files: {error}"
-            )));
-        }
-    };
 
     loop {
         match receiver.recv().await {
@@ -134,19 +124,12 @@ pub(super) async fn execute_command_tool(
                         break;
                     }
                 }
-                ExecutionEvent::Output { stream, text } => {
-                    output_accumulator.push(&stream, &text);
-
-                    let level = match stream {
-                        OutputKind::Stdout => LoggingLevel::Info,
-                        OutputKind::Stderr => LoggingLevel::Error,
-                    };
+                ExecutionEvent::Output { text } => {
                     let _ = notify_mcp_log(
                         &context.peer,
-                        level,
+                        LoggingLevel::Info,
                         json!({
                             "type": "output",
-                            "stream": stream,
                             "text": text,
                         }),
                     )
@@ -201,7 +184,14 @@ pub(super) async fn execute_command_tool(
         }
     }
 
-    let (stdout, stderr) = output_accumulator.finish();
+    let output = match server
+        .execution_service
+        .read_output(launch.execution_id)
+        .await
+    {
+        Ok(output) => output_options.apply(output),
+        Err(error) => return Ok(structured_error(error.to_string())),
+    };
 
     Ok(CallToolResult::structured(json!({
         "executionId": launch.execution_id,
@@ -212,8 +202,7 @@ pub(super) async fn execute_command_tool(
             "timedOut": exit_timed_out.unwrap_or(false)
         },
         "message": last_status_message,
-        "stdout": stdout,
-        "stderr": stderr,
+        "output": output,
     })))
 }
 

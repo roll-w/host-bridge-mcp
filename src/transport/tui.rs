@@ -60,6 +60,10 @@ fn run(console: OperatorConsole, shutdown_controller: ShutdownController) -> io:
     let _guard = TerminalGuard;
 
     loop {
+        if shutdown_controller.is_shutdown_requested() {
+            break;
+        }
+
         let snapshot = console.snapshot();
         state.sync(&snapshot);
 
@@ -126,7 +130,7 @@ mod tests {
     }
 
     #[test]
-    fn modified_q_does_not_request_shutdown() {
+    fn uppercase_q_requests_shutdown() {
         let console = OperatorConsole::default();
         let shutdown_controller = ShutdownController::default();
         let snapshot = snapshot(0);
@@ -140,8 +144,8 @@ mod tests {
             &shutdown_controller,
         );
 
-        assert!(!should_quit);
-        assert!(shutdown_controller.request_shutdown());
+        assert!(should_quit);
+        assert!(shutdown_controller.is_shutdown_requested());
     }
 
     #[test]

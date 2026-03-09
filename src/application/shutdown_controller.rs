@@ -43,19 +43,16 @@ impl ShutdownController {
             }
         }
     }
+
+    pub fn is_shutdown_requested(&self) -> bool {
+        *self.receiver.borrow()
+    }
 }
 
 impl Default for ShutdownController {
     fn default() -> Self {
         let (sender, receiver) = watch::channel(false);
         Self { sender, receiver }
-    }
-}
-
-#[cfg(test)]
-impl ShutdownController {
-    fn is_shutdown_requested(&self) -> bool {
-        *self.receiver.borrow()
     }
 }
 

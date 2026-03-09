@@ -14,51 +14,13 @@
  * limitations under the License.
  */
 
-use crate::application::execution_service::OutputKind;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
-use std::path::PathBuf;
-use uuid::Uuid;
-
 const CHAR_TRUNCATION_MARKER: &str = "... [truncated] ...";
-
-pub(super) struct OutputAccumulator {
-    options: OutputRenderOptions,
-    stdout: OutputSpool,
-    stderr: OutputSpool,
-}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct OutputRenderOptions {
     head_lines: Option<usize>,
     tail_lines: Option<usize>,
     max_chars: Option<usize>,
-}
-
-impl OutputAccumulator {
-    pub(super) fn new(options: OutputRenderOptions) -> io::Result<Self> {
-        Ok(Self {
-            options,
-            stdout: OutputSpool::new("stdout")?,
-            stderr: OutputSpool::new("stderr")?,
-        })
-    }
-
-    pub(super) fn push(&mut self, stream: &OutputKind, text: &str) {
-        let spool = match stream {
-            OutputKind::Stdout => &mut self.stdout,
-            OutputKind::Stderr => &mut self.stderr,
-        };
-
-        spool.append(text);
-    }
-
-    pub(super) fn finish(self) -> (String, String) {
-        (
-            self.options.apply(self.stdout.read_all()),
-            self.options.apply(self.stderr.read_all()),
-        )
-    }
 }
 
 impl OutputRenderOptions {
@@ -76,7 +38,7 @@ impl OutputRenderOptions {
         }
     }
 
-    fn apply(&self, text: String) -> String {
+    pub(super) fn apply(&self, text: String) -> String {
         let text = self.apply_line_limits(text);
         self.apply_char_limit(text)
     }
@@ -128,41 +90,6 @@ impl OutputRenderOptions {
             (Some(_), None) => truncate_head_chars(&text, max_chars),
             _ => truncate_middle_chars(&text, max_chars),
         }
-    }
-}
-
-struct OutputSpool {
-    path: PathBuf,
-    file: File,
-}
-
-impl OutputSpool {
-    fn new(prefix: &str) -> io::Result<Self> {
-        let path =
-            std::env::temp_dir().join(format!("host-bridge-mcp-{prefix}-{}.log", Uuid::new_v4()));
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&path)?;
-
-        Ok(Self { path, file })
-    }
-
-    fn append(&mut self, text: &str) {
-        let _ = self.file.write_all(text.as_bytes());
-    }
-
-    fn read_all(mut self) -> String {
-        let _ = self.file.flush();
-        fs::read_to_string(&self.path).unwrap_or_default()
-    }
-}
-
-impl Drop for OutputSpool {
-    fn drop(&mut self) {
-        let _ = self.file.flush();
-        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -330,7 +257,6 @@ mod tests {
 
         assert!(options.apply(sample_output()).is_empty());
     }
-
     fn sample_output() -> String {
         "one\ntwo\nthree\nfour\n".to_string()
     }

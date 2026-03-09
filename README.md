@@ -14,16 +14,17 @@ still needs the local host toolchain.
 
 > [!WARNING]
 > This server can execute host commands.
-> Do not expose it to untrusted networks. Review `host-bridge.toml` carefully before use.
+> Do not expose it to untrusted networks. Review `host-bridge.yaml` carefully before use.
 
 ## Features
 
 - Execute exactly one command line per tool call
-- Block the MCP tool call until execution completes, then return full `stdout` and `stderr`
+- Block the MCP tool call until execution completes, then return merged command output
 - Show live operational logs and pending approvals in a local TUI
 - Require approval in the TUI when policy demands confirmation
 - Keep a hot in-memory log buffer plus optional on-disk log backing for full log history
 - Expose per-execution SSE streams for external subscribers
+- Persist merged execution output files by `executionId`
 - Support path mapping for container/WSL/host interoperability
 - Use grouped command policies with concise subcommand overrides
 
@@ -45,14 +46,14 @@ Configuration load order (highest to lowest priority):
 
 1. CLI `--config <PATH>`
 2. `HOST_BRIDGE_CONFIG` environment variable
-3. `host-bridge.toml` in the working directory
+3. `host-bridge.yaml` in the working directory
 
-Start from the default template: `host-bridge.toml`.
+Start from the default template: `host-bridge.yaml`.
 
 ### Run
 
 ```bash
-./target/release/host-bridge-mcp --config host-bridge.toml
+./target/release/host-bridge-mcp --config host-bridge.yaml
 ```
 
 Useful CLI flags:
@@ -61,7 +62,7 @@ Useful CLI flags:
 - `-h, --help`: show help text and exit
 - `-V, --version`: print version and exit
 
-By default the server listens on `0.0.0.0:8787`.
+By default the server listens on `127.0.0.1:8787`.
 
 ## TUI
 
@@ -76,7 +77,9 @@ TUI keys:
 - `Up` / `Down`: select approval entries
 - `a`: approve the selected request
 - `r`: reject the selected request
-- mouse wheel / `PgUp` / `PgDn`: scroll logs
+- mouse wheel: scroll logs
+- drag inside the log panel: send the selected visible log lines to the terminal clipboard
+- `PgUp` / `PgDn`: scroll logs
 - `Home` / `End`: jump to the start or follow the tail
 - `q`: gracefully shut down the server
 
@@ -92,7 +95,7 @@ non-Unix platforms).
 - MCP endpoint: `http://127.0.0.1:8787/mcp`
 - Health check: `http://127.0.0.1:8787/health`
 
-Example client configuration:
+Example MCP client configuration:
 
 ```json
 {
@@ -100,6 +103,27 @@ Example client configuration:
   "url": "http://localhost:8787/mcp"
 }
 ```
+
+If `server.access.api-key-env` is configured, the client must send a fixed
+`Authorization: Bearer <key>` header.
+
+Authenticated MCP client configuration:
+
+```json
+{
+  "type": "streamable-http",
+  "url": "http://localhost:8787/mcp",
+  "headers": {
+    "Authorization": "Bearer sk-example"
+  }
+}
+```
+
+Recommended setup:
+
+1. Set the secret in the server environment, for example `HOST_BRIDGE_API_KEY`
+2. Reference that environment variable in `host-bridge.yaml` with `server.access.api-key-env`
+3. Configure the MCP client entry to send the same key in `Authorization`
 
 ### Tool: `execute_command`
 
@@ -124,7 +148,9 @@ Tool behavior:
 - shell chaining operators such as `&&`, `||`, `;`, and `|` are rejected
 - if policy is `confirm`, the tool call stays pending until the local TUI operator approves or rejects it
 - if approved, the command runs and the tool returns only after execution completes
-- the final tool result includes `executionId`, final `status`, `exit`, `stdout`, and `stderr`
+- the final tool result includes `executionId`, final `status`, `exit`, and merged `output`
+- the merged output is also written to the host-bridge data directory as `executions/<executionId>.log`
+- persisted execution output files are retained until you remove them manually
 
 ### SSE execution stream
 
@@ -143,22 +169,29 @@ These notifications include structured JSON for approval state, incremental outp
 
 ## Configuration
 
-Key sections in `host-bridge.toml`:
+Key sections in `host-bridge.yaml`:
 
-- `[server]`
-- `[logging]`
-- `[execution]`
-- `[[execution.commands]]`
-- `[[execution.path_mappings]]`
+- `server`
+- `logging`
+- `execution`
+- `execution.commands`
+- `execution.path-mappings`
 
 Highlights:
 
-- `logging.memory_buffer_lines`: hot in-memory log window for the TUI
-- `logging.file_path`: optional explicit log file path
-- `logging.persist_file`: keep or delete the backing log file on exit
-- `execution.default_action`: fallback action for unmatched commands
-- `[[execution.commands]]`: grouped command policies with optional nested `[[execution.commands.rules]]` overrides
-- `execution.default_timeout_ms` / `execution.max_timeout_ms`: timeout control
+- `server.bind-process`: HTTP bind address
+- `server.access.api-key-env`: optional environment-variable-backed API key for fixed `Authorization: Bearer <key>`
+  request authentication
+- `logging.memory-buffer-lines`: hot in-memory log window for the TUI
+- `logging.file-path`: optional explicit log file path
+- `logging.persist-file`: keep or delete the backing log file on exit
+- default persistent log path: host-bridge data directory + `logs/host-bridge-mcp.log`
+- default execution output path: host-bridge data directory + `executions/<executionId>.log`
+- the host-bridge data directory is usually `~/.host-bridge-mcp` on Unix-like hosts
+- persistent logs append across restarts; execution output files accumulate until manually cleaned up
+- `execution.default-action`: fallback action for unmatched commands
+- `execution.commands`: grouped command policies with nested `rules` overrides
+- `execution.default-timeout-ms` / `execution.max-timeout-ms`: timeout control
 
 See `docs/configuration.md` for the full reference.
 
@@ -167,7 +200,7 @@ See `docs/configuration.md` for the full reference.
 Recommended baseline:
 
 - bind to `127.0.0.1` or another trusted interface unless you fully trust the network
-- keep `execution.default_action = "confirm"` unless you have a strong allow-list
+- keep `execution.default-action = "confirm"` unless you have a strong allow-list
 - explicitly deny high-risk commands such as publish/deploy flows
 - run as a non-root user where possible
 - keep the TUI attached when using confirmation-based policies

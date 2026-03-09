@@ -24,6 +24,7 @@ use serde_json::{json, Value};
 use std::convert::Infallible;
 use std::time::Duration;
 use tokio_stream::once;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
@@ -55,7 +56,9 @@ pub(super) async fn stream_execution(
     let initial_stream = once(Ok::<Event, Infallible>(initial_event));
     let updates = BroadcastStream::new(subscription.receiver).filter_map(|event| match event {
         Ok(event) => Some(Ok::<Event, Infallible>(to_sse_event(&event))),
-        Err(_) => None,
+        Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+            Some(Ok::<Event, Infallible>(lagged_event(skipped)))
+        }
     });
 
     let stream = initial_stream.chain(updates);
@@ -77,6 +80,16 @@ fn to_sse_event(event: &ExecutionEvent) -> Event {
     Event::default()
         .event(event_name(event))
         .data(serialize_event(event))
+}
+
+fn lagged_event(skipped: u64) -> Event {
+    Event::default().event("lagged").data(
+        json!({
+            "type": "lagged",
+            "skipped": skipped,
+        })
+            .to_string(),
+    )
 }
 
 fn event_name(event: &ExecutionEvent) -> &'static str {

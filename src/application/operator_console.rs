@@ -38,6 +38,7 @@ pub enum ConsoleLogLevel {
 
 #[derive(Debug, Clone)]
 pub struct ConsoleLogEntry {
+    pub timestamp: String,
     pub level: ConsoleLogLevel,
     pub message: String,
 }
@@ -245,6 +246,7 @@ impl Default for OperatorConsole {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::fs;
 
     fn sample_request() -> ConfirmationRequest {
         ConfirmationRequest {
@@ -304,6 +306,7 @@ mod tests {
 
         let entries = console.read_logs(0, 3);
         assert_eq!(entries.len(), 3);
+        assert!(!entries[0].timestamp.is_empty());
         assert_eq!(entries[0].message, "line-1");
         assert_eq!(entries[1].message, "line-2");
         assert_eq!(entries[2].message, "line-3");
@@ -337,5 +340,40 @@ mod tests {
         }
 
         assert!(!log_path.exists());
+    }
+
+    #[test]
+    fn persistent_log_file_is_reused_without_truncation() {
+        let log_path =
+            std::env::temp_dir().join(format!("host-bridge-mcp-persist-{}.log", Uuid::new_v4()));
+        let seed_line = "2026-03-09T16:16:21.751592Z  INFO line-0\n";
+        fs::write(&log_path, seed_line).expect("seed log file should be written");
+
+        {
+            let console = OperatorConsole::new(LoggingConfig {
+                memory_buffer_lines: 2,
+                file_path: Some(log_path.display().to_string()),
+                persist_file: true,
+            })
+                .expect("console should initialize");
+
+            let initial_entries = console.read_logs(0, 1);
+            assert_eq!(initial_entries.len(), 1);
+            assert_eq!(initial_entries[0].timestamp, "2026-03-09T16:16:21.751592Z");
+            assert_eq!(initial_entries[0].message, "line-0");
+
+            console.push_log(ConsoleLogLevel::Warn, "line-1");
+
+            let entries = console.read_logs(0, 2);
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].message, "line-0");
+            assert_eq!(entries[1].message, "line-1");
+        }
+
+        let contents = fs::read_to_string(&log_path).expect("log file should remain readable");
+        assert!(contents.contains(seed_line));
+        assert!(contents.contains(" WARN line-1\n"));
+
+        let _ = fs::remove_file(log_path);
     }
 }

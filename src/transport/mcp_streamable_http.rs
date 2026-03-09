@@ -14,14 +14,18 @@
  * limitations under the License.
  */
 
+mod auth;
 mod output;
 mod streaming;
 mod tooling;
 
+use self::auth::{require_request_auth, resolve_request_auth};
 use self::streaming::{health, stream_execution};
 use self::tooling::execute_command_tool;
 use crate::application::execution_service::ExecutionService;
 use crate::application::operator_console::OperatorConsole;
+use crate::config::AccessConfig;
+use axum::middleware;
 use axum::routing::get;
 use axum::Router;
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
@@ -37,6 +41,8 @@ use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, Ser
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
+
+pub use self::auth::TransportAuthError;
 
 #[derive(Clone)]
 pub struct HttpState {
@@ -67,17 +73,17 @@ struct ExecuteCommandToolArgs {
     timeout_ms: Option<u64>,
     #[serde(default)]
     #[schemars(
-        description = "Optional number of leading lines to return from stdout and stderr. Applied separately per stream after execution completes."
+        description = "Optional number of leading lines to return from the merged command output after execution completes."
     )]
     head_lines: Option<u64>,
     #[serde(default)]
     #[schemars(
-        description = "Optional number of trailing lines to return from stdout and stderr. Applied separately per stream after execution completes."
+        description = "Optional number of trailing lines to return from the merged command output after execution completes."
     )]
     tail_lines: Option<u64>,
     #[serde(default)]
     #[schemars(
-        description = "Optional maximum number of characters to return from stdout and stderr after line filtering. Applied separately per stream. Use 0 to disable the character cap."
+        description = "Optional maximum number of characters to return from the merged command output after line filtering. Use 0 to disable the character cap."
     )]
     max_chars: Option<u64>,
 }
@@ -193,11 +199,15 @@ mod tests {
             schema_json.contains("Shell chaining operators such as &&, ||, ;, and | are rejected.")
         );
         assert!(schema_json.contains("Use 0 to disable the character cap."));
-        assert!(schema_json.contains("Applied separately per stream"));
+        assert!(schema_json.contains("merged command output"));
     }
 }
 
-pub fn router(execution_service: ExecutionService, operator_console: OperatorConsole) -> Router {
+pub fn router(
+    execution_service: ExecutionService,
+    operator_console: OperatorConsole,
+    access: AccessConfig,
+) -> Result<Router, TransportAuthError> {
     let stream_state = HttpState {
         execution_service: execution_service.clone(),
     };
@@ -221,9 +231,17 @@ pub fn router(execution_service: ExecutionService, operator_console: OperatorCon
             mcp_config,
         );
 
-    Router::new()
-        .route("/health", get(health))
+    let auth_state = resolve_request_auth(&access)?;
+    let protected_routes = Router::new()
         .route("/executions/{execution_id}/stream", get(stream_execution))
         .nest_service("/mcp", mcp_service)
-        .with_state(stream_state)
+        .route_layer(middleware::from_fn_with_state(
+            auth_state,
+            require_request_auth,
+        ));
+
+    Ok(Router::new()
+        .route("/health", get(health))
+        .merge(protected_routes)
+        .with_state(stream_state))
 }

@@ -18,7 +18,7 @@ use crate::application::execution_service::{
     ExecuteCommandInput, ExecutionEvent, ExecutionState, OutputKind,
 };
 use crate::application::operator_console::ConsoleApprovalError;
-use crate::transport::mcp_streamable_http::output::OutputAccumulator;
+use crate::transport::mcp_streamable_http::output::{OutputAccumulator, OutputRenderOptions};
 use crate::transport::mcp_streamable_http::{ExecuteCommandToolArgs, HostBridgeMcpServer};
 use rmcp::model::{CallToolResult, LoggingLevel, LoggingMessageNotificationParam};
 use rmcp::service::{RequestContext, RoleServer};
@@ -30,6 +30,7 @@ pub(super) async fn execute_command_tool(
     args: ExecuteCommandToolArgs,
     context: RequestContext<RoleServer>,
 ) -> Result<CallToolResult, McpError> {
+    let output_options = OutputRenderOptions::new(args.head_lines, args.tail_lines, args.max_chars);
     let input = ExecuteCommandInput {
         command: args.command,
         working_directory: args.working_directory,
@@ -100,7 +101,7 @@ pub(super) async fn execute_command_tool(
     let mut exit_success: Option<bool> = None;
     let mut exit_timed_out: Option<bool> = None;
     let mut last_status_message: Option<String> = None;
-    let mut output_accumulator = match OutputAccumulator::new() {
+    let mut output_accumulator = match OutputAccumulator::new(output_options) {
         Ok(accumulator) => accumulator,
         Err(error) => {
             return Ok(structured_error(format!(

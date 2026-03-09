@@ -18,6 +18,7 @@ use crate::application::command_parser::{parse_command_line, CommandParseError};
 use crate::application::operator_console::{ConsoleLogLevel, OperatorConsole};
 use crate::config::AppConfig;
 use crate::domain::path_mapping::PathMapper;
+use crate::domain::platform::runtime::{resolve_target_platform, RuntimePlatform};
 use crate::domain::platform::spawn::{apply_spawn_plan, SpawnPlanner};
 use crate::domain::policy::{PolicyDecision, PolicyEngine};
 use serde::{Deserialize, Serialize};
@@ -205,6 +206,12 @@ impl ExecutionService {
         }
     }
 
+    pub fn command_environment_name(&self) -> &'static str {
+        runtime_platform_name(resolve_target_platform(
+            self.config.execution.target_platform,
+        ))
+    }
+
     pub async fn prepare_command(
         &self,
         input: ExecuteCommandInput,
@@ -373,6 +380,14 @@ impl ExecutionService {
         }
 
         Ok(resolved)
+    }
+}
+
+fn runtime_platform_name(platform: RuntimePlatform) -> &'static str {
+    match platform {
+        RuntimePlatform::Windows => "windows",
+        RuntimePlatform::Linux => "linux",
+        RuntimePlatform::Macos => "macos",
     }
 }
 
@@ -658,7 +673,7 @@ mod tests {
     use super::*;
     use crate::config::{
         CommandPolicyConfig, CommandRuleConfig, ExecutionConfig, LoggingConfig, PolicyAction,
-        ServerConfig,
+        ServerConfig, TargetPlatform,
     };
 
     #[test]
@@ -709,5 +724,20 @@ mod tests {
             .expect("command should prepare");
 
         assert!(prepared.confirmation_request().is_some());
+    }
+
+    #[test]
+    fn command_environment_name_returns_resolved_platform() {
+        let config = Arc::new(AppConfig {
+            server: ServerConfig::default(),
+            execution: ExecutionConfig {
+                target_platform: TargetPlatform::Windows,
+                ..ExecutionConfig::default()
+            },
+            logging: LoggingConfig::default(),
+        });
+        let service = ExecutionService::new(config, OperatorConsole::default());
+
+        assert_eq!(service.command_environment_name(), "windows");
     }
 }

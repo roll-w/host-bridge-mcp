@@ -35,6 +35,7 @@ use rmcp::transport::streamable_http_server::{
 };
 use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use serde::Deserialize;
+use serde_json::json;
 use std::collections::HashMap;
 
 #[derive(Clone)]
@@ -45,13 +46,40 @@ pub struct HttpState {
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct ExecuteCommandToolArgs {
+    #[schemars(
+        description = "Exactly one command line to execute. Shell chaining operators such as &&, ||, ;, and | are rejected."
+    )]
     command: String,
     #[serde(default)]
+    #[schemars(
+        description = "Optional working directory for the child process. If omitted, the server uses the current directory or a policy default after path mapping."
+    )]
     working_directory: Option<String>,
     #[serde(default)]
+    #[schemars(
+        description = "Extra environment variables merged into the child process. Existing variables are preserved unless you override the same key."
+    )]
     env: HashMap<String, String>,
     #[serde(default)]
+    #[schemars(
+        description = "Optional execution timeout in milliseconds. If omitted, the server default applies. Values above the server maximum are clamped."
+    )]
     timeout_ms: Option<u64>,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional number of leading lines to return from stdout and stderr. Applied separately per stream after execution completes."
+    )]
+    head_lines: Option<u64>,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional number of trailing lines to return from stdout and stderr. Applied separately per stream after execution completes."
+    )]
+    tail_lines: Option<u64>,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional maximum number of characters to return from stdout and stderr after line filtering. Applied separately per stream. Use 0 to disable the character cap."
+    )]
+    max_chars: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -72,9 +100,7 @@ impl HostBridgeMcpServer {
     }
 
     #[tool(
-        description = "Execute exactly one host command without shell chaining. If approval is required, the call stays \
-        pending until the TUI operator approves or rejects it, then returns the full stdout and stderr after the process \
-        exits."
+        description = "Execute exactly one host command without shell chaining. If approval is required, the call stays pending until the TUI operator approves or rejects it."
     )]
     async fn execute_command(
         &self,
@@ -83,19 +109,19 @@ impl HostBridgeMcpServer {
     ) -> Result<CallToolResult, McpError> {
         execute_command_tool(self, args, context).await
     }
+
+    #[tool(
+        description = "Return the specific platform name where commands currently execute, so agents can choose the right command syntax and path format."
+    )]
+    async fn get_execution_environment(&self) -> Result<CallToolResult, McpError> {
+        Ok(CallToolResult::structured(json!({
+            "environment": self.execution_service.command_environment_name(),
+        })))
+    }
 }
 
 #[tool_handler]
 impl ServerHandler for HostBridgeMcpServer {
-    async fn set_level(
-        &self,
-        request: SetLevelRequestParams,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<(), McpError> {
-        tracing::debug!(level = ?request.level, "Client set MCP logging level");
-        Ok(())
-    }
-
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder()
@@ -106,9 +132,68 @@ impl ServerHandler for HostBridgeMcpServer {
             .with_server_info(Implementation::from_build_env())
             .with_protocol_version(ProtocolVersion::LATEST)
             .with_instructions(
-                "Host bridge MCP server exposing execute_command with TUI approvals, blocking completion, and full stdout/stderr return."
+                "Host bridge MCP server exposing execute_command for host processes and get_execution_environment for platform discovery."
                     .to_string(),
             )
+    }
+
+    async fn set_level(
+        &self,
+        request: SetLevelRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        tracing::debug!(level = ?request.level, "Client set MCP logging level");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ExecuteCommandToolArgs;
+    use rmcp::schemars;
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    #[test]
+    fn deserializes_output_limit_arguments() {
+        let args: ExecuteCommandToolArgs = serde_json::from_value(json!({
+            "command": "cargo test",
+            "workingDirectory": "/workspace/project",
+            "timeoutMs": 120000,
+            "headLines": 12,
+            "tailLines": 8,
+            "maxChars": 0,
+            "env": {
+                "RUST_LOG": "debug"
+            }
+        }))
+            .expect("arguments should deserialize");
+
+        assert_eq!(args.command, "cargo test");
+        assert_eq!(
+            args.working_directory.as_deref(),
+            Some("/workspace/project")
+        );
+        assert_eq!(args.timeout_ms, Some(120000));
+        assert_eq!(args.head_lines, Some(12));
+        assert_eq!(args.tail_lines, Some(8));
+        assert_eq!(args.max_chars, Some(0));
+        assert_eq!(
+            args.env,
+            HashMap::from([(String::from("RUST_LOG"), String::from("debug"))])
+        );
+    }
+
+    #[test]
+    fn schema_contains_agent_visible_field_descriptions() {
+        let schema = schemars::schema_for!(ExecuteCommandToolArgs);
+        let schema_json = serde_json::to_string(&schema).expect("schema should serialize");
+
+        assert!(
+            schema_json.contains("Shell chaining operators such as &&, ||, ;, and | are rejected.")
+        );
+        assert!(schema_json.contains("Use 0 to disable the character cap."));
+        assert!(schema_json.contains("Applied separately per stream"));
     }
 }
 

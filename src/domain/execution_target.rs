@@ -14,10 +14,11 @@
  * limitations under the License.
  */
 
-use crate::config::{ExecutionConfig, ExecutionServerConfig};
+use crate::config::{ExecutionConfig, ExecutionServerConfig, SshAuthConfig, SshAuthType};
 use crate::domain::path_mapping::PathMapper;
 use crate::domain::platform::runtime::{resolve_target_platform, RuntimePlatform};
 use std::collections::HashMap;
+use std::time::Duration;
 
 const HOST_TARGET_NAME: &str = "host";
 
@@ -41,13 +42,29 @@ pub enum ExecutionTransport {
     Ssh(SshTarget),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SshTarget {
     pub host: String,
     pub port: u16,
-    pub user: Option<String>,
-    pub identity_file: Option<String>,
+    pub user: String,
+    pub auth: SshAuthTarget,
     pub known_hosts_file: Option<String>,
+    pub connection_idle_timeout: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SshAuthTarget {
+    Agent,
+    IdentityFile(String),
+    PasswordEnv(String),
+    PasswordFile(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionEnvironmentSummary {
+    pub name: String,
+    pub platform: String,
 }
 
 impl ExecutionTargetRegistry {
@@ -78,10 +95,16 @@ impl ExecutionTargetRegistry {
             .expect("validated config must resolve default execution target")
     }
 
-    pub fn target_names(&self) -> Vec<String> {
-        let mut names = self.targets.keys().cloned().collect::<Vec<_>>();
-        names.sort();
-        names
+    pub fn environments(&self) -> Vec<ExecutionEnvironmentSummary> {
+        let mut targets = self.targets.values().collect::<Vec<_>>();
+        targets.sort_by(|left, right| left.name.cmp(&right.name));
+        targets
+            .into_iter()
+            .map(|target| ExecutionEnvironmentSummary {
+                name: target.name.clone(),
+                platform: target.target_platform.as_name().to_string(),
+            })
+            .collect()
     }
 }
 
@@ -90,11 +113,7 @@ fn implicit_host_target(execution: &ExecutionConfig) -> ExecutionTarget {
         name: HOST_TARGET_NAME.to_string(),
         transport: ExecutionTransport::Host,
         target_platform: resolve_target_platform(execution.target_platform),
-        path_mapper: PathMapper::new(
-            execution.path_mappings.clone(),
-            execution.target_platform,
-            execution.enable_builtin_wsl_mapping,
-        ),
+        path_mapper: PathMapper::new(execution.path_mappings.clone(), execution.target_platform),
     }
 }
 
@@ -103,17 +122,12 @@ fn build_target(server: &ExecutionServerConfig) -> ExecutionTarget {
         ExecutionServerConfig::Host {
             name,
             target_platform,
-            enable_builtin_wsl_mapping,
             path_mappings,
         } => ExecutionTarget {
             name: name.clone(),
             transport: ExecutionTransport::Host,
             target_platform: resolve_target_platform(*target_platform),
-            path_mapper: PathMapper::new(
-                path_mappings.clone(),
-                *target_platform,
-                *enable_builtin_wsl_mapping,
-            ),
+            path_mapper: PathMapper::new(path_mappings.clone(), *target_platform),
         },
         ExecutionServerConfig::Ssh {
             name,
@@ -121,26 +135,38 @@ fn build_target(server: &ExecutionServerConfig) -> ExecutionTarget {
             port,
             user,
             target_platform,
-            enable_builtin_wsl_mapping,
             path_mappings,
-            identity_file,
+            auth,
             known_hosts_file,
+            connection_idle_timeout_ms,
         } => ExecutionTarget {
             name: name.clone(),
             transport: ExecutionTransport::Ssh(SshTarget {
                 host: host.clone(),
                 port: *port,
                 user: user.clone(),
-                identity_file: identity_file.clone(),
+                auth: build_ssh_auth_target(auth),
                 known_hosts_file: known_hosts_file.clone(),
+                connection_idle_timeout: Duration::from_millis(*connection_idle_timeout_ms),
             }),
             target_platform: resolve_target_platform(*target_platform),
-            path_mapper: PathMapper::new(
-                path_mappings.clone(),
-                *target_platform,
-                *enable_builtin_wsl_mapping,
-            ),
+            path_mapper: PathMapper::new(path_mappings.clone(), *target_platform),
         },
+    }
+}
+
+fn build_ssh_auth_target(auth: &SshAuthConfig) -> SshAuthTarget {
+    match auth.kind {
+        SshAuthType::Agent => SshAuthTarget::Agent,
+        SshAuthType::IdentityFile => {
+            SshAuthTarget::IdentityFile(auth.r#ref.clone().expect("validated auth ref"))
+        }
+        SshAuthType::PasswordEnv => {
+            SshAuthTarget::PasswordEnv(auth.r#ref.clone().expect("validated auth ref"))
+        }
+        SshAuthType::PasswordFile => {
+            SshAuthTarget::PasswordFile(auth.r#ref.clone().expect("validated auth ref"))
+        }
     }
 }
 
@@ -154,7 +180,13 @@ mod tests {
         let registry = ExecutionTargetRegistry::from_config(&ExecutionConfig::default());
 
         assert_eq!(registry.default_target().name, "host");
-        assert_eq!(registry.target_names(), vec!["host".to_string()]);
+        assert_eq!(
+            registry.environments(),
+            vec![ExecutionEnvironmentSummary {
+                name: "host".to_string(),
+                platform: RuntimePlatform::current().as_name().to_string(),
+            }]
+        );
     }
 
     #[test]
@@ -163,7 +195,6 @@ mod tests {
             servers: vec![ExecutionServerConfig::Host {
                 name: "host".to_string(),
                 target_platform: TargetPlatform::Windows,
-                enable_builtin_wsl_mapping: false,
                 path_mappings: vec![PathMappingRule {
                     from: "/workspace/mnt/d".to_string(),
                     to: "D:\\".to_string(),
@@ -191,12 +222,15 @@ mod tests {
                 name: "prod".to_string(),
                 host: "prod.example.com".to_string(),
                 port: 22,
-                user: Some("deploy".to_string()),
+                user: "deploy".to_string(),
                 target_platform: TargetPlatform::Linux,
-                enable_builtin_wsl_mapping: false,
                 path_mappings: Vec::new(),
-                identity_file: Some("/home/dev/.ssh/id_ed25519".to_string()),
+                auth: SshAuthConfig {
+                    kind: SshAuthType::PasswordEnv,
+                    r#ref: Some("SSH_PASSWORD".to_string()),
+                },
                 known_hosts_file: Some("/home/dev/.ssh/known_hosts".to_string()),
+                connection_idle_timeout_ms: 45_000,
             }],
             ..ExecutionConfig::default()
         });
@@ -205,7 +239,12 @@ mod tests {
         match &target.transport {
             ExecutionTransport::Ssh(ssh) => {
                 assert_eq!(ssh.host, "prod.example.com");
-                assert_eq!(ssh.user.as_deref(), Some("deploy"));
+                assert_eq!(ssh.user, "deploy");
+                match &ssh.auth {
+                    SshAuthTarget::PasswordEnv(reference) => assert_eq!(reference, "SSH_PASSWORD"),
+                    _ => panic!("expected password-env auth"),
+                }
+                assert_eq!(ssh.connection_idle_timeout, Duration::from_millis(45_000));
             }
             ExecutionTransport::Host => panic!("expected ssh target"),
         }

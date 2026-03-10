@@ -35,18 +35,15 @@ execution:
   # Hard cap for timeoutMs passed from tool calls.
   max-timeout-ms: 7200000
 
-  # Enable built-in /mnt/<drive>/... -> <DRIVE>:\... mapping for Windows targets.
-  enable-builtin-wsl-mapping: true
-
   # Optional global default working directory.
   # default-working-directory: /workspace
 
-  # Default execution server. The implicit local execution target is always named host.
+  # Default execution environment.
   default-server: host
 
-  # Optional additional execution servers.
-  # Remote servers use the local ssh client and intentionally do not accept plaintext passwords.
-  # Prefer ssh-agent, or provide an identity-file and known-hosts-file.
+  # Additional execution environments.
+  # host: local execution inside the current machine.
+  # ssh: remote execution over SSH using the built-in SSH library backend.
   servers:
     - name: build-linux
       transport: ssh
@@ -54,7 +51,17 @@ execution:
       user: dev
       port: 22
       target-platform: linux
-      identity-file: /home/dev/.ssh/id_ed25519
+      auth:
+        type: identity-file
+        ref: /home/dev/.ssh/id_ed25519
+      # auth:
+      #   type: password-env
+      #   ref: BUILD_LINUX_SSH_PASSWORD
+      # auth:
+      #   type: password-file
+      #   ref: /run/secrets/build-linux-password
+      connection-idle-timeout-ms: 300000
+      # Omit known-hosts-file to disable strict host verification.
       known-hosts-file: /home/dev/.ssh/known_hosts
       path-mappings:
         - from: /workspace
@@ -100,9 +107,8 @@ execution:
     - command: rustc
       action: allow
 
-  # Host path mappings are platform-agnostic.
+  # Path mappings for the implicit host environment.
   # Rules are prefix-based and are applied in order.
-  # Additional remote servers can define their own server-scoped path-mappings above.
   path-mappings:
     - from: /workspace/mnt/d
       to: D:\

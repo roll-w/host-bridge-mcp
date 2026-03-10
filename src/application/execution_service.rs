@@ -18,11 +18,11 @@ use crate::application::command_parser::{parse_command_line, CommandParseError};
 use crate::application::data_dir::execution_output_path;
 use crate::config::AppConfig;
 use crate::domain::execution_target::{
-    ExecutionTarget, ExecutionTargetRegistry, ExecutionTransport,
+    ExecutionEnvironmentSummary, ExecutionTarget, ExecutionTargetRegistry, ExecutionTransport,
 };
-use crate::domain::platform::spawn::{apply_spawn_plan, SpawnPlanner};
+use crate::domain::platform::spawn::SpawnPlanner;
 use crate::domain::policy::{PolicyDecision, PolicyEngine};
-use crate::domain::ssh::build_ssh_invocation;
+use crate::domain::ssh::{SshClient, SshCommandRequest};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
@@ -32,14 +32,16 @@ use std::io::{self as std_io, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
-use tokio::process::Command;
 use tokio::sync::{broadcast, Mutex, RwLock};
-use tokio::task::JoinHandle;
-use tokio::time::{timeout, Duration};
+use tokio::time::Duration;
 use uuid::Uuid;
+
+mod runner;
+#[cfg(test)]
+mod tests;
+
+use self::runner::run_execution;
 
 const EXECUTION_RECORD_RETENTION: Duration = Duration::from_secs(5 * 60);
 const TERMINATION_GRACE_PERIOD: Duration = Duration::from_secs(5);
@@ -146,18 +148,37 @@ pub struct ExecutionService {
     policy_engine: Arc<PolicyEngine>,
     targets: Arc<ExecutionTargetRegistry>,
     spawn_planner: SpawnPlanner,
+    ssh_client: Arc<SshClient>,
     records: Arc<RwLock<HashMap<Uuid, Arc<ExecutionRecord>>>>,
 }
 
 #[derive(Debug, Clone)]
 struct RunExecution {
     command_line: String,
+    server_name: String,
+    backend: RunExecutionBackend,
+}
+
+#[derive(Debug, Clone)]
+enum RunExecutionBackend {
+    Host(HostRunExecution),
+    Ssh(SshRunExecution),
+}
+
+#[derive(Debug, Clone)]
+struct HostRunExecution {
     program: String,
     args: Vec<String>,
     working_directory: PathBuf,
     env: HashMap<String, String>,
     timeout_ms: u64,
-    server_name: String,
+}
+
+#[derive(Debug, Clone)]
+struct SshRunExecution {
+    target: crate::domain::execution_target::SshTarget,
+    platform: crate::domain::platform::runtime::RuntimePlatform,
+    request: SshCommandRequest,
 }
 
 struct ExecutionRecord {
@@ -295,20 +316,17 @@ impl ExecutionService {
             policy_engine: Arc::new(policy_engine),
             targets: Arc::new(targets),
             spawn_planner: SpawnPlanner::current(),
+            ssh_client: Arc::new(SshClient::new()),
             records: Arc::new(RwLock::new(HashMap::new())),
         }
-    }
-
-    pub fn command_environment_name(&self) -> &'static str {
-        self.targets.default_target().target_platform.as_name()
     }
 
     pub fn default_server_name(&self) -> &str {
         &self.targets.default_target().name
     }
 
-    pub fn available_server_names(&self) -> Vec<String> {
-        self.targets.target_names()
+    pub fn available_environments(&self) -> Vec<ExecutionEnvironmentSummary> {
+        self.targets.environments()
     }
 
     pub async fn prepare_command(
@@ -332,47 +350,46 @@ impl ExecutionService {
             .map(|argument| target.path_mapper.map_argument_if_path(argument))
             .collect::<Vec<_>>();
 
-        let (program, program_args, working_directory, preview_working_directory, local_env) =
-            match &target.transport {
-                ExecutionTransport::Host => {
-                    let working_directory = self.resolve_local_working_directory(
-                        target,
-                        input.working_directory.as_deref(),
-                        policy.default_working_directory.as_deref(),
-                    )?;
-                    (
-                        executable.clone(),
-                        args.clone(),
-                        working_directory.clone(),
-                        Some(working_directory.display().to_string()),
-                        input.env.clone(),
-                    )
-                }
-                ExecutionTransport::Ssh(ssh_target) => {
-                    let remote_working_directory = self.resolve_remote_working_directory(
-                        target,
-                        input.working_directory.as_deref(),
-                        policy.default_working_directory.as_deref(),
-                    );
-                    let invocation = build_ssh_invocation(
-                        ssh_target,
-                        target.target_platform,
-                        &executable,
-                        &args,
-                        &input.env,
-                        remote_working_directory.as_deref(),
-                    );
-                    (
-                        invocation.program,
-                        invocation.args,
-                        env::current_dir().map_err(|error| {
-                            ExecutionError::InvalidWorkingDirectory(error.to_string())
-                        })?,
-                        remote_working_directory,
-                        HashMap::new(),
-                    )
-                }
-            };
+        let (backend, preview_working_directory) = match &target.transport {
+            ExecutionTransport::Host => {
+                let working_directory = self.resolve_local_working_directory(
+                    target,
+                    input.working_directory.as_deref(),
+                    policy.default_working_directory.as_deref(),
+                )?;
+                (
+                    RunExecutionBackend::Host(HostRunExecution {
+                        program: executable.clone(),
+                        args: args.clone(),
+                        working_directory: working_directory.clone(),
+                        env: input.env.clone(),
+                        timeout_ms,
+                    }),
+                    Some(working_directory.display().to_string()),
+                )
+            }
+            ExecutionTransport::Ssh(ssh_target) => {
+                let remote_working_directory = self.resolve_remote_working_directory(
+                    target,
+                    input.working_directory.as_deref(),
+                    policy.default_working_directory.as_deref(),
+                );
+                (
+                    RunExecutionBackend::Ssh(SshRunExecution {
+                        target: ssh_target.clone(),
+                        platform: target.target_platform,
+                        request: SshCommandRequest {
+                            executable: executable.clone(),
+                            args: args.clone(),
+                            env: input.env.clone(),
+                            working_directory: remote_working_directory.clone(),
+                            timeout_ms,
+                        },
+                    }),
+                    remote_working_directory,
+                )
+            }
+        };
 
         let confirmation_request =
             (policy.decision == PolicyDecision::RequireConfirmation).then(|| ConfirmationRequest {
@@ -389,12 +406,8 @@ impl ExecutionService {
         Ok(PreparedExecution {
             run: RunExecution {
                 command_line: input.command,
-                program,
-                args: program_args,
-                working_directory,
-                env: local_env,
-                timeout_ms,
                 server_name: target.name.clone(),
+                backend,
             },
             confirmation_request,
         })
@@ -469,8 +482,9 @@ impl ExecutionService {
     ) {
         let records = self.records.clone();
         let spawn_planner = self.spawn_planner.clone();
+        let ssh_client = self.ssh_client.clone();
         tokio::spawn(async move {
-            run_execution(execution_id, record, run, spawn_planner).await;
+            run_execution(execution_id, record, run, spawn_planner, ssh_client).await;
             tokio::time::sleep(EXECUTION_RECORD_RETENTION).await;
             records.write().await.remove(&execution_id);
         });
@@ -558,233 +572,6 @@ impl ExecutionService {
     }
 }
 
-async fn run_execution(
-    execution_id: Uuid,
-    record: Arc<ExecutionRecord>,
-    run: RunExecution,
-    spawn_planner: SpawnPlanner,
-) {
-    emit_event(
-        execution_id,
-        &record,
-        ExecutionEvent::Status {
-            state: ExecutionState::Running,
-            message: Some(format!(
-                "Executing on {}: {}",
-                run.server_name, run.command_line
-            )),
-        },
-    );
-
-    let spawn_plan = spawn_planner.build(&run.program, &run.args, &run.env, &run.working_directory);
-    let mut command = Command::new(&spawn_plan.program);
-    command
-        .args(&spawn_plan.args)
-        .current_dir(&run.working_directory)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    apply_spawn_plan(&mut command, &spawn_plan);
-
-    for (key, value) in &run.env {
-        command.env(key, value);
-    }
-
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            record.set_state(ExecutionState::Failed).await;
-            emit_event(
-                execution_id,
-                &record,
-                ExecutionEvent::Error {
-                    message: format!("Failed to spawn '{}': {error}", run.program),
-                },
-            );
-            emit_event(
-                execution_id,
-                &record,
-                ExecutionEvent::Status {
-                    state: ExecutionState::Failed,
-                    message: Some("Execution failed before process start".to_string()),
-                },
-            );
-            return;
-        }
-    };
-
-    let stdout_task = spawn_output_task(execution_id, child.stdout.take(), record.clone());
-
-    let stderr_task = spawn_output_task(execution_id, child.stderr.take(), record.clone());
-
-    let wait_result = timeout(Duration::from_millis(run.timeout_ms), child.wait()).await;
-    let (timed_out, status_result) = match wait_result {
-        Ok(status_result) => (false, status_result),
-        Err(_) => {
-            let _ = child.start_kill();
-            emit_event(
-                execution_id,
-                &record,
-                ExecutionEvent::Error {
-                    message: format!("Process timed out after {} ms", run.timeout_ms),
-                },
-            );
-            let waited_for_exit = timeout(TERMINATION_GRACE_PERIOD, child.wait()).await;
-            match waited_for_exit {
-                Ok(status_result) => (true, status_result),
-                Err(_) => {
-                    emit_event(
-                        execution_id,
-                        &record,
-                        ExecutionEvent::Error {
-                            message: format!(
-                                "Process did not exit within {} ms after timeout",
-                                TERMINATION_GRACE_PERIOD.as_millis()
-                            ),
-                        },
-                    );
-                    (
-                        true,
-                        Err(std_io::Error::new(
-                            std_io::ErrorKind::TimedOut,
-                            format!(
-                                "process did not exit within {} ms after kill",
-                                TERMINATION_GRACE_PERIOD.as_millis()
-                            ),
-                        )),
-                    )
-                }
-            }
-        }
-    };
-
-    drop(child);
-
-    if let Some(task) = stdout_task {
-        let _ = task.await;
-    }
-    if let Some(task) = stderr_task {
-        let _ = task.await;
-    }
-
-    if let Err(error) = record.close_output_store() {
-        tracing::error!(
-            execution_id = %execution_id,
-            error = %error,
-            "Failed to close execution output store"
-        );
-    }
-
-    match status_result {
-        Ok(status) => {
-            let success = status.success() && !timed_out;
-            let code = status.code().unwrap_or(-1);
-            let final_state = if success {
-                ExecutionState::Completed
-            } else {
-                ExecutionState::Failed
-            };
-
-            record.set_state(final_state.clone()).await;
-            emit_event(
-                execution_id,
-                &record,
-                ExecutionEvent::Exit {
-                    code,
-                    success,
-                    timed_out,
-                },
-            );
-            emit_event(
-                execution_id,
-                &record,
-                ExecutionEvent::Status {
-                    state: final_state,
-                    message: Some(format!("Process finished with code {code}")),
-                },
-            );
-        }
-        Err(error) => {
-            record.set_state(ExecutionState::Failed).await;
-            emit_event(
-                execution_id,
-                &record,
-                ExecutionEvent::Error {
-                    message: format!("Failed while waiting for process: {error}"),
-                },
-            );
-            emit_event(
-                execution_id,
-                &record,
-                ExecutionEvent::Status {
-                    state: ExecutionState::Failed,
-                    message: Some("Execution failed while waiting for process".to_string()),
-                },
-            );
-        }
-    }
-}
-
-async fn stream_output<R>(execution_id: Uuid, reader: R, record: Arc<ExecutionRecord>)
-where
-    R: AsyncRead + Unpin,
-{
-    let mut buffered_reader = BufReader::new(reader);
-    let mut buffer = Vec::with_capacity(4_096);
-
-    loop {
-        buffer.clear();
-        match buffered_reader.read_until(b'\n', &mut buffer).await {
-            Ok(0) => return,
-            Ok(_) => {
-                let text = String::from_utf8_lossy(&buffer).into_owned();
-                emit_event(execution_id, &record, ExecutionEvent::Output { text });
-            }
-            Err(error) => {
-                emit_event(
-                    execution_id,
-                    &record,
-                    ExecutionEvent::Error {
-                        message: format!("Failed to read process output: {error}"),
-                    },
-                );
-                return;
-            }
-        }
-    }
-}
-
-fn spawn_output_task<R>(
-    execution_id: Uuid,
-    reader: Option<R>,
-    record: Arc<ExecutionRecord>,
-) -> Option<JoinHandle<()>>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-{
-    reader.map(|reader| {
-        tokio::spawn(async move {
-            stream_output(execution_id, reader, record).await;
-        })
-    })
-}
-
-fn emit_event(execution_id: Uuid, record: &ExecutionRecord, event: ExecutionEvent) {
-    log_execution_event(execution_id, &event);
-    if let ExecutionEvent::Output { text } = &event {
-        if let Err(error) = record.append_output(text) {
-            tracing::error!(
-                execution_id = %execution_id,
-                error = %error,
-                "Failed to persist merged execution output"
-            );
-        }
-    }
-    record.send(event);
-}
-
 fn open_private_output_file(path: &Path) -> std_io::Result<File> {
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
@@ -799,247 +586,4 @@ fn open_output_file_for_append(path: &Path) -> std_io::Result<File> {
     let mut options = OpenOptions::new();
     options.append(true).write(true);
     options.open(path)
-}
-
-fn log_execution_event(execution_id: Uuid, event: &ExecutionEvent) {
-    let execution_id = short_id(execution_id);
-    match event {
-        ExecutionEvent::Status { message, .. } => {
-            if let Some(message) = message {
-                tracing::info!("[{execution_id}] {message}");
-            }
-        }
-        ExecutionEvent::Output { text } => {
-            let line = text.trim_end_matches(['\n', '\r']);
-            tracing::info!("[{execution_id}] output | {line}");
-        }
-        ExecutionEvent::Exit {
-            code,
-            success,
-            timed_out,
-        } => {
-            if *success {
-                tracing::info!(
-                    "[{execution_id}] exit code={code} success={success} timed_out={timed_out}"
-                );
-            } else {
-                tracing::warn!(
-                    "[{execution_id}] exit code={code} success={success} timed_out={timed_out}"
-                );
-            }
-        }
-        ExecutionEvent::Error { message } => {
-            tracing::error!("[{execution_id}] {message}");
-        }
-    }
-}
-
-fn short_id(execution_id: Uuid) -> String {
-    execution_id.to_string().chars().take(8).collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::{
-        CommandPolicyConfig, CommandRuleConfig, ExecutionConfig, ExecutionServerConfig,
-        PathMappingRule, PolicyAction, TargetPlatform,
-    };
-
-    fn test_config(execution: ExecutionConfig) -> Arc<AppConfig> {
-        let mut config = AppConfig::default();
-        config.execution = execution;
-        Arc::new(config)
-    }
-
-    #[test]
-    fn reject_zero_timeout() {
-        let config = test_config(ExecutionConfig {
-            default_action: PolicyAction::Allow,
-            ..ExecutionConfig::default()
-        });
-        let service = ExecutionService::new(config);
-        let result = service.resolve_timeout(Some(0));
-        assert!(matches!(result, Err(ExecutionError::InvalidTimeout)));
-    }
-
-    #[tokio::test]
-    async fn prepare_command_marks_confirmation_when_policy_requires_it() {
-        let config = test_config(ExecutionConfig {
-            default_action: PolicyAction::Confirm,
-            commands: vec![CommandPolicyConfig {
-                command: "cargo".to_string(),
-                default_working_directory: None,
-                action: PolicyAction::Confirm,
-                rules: vec![CommandRuleConfig {
-                    args_prefix: vec!["build".to_string()],
-                    action: PolicyAction::Confirm,
-                    default_working_directory: None,
-                }],
-            }],
-            ..ExecutionConfig::default()
-        });
-
-        let service = ExecutionService::new(config);
-        let prepared = service
-            .prepare_command(ExecuteCommandInput {
-                command: "cargo build".to_string(),
-                server: None,
-                working_directory: None,
-                env: HashMap::new(),
-                timeout_ms: None,
-            })
-            .await
-            .expect("command should prepare");
-
-        let confirmation = prepared
-            .confirmation_request()
-            .expect("confirmation should exist");
-        assert_eq!(confirmation.server, "host");
-        assert_eq!(confirmation.platform, service.command_environment_name());
-    }
-
-    #[tokio::test]
-    async fn prepare_command_rejects_unknown_server() {
-        let service = ExecutionService::new(test_config(ExecutionConfig {
-            default_action: PolicyAction::Allow,
-            ..ExecutionConfig::default()
-        }));
-
-        let error = service
-            .prepare_command(ExecuteCommandInput {
-                command: "cargo build".to_string(),
-                server: Some("missing".to_string()),
-                working_directory: None,
-                env: HashMap::new(),
-                timeout_ms: None,
-            })
-            .await
-            .expect_err("unknown server should fail");
-
-        assert!(matches!(error, ExecutionError::UnknownServer(name) if name == "missing"));
-    }
-
-    #[tokio::test]
-    async fn prepare_command_builds_ssh_invocation_for_remote_server() {
-        let service = ExecutionService::new(test_config(ExecutionConfig {
-            default_action: PolicyAction::Confirm,
-            servers: vec![ExecutionServerConfig::Ssh {
-                name: "prod".to_string(),
-                host: "prod.example.com".to_string(),
-                port: 2222,
-                user: Some("deploy".to_string()),
-                target_platform: TargetPlatform::Linux,
-                enable_builtin_wsl_mapping: false,
-                path_mappings: vec![PathMappingRule {
-                    from: "/workspace".to_string(),
-                    to: "/srv/workspace".to_string(),
-                    platforms: Vec::new(),
-                }],
-                identity_file: Some("/home/dev/.ssh/id_ed25519".to_string()),
-                known_hosts_file: Some("/home/dev/.ssh/known_hosts".to_string()),
-            }],
-            ..ExecutionConfig::default()
-        }));
-
-        let prepared = service
-            .prepare_command(ExecuteCommandInput {
-                command: "cargo build".to_string(),
-                server: Some("prod".to_string()),
-                working_directory: Some("/workspace/app".to_string()),
-                env: HashMap::from([("RUST_LOG".to_string(), "debug".to_string())]),
-                timeout_ms: Some(5_000),
-            })
-            .await
-            .expect("remote command should prepare");
-
-        let confirmation = prepared
-            .confirmation_request()
-            .expect("confirmation should exist");
-        assert_eq!(confirmation.server, "prod");
-        assert_eq!(confirmation.platform, "linux");
-        assert_eq!(
-            confirmation.working_directory.as_deref(),
-            Some("/srv/workspace/app")
-        );
-        assert_eq!(prepared.run.program, "ssh");
-        assert!(prepared.run.args.contains(&"-p".to_string()));
-        assert!(prepared.run.args.contains(&"2222".to_string()));
-        assert!(
-            prepared
-                .run
-                .args
-                .contains(&"deploy@prod.example.com".to_string())
-        );
-        let remote_command = prepared
-            .run
-            .args
-            .last()
-            .expect("remote command should be present");
-        assert!(remote_command.contains("/srv/workspace/app"));
-        assert!(remote_command.contains("RUST_LOG=debug"));
-        assert!(remote_command.contains("cargo"));
-    }
-
-    #[test]
-    fn command_environment_name_returns_resolved_platform() {
-        let config = test_config(ExecutionConfig {
-            target_platform: TargetPlatform::Windows,
-            ..ExecutionConfig::default()
-        });
-        let service = ExecutionService::new(config);
-
-        assert_eq!(service.command_environment_name(), "windows");
-    }
-
-    #[test]
-    fn execution_record_preserves_merged_output_order() {
-        let path =
-            std::env::temp_dir().join(format!("host-bridge-mcp-test-{}.log", Uuid::new_v4()));
-        let record =
-            ExecutionRecord::with_output_path(path.clone()).expect("record should initialize");
-
-        record
-            .append_output("first\n")
-            .expect("first write should succeed");
-        record
-            .append_output("second\n")
-            .expect("second write should succeed");
-
-        assert_eq!(
-            record.read_output().expect("output should be readable"),
-            "first\nsecond\n"
-        );
-
-        drop(record);
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn execution_output_file_is_named_from_execution_id() {
-        let execution_id =
-            Uuid::parse_str("123e4567-e89b-12d3-a456-426614174000").expect("uuid should parse");
-        let path = execution_output_path(execution_id).expect("path should resolve");
-
-        assert_eq!(
-            path.file_name().and_then(|value| value.to_str()),
-            Some("123e4567-e89b-12d3-a456-426614174000.log")
-        );
-    }
-
-    #[test]
-    fn execution_output_file_is_retained_after_record_drop() {
-        let path =
-            std::env::temp_dir().join(format!("host-bridge-mcp-output-{}.log", Uuid::new_v4()));
-        {
-            let record =
-                ExecutionRecord::with_output_path(path.clone()).expect("record should initialize");
-            record
-                .append_output("persisted\n")
-                .expect("output should be written");
-        }
-
-        assert!(path.exists());
-        let _ = fs::remove_file(path);
-    }
 }

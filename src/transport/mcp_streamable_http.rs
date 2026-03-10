@@ -122,13 +122,12 @@ impl HostBridgeMcpServer {
     }
 
     #[tool(
-        description = "Return the default execution server, its platform, and the list of configured execution servers so agents can choose the right command syntax and path format."
+        description = "Return the configured execution environments with their names and platform types, plus the default environment name."
     )]
     async fn get_execution_environment(&self) -> Result<CallToolResult, McpError> {
         Ok(CallToolResult::structured(json!({
-            "environment": self.execution_service.command_environment_name(),
-            "defaultServer": self.execution_service.default_server_name(),
-            "availableServers": self.execution_service.available_server_names(),
+            "defaultEnvironment": self.execution_service.default_server_name(),
+            "environments": self.execution_service.available_environments(),
         })))
     }
 }
@@ -163,9 +162,17 @@ impl ServerHandler for HostBridgeMcpServer {
 #[cfg(test)]
 mod tests {
     use super::ExecuteCommandToolArgs;
+    use super::HostBridgeMcpServer;
+    use crate::application::execution_service::ExecutionService;
+    use crate::application::operator_console::OperatorConsole;
+    use crate::config::{
+        AppConfig, ExecutionConfig, ExecutionServerConfig, SshAuthConfig, SshAuthType,
+        TargetPlatform,
+    };
     use rmcp::schemars;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     #[test]
     fn deserializes_output_limit_arguments() {
@@ -209,6 +216,60 @@ mod tests {
         );
         assert!(schema_json.contains("Use 0 to disable the character cap."));
         assert!(schema_json.contains("merged command output"));
+    }
+
+    #[tokio::test]
+    async fn get_execution_environment_reports_named_environments() {
+        let server = HostBridgeMcpServer::new(
+            ExecutionService::new(Arc::new(AppConfig {
+                execution: ExecutionConfig {
+                    default_server: "prod".to_string(),
+                    servers: vec![ExecutionServerConfig::Ssh {
+                        name: "prod".to_string(),
+                        host: "prod.example.com".to_string(),
+                        port: 22,
+                        user: "deploy".to_string(),
+                        target_platform: TargetPlatform::Linux,
+                        path_mappings: Vec::new(),
+                        auth: SshAuthConfig {
+                            kind: SshAuthType::Agent,
+                            r#ref: None,
+                        },
+                        known_hosts_file: None,
+                        connection_idle_timeout_ms: 30_000,
+                    }],
+                    ..ExecutionConfig::default()
+                },
+                ..AppConfig::default()
+            })),
+            OperatorConsole::default(),
+        );
+
+        let result = server
+            .get_execution_environment()
+            .await
+            .expect("environment query should succeed");
+        let payload = result
+            .structured_content
+            .expect("structured payload should exist");
+
+        assert_eq!(payload.get("defaultEnvironment"), Some(&json!("prod")));
+        let environments = payload
+            .get("environments")
+            .and_then(serde_json::Value::as_array)
+            .expect("environments should be an array");
+        assert_eq!(environments.len(), 2);
+        assert!(environments.iter().any(|environment| {
+            environment.get("name") == Some(&json!("prod"))
+                && environment.get("platform") == Some(&json!("linux"))
+        }));
+        assert!(environments.iter().any(|environment| {
+            environment.get("name") == Some(&json!("host"))
+                && environment
+                .get("platform")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+        }));
     }
 }
 

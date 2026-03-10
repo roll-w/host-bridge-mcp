@@ -21,20 +21,14 @@ use crate::domain::platform::runtime::{current_is_wsl, resolve_target_platform, 
 pub struct PathMapper {
     rules: Vec<PathMappingRule>,
     target_platform: RuntimePlatform,
-    enable_builtin_wsl_mapping: bool,
     running_inside_wsl: bool,
 }
 
 impl PathMapper {
-    pub fn new(
-        rules: Vec<PathMappingRule>,
-        target: TargetPlatform,
-        enable_builtin_wsl_mapping: bool,
-    ) -> Self {
+    pub fn new(rules: Vec<PathMappingRule>, target: TargetPlatform) -> Self {
         Self {
             rules,
             target_platform: resolve_target_platform(target),
-            enable_builtin_wsl_mapping,
             running_inside_wsl: current_is_wsl(),
         }
     }
@@ -50,12 +44,6 @@ impl PathMapper {
                 continue;
             }
             if let Some(mapped) = apply_rule(trimmed, rule) {
-                return mapped;
-            }
-        }
-
-        if self.enable_builtin_wsl_mapping && self.target_platform == RuntimePlatform::Windows {
-            if let Some(mapped) = map_wsl_to_windows(trimmed) {
                 return mapped;
             }
         }
@@ -148,27 +136,6 @@ fn apply_rule(input: &str, rule: &PathMappingRule) -> Option<String> {
     Some(format!("{}{}", rule.to, normalized_remainder))
 }
 
-fn map_wsl_to_windows(input: &str) -> Option<String> {
-    let rest = input.strip_prefix("/mnt/")?;
-    let mut chars = rest.chars();
-    let drive = chars.next()?;
-    if !drive.is_ascii_alphabetic() {
-        return None;
-    }
-
-    let remaining = chars.as_str();
-    if !remaining.starts_with('/') {
-        return None;
-    }
-
-    let suffix = remaining[1..].replace('/', "\\");
-    if suffix.is_empty() {
-        return Some(format!("{}:\\", drive.to_ascii_uppercase()));
-    }
-
-    Some(format!("{}:\\{}", drive.to_ascii_uppercase(), suffix))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,7 +149,6 @@ mod tests {
                 platforms: Vec::new(),
             }],
             TargetPlatform::Windows,
-            false,
         );
 
         assert_eq!(

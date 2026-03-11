@@ -4,7 +4,7 @@
 
 Run host commands through MCP with TUI approvals, live logs, and full final output.
 
-[Quickstart](#quickstart) | [Configuration](#configuration) | [Usage](#usage) | [TUI](#tui) | [Security](#security) | [Documentation](#documentation)
+[Quickstart](#quickstart) | [Configuration](#configuration) | [Usage](#usage) | [TUI](#tui) | [Security](#security)
 
 </div>
 
@@ -186,14 +186,13 @@ Highlights:
 - `logging.file-path`: optional explicit log file path
 - `logging.persist-file`: keep or delete the backing log file on exit
 - default persistent log path: host-bridge data directory + `logs/host-bridge-mcp.log`
+- default temporary log path: host-bridge data directory + `logs/host-bridge-mcp-<uuid>.log`
 - default execution output path: host-bridge data directory + `executions/<executionId>.log`
 - the host-bridge data directory is usually `~/.host-bridge-mcp` on Unix-like hosts
 - persistent logs append across restarts; execution output files accumulate until manually cleaned up
 - `execution.default-action`: fallback action for unmatched commands
 - `execution.commands`: grouped command policies with nested `rules` overrides
 - `execution.default-timeout-ms` / `execution.max-timeout-ms`: timeout control
-
-See `docs/configuration.md` for the full reference.
 
 ## Security
 

@@ -92,6 +92,7 @@ mod tests {
     use super::*;
     use crate::application::operator_console::ConsoleSnapshot;
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::layout::Rect;
 
     fn snapshot(total_log_count: usize) -> ConsoleSnapshot {
         ConsoleSnapshot {
@@ -151,7 +152,7 @@ mod tests {
     #[test]
     fn drag_selection_tracks_visible_log_range() {
         let mut state = TuiState::default();
-        state.set_visible_logs(ratatui::layout::Rect::new(0, 0, 40, 6), 10, 4);
+        state.set_visible_logs(Rect::new(0, 0, 40, 6), 10, 4, 30);
 
         state.begin_log_selection(2, 2);
         state.extend_log_selection(2, 4);
@@ -159,5 +160,32 @@ mod tests {
         assert_eq!(state.selected_log_range(), Some((11, 13)));
         assert!(state.is_log_line_selected(12));
         assert!(!state.is_log_line_selected(14));
+    }
+
+    #[test]
+    fn right_and_left_keys_scroll_logs_horizontally() {
+        let console = OperatorConsole::default();
+        let shutdown_controller = ShutdownController::default();
+        let snapshot = snapshot(1);
+        let mut state = TuiState::default();
+        state.set_visible_logs(Rect::new(0, 0, 20, 6), 0, 1, 60);
+
+        handle_input(
+            Event::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            &console,
+            &snapshot,
+            &mut state,
+            &shutdown_controller,
+        );
+        assert_eq!(state.log_horizontal_offset_columns(), 8);
+
+        handle_input(
+            Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            &console,
+            &snapshot,
+            &mut state,
+            &shutdown_controller,
+        );
+        assert_eq!(state.log_horizontal_offset_columns(), 0);
     }
 }

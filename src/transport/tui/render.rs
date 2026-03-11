@@ -102,7 +102,7 @@ fn render_status_bar(frame: &mut Frame, area: Rect, snapshot: &ConsoleSnapshot) 
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::raw(
-            "  |  Up/Down select  a approve  r reject  Wheel/PgUp/PgDn logs  drag logs clip  Home/End head-tail  q shutdown",
+            "  |  Up/Down select  Left/Right x-scroll  a approve  r reject  Wheel/PgUp/PgDn logs  Home/End head-tail  q shutdown",
         ),
     ]);
     frame.render_widget(Paragraph::new(text).style(style), area);
@@ -173,22 +173,50 @@ fn render_logs(
     state.set_log_page_size(visible_height.max(1));
     let start = state.log_start(snapshot, visible_height.max(1));
     let log_entries = console.read_logs(start, visible_height.max(1));
-    state.set_visible_logs(area, start, log_entries.len());
     let log_lines = visible_logs(&log_entries, state, start);
+    state.set_visible_logs(
+        area,
+        start,
+        log_entries.len(),
+        max_log_line_width(&log_entries),
+    );
     let end = if log_entries.is_empty() {
         start
     } else {
         start + log_entries.len()
     };
-    let title = format!(
-        "Logs {}..{} / {} ({})",
-        if log_entries.is_empty() { 0 } else { start + 1 },
-        end,
-        snapshot.total_log_count,
-        snapshot.log_file_path
-    );
-    let logs = Paragraph::new(log_lines).block(Block::default().title(title).borders(Borders::ALL));
+    let horizontal_offset = state.log_horizontal_offset_columns();
+    let title = if horizontal_offset == 0 {
+        format!(
+            "Logs {}..{} / {} ({})",
+            if log_entries.is_empty() { 0 } else { start + 1 },
+            end,
+            snapshot.total_log_count,
+            snapshot.log_file_path
+        )
+    } else {
+        format!(
+            "Logs {}..{} / {} [x:{}] ({})",
+            if log_entries.is_empty() { 0 } else { start + 1 },
+            end,
+            snapshot.total_log_count,
+            horizontal_offset,
+            snapshot.log_file_path
+        )
+    };
+    let logs = Paragraph::new(log_lines)
+        .scroll((0, state.log_horizontal_offset()))
+        .block(Block::default().title(title).borders(Borders::ALL));
     frame.render_widget(logs, area);
+}
+
+fn max_log_line_width(entries: &[ConsoleLogEntry]) -> usize {
+    entries
+        .iter()
+        .map(log_line_text)
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0)
 }
 
 fn approval_detail_lines(approval: &PendingApprovalView) -> Vec<Line<'static>> {

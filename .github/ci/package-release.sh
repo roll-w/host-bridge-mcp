@@ -23,7 +23,7 @@ Usage:
   bash .github/ci/package-release.sh \
     --binary <path> \
     --binary-name <name> \
-    --archive <tar.gz|zip> \
+    --archive <tar.gz|zip|none> \
     --artifact-name <name> \
     [--output-dir <dir>]
 EOF
@@ -84,7 +84,7 @@ if [[ -z "$binary_name" ]]; then
 fi
 
 case "$archive_format" in
-  tar.gz|zip)
+  tar.gz|zip|none)
     ;;
   *)
     printf 'Unsupported archive format: %s\n' "$archive_format" >&2
@@ -100,10 +100,17 @@ fi
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 output_dir=${output_dir%/}
 staging_dir="$repo_root/$output_dir/$artifact_name"
-archive_path="$repo_root/$output_dir/$artifact_name.$archive_format"
+archive_path=""
+artifact_path="$staging_dir"
+
+if [[ "$archive_format" != "none" ]]; then
+  archive_path="$repo_root/$output_dir/$artifact_name.$archive_format"
+fi
 
 rm -rf "$staging_dir"
-rm -f "$archive_path"
+if [[ -n "$archive_path" ]]; then
+  rm -f "$archive_path"
+fi
 
 mkdir -p "$staging_dir"
 
@@ -114,8 +121,11 @@ for relative_path in host-bridge.yaml README.md LICENSE; do
 done
 
 case "$archive_format" in
+  none)
+    ;;
   tar.gz)
     tar -czf "$archive_path" -C "$repo_root/$output_dir" "$artifact_name"
+    artifact_path="$archive_path"
     ;;
   zip)
     python3 - <<'PY' "$repo_root/$output_dir" "$artifact_name"
@@ -133,7 +143,8 @@ with ZipFile(archive_path, "w", compression=ZIP_DEFLATED, compresslevel=9) as ar
         if path.is_file():
             archive.write(path, path.relative_to(output_dir))
 PY
+    artifact_path="$archive_path"
     ;;
 esac
 
-printf '%s\n' "$archive_path"
+printf '%s\n' "$artifact_path"

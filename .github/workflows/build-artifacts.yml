@@ -48,7 +48,7 @@ jobs:
             artifact_abi: gnu
             target: x86_64-unknown-linux-gnu
             build_tool: cargo
-            archive: tar.gz
+            archive: none
             binary_path: target/x86_64-unknown-linux-gnu/release/host-bridge-mcp
             package_binary_name: host-bridge-mcp
 
@@ -59,7 +59,7 @@ jobs:
             artifact_abi: gnu
             target: aarch64-unknown-linux-gnu
             build_tool: cargo
-            archive: tar.gz
+            archive: none
             binary_path: target/aarch64-unknown-linux-gnu/release/host-bridge-mcp
             package_binary_name: host-bridge-mcp
 
@@ -70,7 +70,7 @@ jobs:
             artifact_abi: ""
             target: x86_64-pc-windows-msvc
             build_tool: xwin
-            archive: zip
+            archive: none
             binary_path: target/x86_64-pc-windows-msvc/release/host-bridge-mcp.exe
             package_binary_name: host-bridge-mcp.exe
 
@@ -81,7 +81,7 @@ jobs:
             artifact_abi: ""
             target: aarch64-pc-windows-msvc
             build_tool: xwin
-            archive: zip
+            archive: none
             binary_path: target/aarch64-pc-windows-msvc/release/host-bridge-mcp.exe
             package_binary_name: host-bridge-mcp.exe
 
@@ -92,7 +92,7 @@ jobs:
             artifact_abi: ""
             target: x86_64-apple-darwin
             build_tool: zigbuild
-            archive: zip
+            archive: none
             binary_path: target/x86_64-apple-darwin/release/host-bridge-mcp
             package_binary_name: host-bridge-mcp
 
@@ -103,7 +103,7 @@ jobs:
             artifact_abi: ""
             target: aarch64-apple-darwin
             build_tool: zigbuild
-            archive: zip
+            archive: none
             binary_path: target/aarch64-apple-darwin/release/host-bridge-mcp
             package_binary_name: host-bridge-mcp
 

@@ -44,6 +44,9 @@ use std::collections::HashMap;
 
 pub use self::auth::TransportAuthError;
 
+const MCP_SERVER_NAME: &str = env!("CARGO_PKG_NAME");
+const MCP_SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Clone)]
 pub struct HttpState {
     execution_service: ExecutionService,
@@ -141,7 +144,7 @@ impl ServerHandler for HostBridgeMcpServer {
                 .enable_logging()
                 .build(),
         )
-            .with_server_info(Implementation::from_build_env())
+            .with_server_info(server_implementation())
             .with_protocol_version(ProtocolVersion::LATEST)
             .with_instructions(
                 "Host bridge MCP server exposing execute_command for host processes and get_execution_environment for platform discovery."
@@ -159,9 +162,13 @@ impl ServerHandler for HostBridgeMcpServer {
     }
 }
 
+fn server_implementation() -> Implementation {
+    Implementation::new(MCP_SERVER_NAME, MCP_SERVER_VERSION)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ExecuteCommandToolArgs;
+    use super::{server_implementation, ExecuteCommandToolArgs};
     use super::HostBridgeMcpServer;
     use crate::application::execution_service::ExecutionService;
     use crate::application::operator_console::OperatorConsole;
@@ -216,6 +223,14 @@ mod tests {
         );
         assert!(schema_json.contains("Use 0 to disable the character cap."));
         assert!(schema_json.contains("merged command output"));
+    }
+
+    #[test]
+    fn server_implementation_uses_package_metadata() {
+        let implementation = server_implementation();
+
+        assert_eq!(implementation.name, env!("CARGO_PKG_NAME"));
+        assert_eq!(implementation.version, env!("CARGO_PKG_VERSION"));
     }
 
     #[tokio::test]

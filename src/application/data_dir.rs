@@ -25,6 +25,7 @@ const APP_DIR_NAME: &str = ".host-bridge-mcp";
 const EXECUTIONS_DIR_NAME: &str = "executions";
 const LOGS_DIR_NAME: &str = "logs";
 const DEFAULT_LOG_FILE_NAME: &str = "host-bridge-mcp.log";
+const TEMP_LOG_FILE_PREFIX: &str = "host-bridge-mcp-";
 
 pub(crate) fn execution_output_path(execution_id: Uuid) -> io::Result<PathBuf> {
     let executions_dir = resolve_data_subdir(EXECUTIONS_DIR_NAME)?;
@@ -33,7 +34,12 @@ pub(crate) fn execution_output_path(execution_id: Uuid) -> io::Result<PathBuf> {
 
 pub(crate) fn default_persisted_log_path() -> io::Result<PathBuf> {
     let logs_dir = resolve_data_subdir(LOGS_DIR_NAME)?;
-    Ok(logs_dir.join(DEFAULT_LOG_FILE_NAME))
+    Ok(persisted_log_path(&logs_dir))
+}
+
+pub(crate) fn default_temporary_log_path() -> io::Result<PathBuf> {
+    let logs_dir = resolve_data_subdir(LOGS_DIR_NAME)?;
+    Ok(temporary_log_path(&logs_dir, Uuid::new_v4()))
 }
 
 fn resolve_data_subdir(name: &str) -> io::Result<PathBuf> {
@@ -67,6 +73,14 @@ fn ensure_data_subdir(base_dir: &Path, name: &str) -> io::Result<PathBuf> {
     ensure_directory(&subdir)?;
 
     Ok(subdir)
+}
+
+fn persisted_log_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(DEFAULT_LOG_FILE_NAME)
+}
+
+fn temporary_log_path(data_dir: &Path, file_id: Uuid) -> PathBuf {
+    data_dir.join(format!("{TEMP_LOG_FILE_PREFIX}{file_id}.log"))
 }
 
 fn resolve_base_data_dir_candidates() -> io::Result<Vec<PathBuf>> {
@@ -185,6 +199,30 @@ mod tests {
     #[test]
     fn default_log_file_name_is_stable() {
         assert_eq!(DEFAULT_LOG_FILE_NAME, "host-bridge-mcp.log");
+    }
+
+    #[test]
+    fn persisted_log_path_uses_logs_subdir() {
+        let logs_dir = PathBuf::from("/tmp/.host-bridge-mcp/logs");
+
+        assert_eq!(
+            persisted_log_path(&logs_dir),
+            PathBuf::from("/tmp/.host-bridge-mcp/logs/host-bridge-mcp.log")
+        );
+    }
+
+    #[test]
+    fn temporary_log_path_uses_logs_subdir_with_unique_name() {
+        let logs_dir = PathBuf::from("/tmp/.host-bridge-mcp/logs");
+        let file_id =
+            Uuid::parse_str("123e4567-e89b-12d3-a456-426614174000").expect("uuid should parse");
+
+        assert_eq!(
+            temporary_log_path(&logs_dir, file_id),
+            PathBuf::from(
+                "/tmp/.host-bridge-mcp/logs/host-bridge-mcp-123e4567-e89b-12d3-a456-426614174000.log"
+            )
+        );
     }
 
     #[test]

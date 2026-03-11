@@ -200,7 +200,7 @@ pub enum ConfigError {
     Parse {
         path: String,
         #[source]
-        source: serde_yaml::Error,
+        source: serde_saphyr::Error,
     },
     #[error("invalid config: {0}")]
     Validation(String),
@@ -313,7 +313,7 @@ impl AppConfig {
             path: path.clone(),
             source,
         })?;
-        let config = serde_yaml::from_str::<Self>(&raw)
+        let config = serde_saphyr::from_str::<Self>(&raw)
             .map_err(|source| ConfigError::Parse { path, source })?;
         config.validate()?;
         Ok(config)

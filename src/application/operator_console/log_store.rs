@@ -14,19 +14,17 @@
  * limitations under the License.
  */
 
-use crate::application::data_dir::default_persisted_log_path;
+use crate::application::data_dir::{default_persisted_log_path, default_temporary_log_path};
 use crate::application::operator_console::{ConsoleLogEntry, ConsoleLogLevel};
 use crate::config::LoggingConfig;
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::{FormatTime, SystemTime as TracingSystemTime};
-use uuid::Uuid;
-
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
 
 pub(super) struct LogStore {
     buffer_limit: usize,
@@ -215,7 +213,7 @@ fn resolve_log_path(logging: &LoggingConfig) -> io::Result<PathBuf> {
         return default_persisted_log_path();
     }
 
-    Ok(std::env::temp_dir().join(format!("host-bridge-mcp-{}.log", Uuid::new_v4())))
+    default_temporary_log_path()
 }
 
 fn open_private_write_file(path: &Path, append_mode: bool) -> io::Result<File> {

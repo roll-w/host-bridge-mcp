@@ -21,6 +21,8 @@ pub(super) struct TuiState {
     pub(super) selected_approval_index: usize,
     pub(super) log_start_index: usize,
     pub(super) log_page_size: usize,
+    pub(super) log_horizontal_offset: usize,
+    pub(super) max_log_horizontal_offset: usize,
     pub(super) follow_logs: bool,
     pub(super) last_pending_count: usize,
     pub(super) logs_area: Option<Rect>,
@@ -35,6 +37,8 @@ impl Default for TuiState {
             selected_approval_index: 0,
             log_start_index: 0,
             log_page_size: 0,
+            log_horizontal_offset: 0,
+            max_log_horizontal_offset: 0,
             follow_logs: false,
             last_pending_count: 0,
             logs_area: None,
@@ -89,13 +93,27 @@ impl TuiState {
         self.log_page_size = page_size.max(1);
     }
 
-    pub(super) fn set_visible_logs(&mut self, area: Rect, start: usize, count: usize) {
+    pub(super) fn set_visible_logs(
+        &mut self,
+        area: Rect,
+        start: usize,
+        count: usize,
+        max_line_width: usize,
+    ) {
         self.logs_area = Some(area);
         self.visible_log_start = start;
         self.visible_log_count = count;
         if count == 0 {
             self.active_log_selection = None;
+            self.log_horizontal_offset = 0;
+            self.max_log_horizontal_offset = 0;
+            return;
         }
+
+        self.max_log_horizontal_offset = max_line_width.saturating_sub(log_view_width(area));
+        self.log_horizontal_offset = self
+            .log_horizontal_offset
+            .min(self.max_log_horizontal_offset);
     }
 
     pub(super) fn log_start(&self, snapshot: &ConsoleSnapshot, visible_height: usize) -> usize {
@@ -138,6 +156,25 @@ impl TuiState {
 
     pub(super) fn follow_tail(&mut self) {
         self.follow_logs = true;
+    }
+
+    pub(super) fn scroll_logs_left(&mut self, columns: usize) {
+        self.log_horizontal_offset = self.log_horizontal_offset.saturating_sub(columns.max(1));
+    }
+
+    pub(super) fn scroll_logs_right(&mut self, columns: usize) {
+        self.log_horizontal_offset = self
+            .log_horizontal_offset
+            .saturating_add(columns.max(1))
+            .min(self.max_log_horizontal_offset);
+    }
+
+    pub(super) fn log_horizontal_offset(&self) -> u16 {
+        self.log_horizontal_offset.min(u16::MAX as usize) as u16
+    }
+
+    pub(super) fn log_horizontal_offset_columns(&self) -> usize {
+        self.log_horizontal_offset
     }
 
     pub(super) fn begin_log_selection(&mut self, column: u16, row: u16) {
@@ -201,5 +238,29 @@ impl TuiState {
         }
 
         Some(self.visible_log_start + relative_row)
+    }
+}
+
+fn log_view_width(area: Rect) -> usize {
+    area.width.saturating_sub(2) as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn horizontal_scroll_is_clamped_to_visible_content() {
+        let mut state = TuiState::default();
+        state.set_visible_logs(Rect::new(0, 0, 20, 6), 0, 3, 40);
+
+        state.scroll_logs_right(64);
+        assert_eq!(state.log_horizontal_offset_columns(), 22);
+
+        state.scroll_logs_left(5);
+        assert_eq!(state.log_horizontal_offset_columns(), 17);
+
+        state.scroll_logs_left(64);
+        assert_eq!(state.log_horizontal_offset_columns(), 0);
     }
 }

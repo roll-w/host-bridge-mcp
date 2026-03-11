@@ -67,6 +67,16 @@ pub(super) fn handle_input(
                     state.follow_tail();
                     false
                 }
+                KeyCode::Left => {
+                    state.scroll_logs_left(8);
+                    state.clear_log_selection();
+                    false
+                }
+                KeyCode::Right => {
+                    state.scroll_logs_right(8);
+                    state.clear_log_selection();
+                    false
+                }
                 KeyCode::Char('a') => {
                     if let Some(approval) = state.selected_approval(snapshot) {
                         console.resolve_confirmation(approval.id, true);

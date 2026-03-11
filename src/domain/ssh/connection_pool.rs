@@ -14,95 +14,112 @@
  * limitations under the License.
  */
 
-use super::{authenticate_session, connect_session, disconnect_session, verify_host_key, SshError};
+use super::{create_authenticated_session, SshError, SshSessionHandle};
 use crate::domain::execution_target::SshTarget;
-use ssh2::Session;
+use russh::Disconnect;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Weak};
-use std::thread;
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::task::JoinHandle;
 
-const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
-const MIN_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
-const MAX_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
-const MAX_IDLE_CONNECTIONS_PER_TARGET: usize = 4;
+const SSH_DISCONNECT_LANGUAGE: &str = "en-US";
 
-pub(super) struct SshConnectionPool {
-    state: Arc<PoolState>,
+pub(super) struct SshConnectionManager {
+    state: Arc<ManagerState>,
 }
 
 pub(super) struct SshConnectionLease {
-    pool: Arc<PoolState>,
+    state: Arc<ManagerState>,
     target: SshTarget,
-    session: Option<Session>,
+    handle: Option<SshSessionHandle>,
     reused: bool,
     discard_on_drop: bool,
 }
 
-struct PoolState {
-    idle_connections: Mutex<HashMap<SshTarget, Vec<IdleSshConnection>>>,
+struct ManagerState {
+    idle_connections: Mutex<HashMap<SshTarget, ManagedSshConnection>>,
+    next_generation: AtomicU64,
 }
 
-struct IdleSshConnection {
-    session: Session,
+struct ManagedSshConnection {
+    generation: u64,
+    handle: SshSessionHandle,
     idle_timeout: Duration,
-    keepalive_interval: Option<Duration>,
-    last_used_at: Instant,
-    next_keepalive_at: Instant,
+    returned_at: Instant,
+    cleanup_task: Option<JoinHandle<()>>,
 }
 
-impl SshConnectionPool {
+impl SshConnectionManager {
     pub(super) fn new() -> Self {
-        let state = Arc::new(PoolState {
-            idle_connections: Mutex::new(HashMap::new()),
-        });
-        spawn_maintenance_thread(&state);
-
-        Self { state }
+        Self {
+            state: Arc::new(ManagerState {
+                idle_connections: Mutex::new(HashMap::new()),
+                next_generation: AtomicU64::new(1),
+            }),
+        }
     }
 
-    pub(super) fn checkout(&self, target: &SshTarget) -> Result<SshConnectionLease, SshError> {
-        if let Some(session) = self.state.take_idle_session(target) {
-            return Ok(SshConnectionLease::new(
-                self.state.clone(),
-                target.clone(),
-                session,
-                true,
-            ));
+    pub(super) async fn checkout(&self, target: SshTarget) -> Result<SshConnectionLease, SshError> {
+        if let Some(connection) = self.state.take_connection(&target) {
+            if connection.is_reusable(Instant::now()) {
+                return Ok(SshConnectionLease::new(
+                    self.state.clone(),
+                    target,
+                    connection.handle,
+                    true,
+                ));
+            }
+
+            if !connection.handle.is_closed() {
+                schedule_disconnect(connection.handle, "stale cached connection");
+            }
         }
 
-        self.checkout_fresh(target)
+        self.checkout_fresh(target).await
     }
 
-    pub(super) fn checkout_fresh(
+    pub(super) async fn checkout_fresh(
         &self,
-        target: &SshTarget,
+        target: SshTarget,
     ) -> Result<SshConnectionLease, SshError> {
-        let session = create_authenticated_session(target)?;
+        if let Some(connection) = self.state.take_connection(&target) {
+            if !connection.handle.is_closed() {
+                schedule_disconnect(connection.handle, "connection refresh");
+            }
+        }
+
+        let handle = create_authenticated_session(target.clone()).await?;
         Ok(SshConnectionLease::new(
             self.state.clone(),
-            target.clone(),
-            session,
+            target,
+            handle,
             false,
         ))
     }
 }
 
 impl SshConnectionLease {
-    fn new(pool: Arc<PoolState>, target: SshTarget, session: Session, reused: bool) -> Self {
+    fn new(
+        state: Arc<ManagerState>,
+        target: SshTarget,
+        handle: SshSessionHandle,
+        reused: bool,
+    ) -> Self {
         Self {
-            pool,
+            state,
             target,
-            session: Some(session),
+            handle: Some(handle),
             reused,
             discard_on_drop: false,
         }
     }
 
-    pub(super) fn session(&self) -> &Session {
-        self.session
+    pub(super) fn handle(&self) -> &SshSessionHandle {
+        self.handle
             .as_ref()
-            .expect("ssh session lease must hold a session until drop")
+            .expect("ssh connection lease must hold a handle until drop")
     }
 
     pub(super) fn discard(&mut self) {
@@ -116,192 +133,157 @@ impl SshConnectionLease {
 
 impl Drop for SshConnectionLease {
     fn drop(&mut self) {
-        let Some(session) = self.session.take() else {
+        let Some(handle) = self.handle.take() else {
             return;
         };
 
         if self.discard_on_drop {
-            disconnect_session(session);
+            schedule_disconnect(handle, "connection discarded");
         } else {
-            self.pool.return_idle_session(self.target.clone(), session);
+            self.state.return_connection(self.target.clone(), handle);
         }
     }
 }
 
-impl PoolState {
-    fn take_idle_session(&self, target: &SshTarget) -> Option<Session> {
-        let now = Instant::now();
-        let mut stale_sessions = Vec::new();
-        let mut idle_connections = self
+impl ManagerState {
+    fn take_connection(&self, target: &SshTarget) -> Option<ManagedSshConnection> {
+        let mut connection = self
             .idle_connections
             .lock()
-            .expect("ssh connection pool mutex should not be poisoned");
-        let session = idle_connections.get_mut(target).and_then(|connections| {
-            while let Some(connection) = connections.pop() {
-                if connection.is_expired(now) {
-                    stale_sessions.push(connection.session);
-                    continue;
-                }
-
-                return Some(connection.session);
-            }
-
-            None
-        });
-        idle_connections.retain(|_, connections| !connections.is_empty());
-        drop(idle_connections);
-
-        for session in stale_sessions {
-            disconnect_session(session);
-        }
-
-        session
+            .expect("ssh connection manager mutex should not be poisoned")
+            .remove(target)?;
+        connection.abort_cleanup();
+        Some(connection)
     }
 
-    fn return_idle_session(&self, target: SshTarget, session: Session) {
-        let connection = IdleSshConnection::new(session, target.connection_idle_timeout);
-        let mut disconnected_sessions = Vec::new();
-        let mut idle_connections = self
-            .idle_connections
-            .lock()
-            .expect("ssh connection pool mutex should not be poisoned");
-        let connections = idle_connections.entry(target).or_default();
-        connections.push(connection);
-
-        for _ in 0..excess_idle_connection_count(connections.len()) {
-            let Some(index) = oldest_connection_index(connections) else {
-                break;
-            };
-            disconnected_sessions.push(connections.swap_remove(index).session);
+    fn return_connection(self: &Arc<Self>, target: SshTarget, handle: SshSessionHandle) {
+        if handle.is_closed() {
+            return;
         }
 
-        drop(idle_connections);
-
-        for session in disconnected_sessions {
-            disconnect_session(session);
-        }
-    }
-
-    fn maintain_idle_sessions(&self) {
-        let now = Instant::now();
-        let mut disconnected_sessions = Vec::new();
-        let mut idle_connections = self
-            .idle_connections
-            .lock()
-            .expect("ssh connection pool mutex should not be poisoned");
-
-        for connections in idle_connections.values_mut() {
-            let mut index = 0;
-            while index < connections.len() {
-                if connections[index].is_expired(now) {
-                    disconnected_sessions.push(connections.swap_remove(index).session);
-                    continue;
-                }
-
-                if connections[index].should_send_keepalive(now) {
-                    if connections[index].session.keepalive_send().is_err() {
-                        connections[index].record_keepalive(now);
-                        index += 1;
-                        continue;
-                    }
-
-                    connections[index].record_keepalive(now);
-                }
-
-                index += 1;
-            }
-        }
-
-        idle_connections.retain(|_, connections| !connections.is_empty());
-        drop(idle_connections);
-
-        for session in disconnected_sessions {
-            disconnect_session(session);
-        }
-    }
-}
-
-impl IdleSshConnection {
-    fn new(session: Session, idle_timeout: Duration) -> Self {
-        let keepalive_interval = keepalive_interval_for(idle_timeout);
-        let now = Instant::now();
-
-        Self {
-            session,
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+        let idle_timeout = target.connection_idle_timeout;
+        let mut connection = ManagedSshConnection::new(generation, handle, idle_timeout);
+        connection.cleanup_task = spawn_idle_cleanup_task(
+            target.clone(),
+            generation,
             idle_timeout,
-            keepalive_interval,
-            last_used_at: now,
-            next_keepalive_at: now + keepalive_interval.unwrap_or(idle_timeout),
+            Arc::downgrade(self),
+        );
+        let replaced = self
+            .idle_connections
+            .lock()
+            .expect("ssh connection manager mutex should not be poisoned")
+            .insert(target.clone(), connection);
+
+        if let Some(replaced) = replaced {
+            let mut replaced = replaced;
+            replaced.abort_cleanup();
+            if !replaced.handle.is_closed() {
+                schedule_disconnect(replaced.handle, "connection superseded");
+            }
         }
     }
 
-    fn is_expired(&self, now: Instant) -> bool {
-        now.duration_since(self.last_used_at) >= self.idle_timeout
+    fn remove_if_generation(
+        &self,
+        target: &SshTarget,
+        generation: u64,
+    ) -> Option<SshSessionHandle> {
+        let mut idle_connections = self
+            .idle_connections
+            .lock()
+            .expect("ssh connection manager mutex should not be poisoned");
+        let should_remove = idle_connections
+            .get(target)
+            .is_some_and(|connection| connection.generation == generation);
+        if !should_remove {
+            return None;
+        }
+
+        idle_connections
+            .remove(target)
+            .map(|connection| connection.handle)
+    }
+}
+
+impl ManagedSshConnection {
+    fn new(generation: u64, handle: SshSessionHandle, idle_timeout: Duration) -> Self {
+        Self {
+            generation,
+            handle,
+            idle_timeout,
+            returned_at: Instant::now(),
+            cleanup_task: None,
+        }
     }
 
-    fn should_send_keepalive(&self, now: Instant) -> bool {
-        self.keepalive_interval.is_some() && now >= self.next_keepalive_at
+    fn is_reusable(&self, now: Instant) -> bool {
+        !self.handle.is_closed() && !is_connection_expired(self.returned_at, self.idle_timeout, now)
     }
 
-    fn record_keepalive(&mut self, now: Instant) {
-        if let Some(interval) = self.keepalive_interval {
-            self.next_keepalive_at = now + interval;
+    fn abort_cleanup(&mut self) {
+        if let Some(cleanup_task) = self.cleanup_task.take() {
+            cleanup_task.abort();
         }
     }
 }
 
-fn create_authenticated_session(target: &SshTarget) -> Result<Session, SshError> {
-    let session = connect_session(target)?;
-    verify_host_key(&session, target)?;
-    authenticate_session(&session, target)?;
-    let keepalive_interval = keepalive_interval_for(target.connection_idle_timeout)
-        .map(|interval| interval.as_secs().min(u64::from(u32::MAX)) as u32)
-        .unwrap_or(0);
-    session.set_keepalive(false, keepalive_interval);
-    Ok(session)
-}
-
-fn spawn_maintenance_thread(state: &Arc<PoolState>) {
-    let state = Arc::downgrade(state);
-    thread::spawn(move || run_maintenance_loop(state));
-}
-
-fn run_maintenance_loop(state: Weak<PoolState>) {
-    loop {
-        thread::sleep(MAINTENANCE_INTERVAL);
+fn spawn_idle_cleanup_task(
+    target: SshTarget,
+    generation: u64,
+    idle_timeout: Duration,
+    state: std::sync::Weak<ManagerState>,
+) -> Option<JoinHandle<()>> {
+    spawn_background_task(async move {
+        tokio::time::sleep(idle_timeout).await;
 
         let Some(state) = state.upgrade() else {
-            break;
+            return;
+        };
+        let Some(handle) = state.remove_if_generation(&target, generation) else {
+            return;
         };
 
-        state.maintain_idle_sessions();
+        schedule_disconnect(handle, "idle timeout");
+    })
+}
+
+fn schedule_disconnect(handle: SshSessionHandle, description: &'static str) {
+    if handle.is_closed() {
+        return;
     }
+
+    spawn_background_task(async move {
+        let _ = handle
+            .disconnect(
+                Disconnect::ByApplication,
+                description,
+                SSH_DISCONNECT_LANGUAGE,
+            )
+            .await;
+    });
 }
 
-fn keepalive_interval_for(idle_timeout: Duration) -> Option<Duration> {
-    if idle_timeout < MIN_KEEPALIVE_INTERVAL.saturating_mul(2) {
-        return None;
+fn spawn_background_task<F>(future: F) -> Option<JoinHandle<()>>
+where
+    F: Future<Output=()> + Send + 'static,
+{
+    if let Ok(runtime_handle) = tokio::runtime::Handle::try_current() {
+        return Some(runtime_handle.spawn(future));
     }
 
-    let candidate = idle_timeout / 3;
-    Some(candidate.clamp(MIN_KEEPALIVE_INTERVAL, MAX_KEEPALIVE_INTERVAL))
+    None
 }
 
-fn excess_idle_connection_count(len: usize) -> usize {
-    len.saturating_sub(MAX_IDLE_CONNECTIONS_PER_TARGET)
-}
-
-fn oldest_connection_index(connections: &[IdleSshConnection]) -> Option<usize> {
-    connections
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, connection)| connection.last_used_at)
-        .map(|(index, _)| index)
+fn is_connection_expired(returned_at: Instant, idle_timeout: Duration, now: Instant) -> bool {
+    now.duration_since(returned_at) >= idle_timeout
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::ssh::keepalive_interval_for;
 
     #[test]
     fn keepalive_interval_is_disabled_for_short_idle_timeout() {
@@ -321,9 +303,17 @@ mod tests {
     }
 
     #[test]
-    fn idle_pool_cap_only_trims_connections_above_limit() {
-        assert_eq!(excess_idle_connection_count(0), 0);
-        assert_eq!(excess_idle_connection_count(4), 0);
-        assert_eq!(excess_idle_connection_count(6), 2);
+    fn connection_expiration_uses_return_time_and_timeout() {
+        let returned_at = Instant::now();
+        assert!(!is_connection_expired(
+            returned_at,
+            Duration::from_secs(10),
+            returned_at + Duration::from_secs(9)
+        ));
+        assert!(is_connection_expired(
+            returned_at,
+            Duration::from_secs(10),
+            returned_at + Duration::from_secs(10)
+        ));
     }
 }

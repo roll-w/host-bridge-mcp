@@ -213,22 +213,24 @@ async fn run_ssh_execution(
     run: SshRunExecution,
     ssh_client: Arc<SshClient>,
 ) {
-    let record_for_thread = record.clone();
-    let join_result = tokio::task::spawn_blocking(move || {
-        ssh_client.execute_command(&run.target, run.platform, &run.request, |text| {
+    let output_record = record.clone();
+    let SshRunExecution {
+        target,
+        platform,
+        request,
+    } = run;
+
+    match ssh_client
+        .execute_command(target, platform, request, move |text| {
             emit_event(
                 execution_id,
-                &record_for_thread,
+                &output_record,
                 ExecutionEvent::Output { text },
             );
         })
-    })
-        .await;
-
-    finalize_output_store(execution_id, &record);
-
-    match join_result {
-        Ok(Ok(result)) => {
+        .await
+    {
+        Ok(result) => {
             let final_state = if result.success {
                 ExecutionState::Completed
             } else {
@@ -253,7 +255,7 @@ async fn run_ssh_execution(
                 },
             );
         }
-        Ok(Err(error)) => {
+        Err(error) => {
             record.set_state(ExecutionState::Failed).await;
             let timed_out = matches!(error, crate::domain::ssh::SshError::Timeout(_));
             emit_event(
@@ -285,25 +287,9 @@ async fn run_ssh_execution(
                 },
             );
         }
-        Err(error) => {
-            record.set_state(ExecutionState::Failed).await;
-            emit_event(
-                execution_id,
-                &record,
-                ExecutionEvent::Error {
-                    message: format!("Failed to join ssh execution task: {error}"),
-                },
-            );
-            emit_event(
-                execution_id,
-                &record,
-                ExecutionEvent::Status {
-                    state: ExecutionState::Failed,
-                    message: Some("Execution failed while waiting for remote process".to_string()),
-                },
-            );
-        }
     }
+
+    finalize_output_store(execution_id, &record);
 }
 
 fn finalize_output_store(execution_id: Uuid, record: &ExecutionRecord) {

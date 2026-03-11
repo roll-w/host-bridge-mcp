@@ -16,24 +16,47 @@
 
 use crate::domain::execution_target::{SshAuthTarget, SshTarget};
 use crate::domain::platform::runtime::RuntimePlatform;
-use ssh2::{CheckResult, KnownHostFileKind, Session};
+use russh::client;
+use russh::keys::{
+    agent::client::{AgentClient, AgentStream}, check_known_hosts_path, load_secret_key, Algorithm,
+    HashAlg,
+    PrivateKeyWithHashAlg, PublicKey,
+};
+use russh::ChannelMsg;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Read};
-use std::net::TcpStream;
-use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::sync::{mpsc, oneshot};
 
+mod command;
 mod connection_pool;
 
-use self::connection_pool::SshConnectionPool;
+use self::command::{build_remote_command, keepalive_interval_for};
+use self::connection_pool::SshConnectionManager;
 
-const SSH_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const SSH_COMMAND_QUEUE_CAPACITY: usize = 64;
+const SSH_OUTPUT_QUEUE_CAPACITY: usize = 256;
+const KEEPALIVE_FAILURE_THRESHOLD: usize = 3;
+
+type DynamicAgentClient = AgentClient<Box<dyn AgentStream + Send + Unpin + 'static>>;
+pub(super) type SshSessionHandle = client::Handle<SshClientHandler>;
 
 #[derive(Clone)]
 pub struct SshClient {
-    pool: Arc<SshConnectionPool>,
+    command_tx: mpsc::Sender<WorkerCommand>,
+}
+
+struct SshWorkerClient {
+    connection_manager: SshConnectionManager,
+}
+
+struct WorkerCommand {
+    target: SshTarget,
+    platform: RuntimePlatform,
+    request: SshCommandRequest,
+    output_tx: mpsc::Sender<String>,
+    result_tx: oneshot::Sender<Result<SshCommandResult, SshError>>,
 }
 
 #[derive(Debug, Clone)]
@@ -64,26 +87,50 @@ pub enum SshError {
     EmptyAuthFile(String),
     #[error("failed to connect to ssh server {0}:{1}: {2}")]
     Connect(String, u16, String),
-    #[error("failed to initialize ssh session: {0}")]
-    SessionInit(String),
-    #[error("failed to perform ssh handshake with {0}:{1}: {2}")]
-    Handshake(String, u16, String),
     #[error("failed to load known hosts from {0}: {1}")]
     KnownHostsLoad(String, String),
     #[error("ssh host key for {0}:{1} is not trusted by {2}")]
     HostVerification(String, u16, String),
+    #[error("failed to authenticate ssh agent for {0}@{1}:{2}: {3}")]
+    Agent(String, String, u16, String),
+    #[error("failed to load ssh identity file '{0}': {1}")]
+    IdentityLoad(String, String),
     #[error("ssh authentication failed for {0}@{1}:{2}: {3}")]
     Authentication(String, String, u16, String),
     #[error("failed to open ssh exec channel for {0}@{1}:{2}: {3}")]
     ChannelOpen(String, String, u16, String),
     #[error("failed to execute remote command on {0}@{1}:{2}: {3}")]
     CommandStart(String, String, u16, String),
-    #[error("failed while reading remote output from {0}@{1}:{2}: {3}")]
-    Output(String, String, u16, String),
     #[error("remote command timed out after {0} ms")]
     Timeout(u64),
-    #[error("failed to finalize remote command on {0}@{1}:{2}: {3}")]
-    Finalize(String, String, u16, String),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum ClientHandlerError {
+    #[error(transparent)]
+    Russh(#[from] russh::Error),
+    #[error("failed to load known hosts from {0}: {1}")]
+    KnownHostsLoad(String, String),
+    #[error("ssh host key for {0}:{1} is not trusted by {2}")]
+    HostVerification(String, u16, String),
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct SshClientHandler {
+    host: String,
+    port: u16,
+    known_hosts_file: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandAttemptStage {
+    ConnectionSetup,
+    Runtime,
+}
+
+struct CommandAttemptError {
+    error: SshError,
+    stage: CommandAttemptStage,
 }
 
 impl Default for SshClient {
@@ -94,40 +141,113 @@ impl Default for SshClient {
 
 impl SshClient {
     pub fn new() -> Self {
-        Self {
-            pool: Arc::new(SshConnectionPool::new()),
-        }
+        let (command_tx, command_rx) = mpsc::channel(SSH_COMMAND_QUEUE_CAPACITY);
+        spawn_ssh_worker(command_rx);
+        Self { command_tx }
     }
 
-    pub fn execute_command<F>(
+    pub async fn execute_command<F>(
         &self,
-        target: &SshTarget,
+        target: SshTarget,
         platform: RuntimePlatform,
-        request: &SshCommandRequest,
+        request: SshCommandRequest,
         on_output: F,
     ) -> Result<SshCommandResult, SshError>
     where
-        F: FnMut(String),
+        F: Fn(String) + Send + Sync + 'static,
     {
-        let mut on_output = on_output;
+        let error_host = target.host.clone();
+        let error_port = target.port;
+        let (output_tx, mut output_rx) = mpsc::channel(SSH_OUTPUT_QUEUE_CAPACITY);
+        let (result_tx, result_rx) = oneshot::channel();
+        self.command_tx
+            .send(WorkerCommand {
+                target,
+                platform,
+                request,
+                output_tx,
+                result_tx,
+            })
+            .await
+            .map_err(|_| {
+                SshError::Connect(
+                    error_host.clone(),
+                    error_port,
+                    "ssh worker is not running".to_string(),
+                )
+            })?;
+
+        let output_callback: Arc<dyn Fn(String) + Send + Sync> = Arc::new(on_output);
+        let callback = output_callback.clone();
+        let output_task = tokio::spawn(async move {
+            while let Some(text) = output_rx.recv().await {
+                callback(text);
+            }
+        });
+
+        let result = result_rx.await.map_err(|_| {
+            SshError::Connect(
+                error_host,
+                error_port,
+                "ssh worker stopped before returning a result".to_string(),
+            )
+        })?;
+        let _ = output_task.await;
+        result
+    }
+}
+
+impl SshWorkerClient {
+    fn new() -> Self {
+        Self {
+            connection_manager: SshConnectionManager::new(),
+        }
+    }
+
+    async fn run(mut command_rx: mpsc::Receiver<WorkerCommand>) {
+        let worker = Self::new();
+        while let Some(command) = command_rx.recv().await {
+            let result = worker
+                .execute_command(
+                    command.target,
+                    command.platform,
+                    command.request,
+                    command.output_tx,
+                )
+                .await;
+            let _ = command.result_tx.send(result);
+        }
+    }
+
+    async fn execute_command(
+        &self,
+        target: SshTarget,
+        platform: RuntimePlatform,
+        request: SshCommandRequest,
+        output_tx: mpsc::Sender<String>,
+    ) -> Result<SshCommandResult, SshError> {
         let mut allow_fresh_retry = true;
         let mut force_fresh_session = false;
 
         loop {
             let mut connection = if force_fresh_session {
-                self.pool.checkout_fresh(target)?
+                self.connection_manager
+                    .checkout_fresh(target.clone())
+                    .await?
             } else {
-                self.pool.checkout(target)?
+                self.connection_manager.checkout(target.clone()).await?
             };
             let reused_connection = connection.was_reused();
 
             match execute_command_with_connection(
                 &mut connection,
-                target,
+                target.clone(),
                 platform,
-                request,
-                &mut on_output,
-            ) {
+                request.clone(),
+                output_tx.clone(),
+            )
+                .await
+            {
                 Ok(result) => return Ok(result),
                 Err(error)
                 if should_retry_with_fresh_session(
@@ -145,154 +265,117 @@ impl SshClient {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CommandAttemptStage {
-    ConnectionSetup,
-    Runtime,
+fn spawn_ssh_worker(command_rx: mpsc::Receiver<WorkerCommand>) {
+    std::thread::Builder::new()
+        .name("host-bridge-ssh".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("ssh worker runtime should initialize");
+            runtime.block_on(SshWorkerClient::run(command_rx));
+        })
+        .expect("ssh worker thread should start");
 }
 
-struct CommandAttemptError {
-    error: SshError,
-    stage: CommandAttemptStage,
-}
-
-fn execute_command_with_connection<F>(
+async fn execute_command_with_connection(
     connection: &mut crate::domain::ssh::connection_pool::SshConnectionLease,
-    target: &SshTarget,
+    target: SshTarget,
     platform: RuntimePlatform,
-    request: &SshCommandRequest,
-    on_output: &mut F,
-) -> Result<SshCommandResult, CommandAttemptError>
-where
-    F: FnMut(String),
-{
-    let session = connection.session().clone();
+    request: SshCommandRequest,
+    output_tx: mpsc::Sender<String>,
+) -> Result<SshCommandResult, CommandAttemptError> {
+    let user = target.user.clone();
+    let host = target.host.clone();
+    let port = target.port;
 
-    let mut channel = session.channel_session().map_err(|error| {
-        connection.discard();
-        CommandAttemptError {
-            error: SshError::ChannelOpen(
-                target.user.clone(),
-                target.host.clone(),
-                target.port,
-                error.to_string(),
-            ),
-            stage: CommandAttemptStage::ConnectionSetup,
-        }
-    })?;
-    channel
-        .handle_extended_data(ssh2::ExtendedData::Merge)
+    let mut channel = connection
+        .handle()
+        .channel_open_session()
+        .await
         .map_err(|error| {
             connection.discard();
             CommandAttemptError {
-                error: SshError::ChannelOpen(
-                    target.user.clone(),
-                    target.host.clone(),
-                    target.port,
-                    error.to_string(),
-                ),
+                error: SshError::ChannelOpen(user.clone(), host.clone(), port, error.to_string()),
                 stage: CommandAttemptStage::ConnectionSetup,
             }
         })?;
 
-    let remote_command = build_remote_command(platform, request);
-    channel.exec(&remote_command).map_err(|error| {
+    let remote_command = build_remote_command(platform, &request);
+    channel.exec(true, remote_command).await.map_err(|error| {
         connection.discard();
         CommandAttemptError {
-            error: SshError::CommandStart(
-                target.user.clone(),
-                target.host.clone(),
-                target.port,
-                error.to_string(),
-            ),
+            error: SshError::CommandStart(user.clone(), host.clone(), port, error.to_string()),
             stage: CommandAttemptStage::ConnectionSetup,
         }
     })?;
 
-    let deadline = Instant::now() + Duration::from_millis(request.timeout_ms);
-    let mut buffer = [0u8; 8192];
-    let mut timed_out = false;
+    let wait_result = tokio::time::timeout(Duration::from_millis(request.timeout_ms), async {
+        let mut code = None;
+        let mut request_confirmed = false;
 
-    loop {
-        let mut progressed = false;
         loop {
-            match channel.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(read) => {
-                    progressed = true;
-                    on_output(String::from_utf8_lossy(&buffer[..read]).into_owned());
+            let Some(message) = channel.wait().await else {
+                break;
+            };
+
+            match message {
+                ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                    request_confirmed = true;
+                    let _ = output_tx
+                        .send(String::from_utf8_lossy(data.as_ref()).into_owned())
+                        .await;
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(error) => {
-                    connection.discard();
+                ChannelMsg::Success => {
+                    request_confirmed = true;
+                }
+                ChannelMsg::Failure => {
                     return Err(CommandAttemptError {
-                        error: SshError::Output(
-                            target.user.clone(),
-                            target.host.clone(),
-                            target.port,
-                            error.to_string(),
+                        error: SshError::CommandStart(
+                            user.clone(),
+                            host.clone(),
+                            port,
+                            "remote server rejected exec request".to_string(),
                         ),
-                        stage: CommandAttemptStage::Runtime,
+                        stage: if request_confirmed {
+                            CommandAttemptStage::Runtime
+                        } else {
+                            CommandAttemptStage::ConnectionSetup
+                        },
                     });
                 }
+                ChannelMsg::ExitStatus { exit_status } => {
+                    request_confirmed = true;
+                    code = Some(exit_status as i32);
+                }
+                ChannelMsg::ExitSignal { .. } => {
+                    request_confirmed = true;
+                    code.get_or_insert(-1);
+                }
+                ChannelMsg::Close | ChannelMsg::Eof => {}
+                _ => {}
             }
         }
 
-        if channel.eof() {
-            break;
-        }
-
-        if Instant::now() >= deadline {
-            timed_out = true;
-            connection.discard();
-            let _ = channel.close();
-            let _ = session.disconnect(None, "timeout", None);
-            break;
-        }
-
-        if !progressed {
-            std::thread::sleep(SSH_POLL_INTERVAL);
-        }
-    }
-
-    if timed_out {
-        return Err(CommandAttemptError {
-            error: SshError::Timeout(request.timeout_ms),
-            stage: CommandAttemptStage::Runtime,
-        });
-    }
-
-    channel.wait_close().map_err(|error| {
-        connection.discard();
-        CommandAttemptError {
-            error: SshError::Finalize(
-                target.user.clone(),
-                target.host.clone(),
-                target.port,
-                error.to_string(),
-            ),
-            stage: CommandAttemptStage::Runtime,
-        }
-    })?;
-
-    let code = channel.exit_status().map_err(|error| {
-        connection.discard();
-        CommandAttemptError {
-            error: SshError::Finalize(
-                target.user.clone(),
-                target.host.clone(),
-                target.port,
-                error.to_string(),
-            ),
-            stage: CommandAttemptStage::Runtime,
-        }
-    })?;
-
-    Ok(SshCommandResult {
-        code,
-        success: code == 0,
-        timed_out: false,
+        Ok(SshCommandResult {
+            code: code.unwrap_or(-1),
+            success: code == Some(0),
+            timed_out: false,
+        })
     })
+        .await;
+
+    match wait_result {
+        Ok(result) => result,
+        Err(_) => {
+            connection.discard();
+            let _ = channel.close().await;
+            Err(CommandAttemptError {
+                error: SshError::Timeout(request.timeout_ms),
+                stage: CommandAttemptStage::Runtime,
+            })
+        }
+    }
 }
 
 fn should_retry_with_fresh_session(
@@ -303,110 +386,178 @@ fn should_retry_with_fresh_session(
     reused_connection && allow_fresh_retry && stage == CommandAttemptStage::ConnectionSetup
 }
 
-pub fn build_remote_command(platform: RuntimePlatform, request: &SshCommandRequest) -> String {
-    match platform {
-        RuntimePlatform::Windows => build_windows_remote_command(request),
-        RuntimePlatform::Linux | RuntimePlatform::Macos => build_posix_remote_command(request),
+pub(super) async fn create_authenticated_session(
+    target: SshTarget,
+) -> Result<SshSessionHandle, SshError> {
+    let mut session = connect_session(target.clone()).await?;
+    authenticate_session(&mut session, target).await?;
+    Ok(session)
+}
+
+async fn connect_session(target: SshTarget) -> Result<SshSessionHandle, SshError> {
+    let host = target.host.clone();
+    let port = target.port;
+    let handler = SshClientHandler::new(target.clone());
+    let config = Arc::new(build_client_config(&target));
+    let address = format!("{host}:{port}");
+    let socket = tokio::net::TcpStream::connect(address)
+        .await
+        .map_err(|error| SshError::Connect(host.clone(), port, error.to_string()))?;
+
+    if config.nodelay {
+        let _ = socket.set_nodelay(true);
+    }
+
+    client::connect_stream(config, socket, handler)
+        .await
+        .map_err(|error| map_client_handler_error(host, port, error))
+}
+
+fn build_client_config(target: &SshTarget) -> client::Config {
+    let mut config = client::Config::default();
+    config.nodelay = true;
+    config.inactivity_timeout = Some(target.connection_idle_timeout);
+    config.keepalive_max = KEEPALIVE_FAILURE_THRESHOLD;
+    if let Some(interval) = keepalive_interval_for(target.connection_idle_timeout) {
+        config.keepalive_interval = Some(interval);
+    }
+    config
+}
+
+async fn authenticate_session(
+    session: &mut SshSessionHandle,
+    target: SshTarget,
+) -> Result<(), SshError> {
+    match target.auth.clone() {
+        SshAuthTarget::Agent => authenticate_with_agent(session, target).await,
+        SshAuthTarget::IdentityFile(path) => {
+            authenticate_with_identity_file(session, target, path).await
+        }
+        SshAuthTarget::PasswordEnv(reference) => {
+            let password = resolve_auth_env(&reference)?;
+            authenticate_with_password(session, target, password).await
+        }
+        SshAuthTarget::PasswordFile(reference) => {
+            let password = resolve_auth_file(&reference)?;
+            authenticate_with_password(session, target, password).await
+        }
     }
 }
 
-fn build_posix_remote_command(request: &SshCommandRequest) -> String {
-    let env_prefix = build_posix_env_prefix(&request.env);
-    let command = std::iter::once(quote_posix(&request.executable))
-        .chain(request.args.iter().map(|value| quote_posix(value)))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let exec_command = if env_prefix.is_empty() {
-        format!("exec {command}")
-    } else {
-        format!("exec env {env_prefix} {command}")
-    };
-    let script = match request.working_directory.as_deref() {
-        Some(working_directory) => {
-            format!("cd -- {} && {exec_command}", quote_posix(working_directory))
-        }
-        None => exec_command,
-    };
+async fn authenticate_with_password(
+    session: &mut SshSessionHandle,
+    target: SshTarget,
+    password: String,
+) -> Result<(), SshError> {
+    let user = target.user.clone();
+    let host = target.host.clone();
+    let port = target.port;
+    let auth_result = session
+        .authenticate_password(target.user.clone(), password)
+        .await
+        .map_err(|error| SshError::Authentication(user, host, port, error.to_string()))?;
 
-    format!("sh -lc {}", quote_posix(&script))
+    ensure_authentication_success(&target, auth_result.success())
 }
 
-fn build_windows_remote_command(request: &SshCommandRequest) -> String {
-    let script = build_windows_script(request);
-    let encoded = encode_powershell_command(&script);
-    format!(
-        "powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {encoded}"
+async fn authenticate_with_identity_file(
+    session: &mut SshSessionHandle,
+    target: SshTarget,
+    path: String,
+) -> Result<(), SshError> {
+    let user = target.user.clone();
+    let host = target.host.clone();
+    let port = target.port;
+    let private_key = load_secret_key(&path, None)
+        .map_err(|error| SshError::IdentityLoad(path.clone(), error.to_string()))?;
+    let hash_alg = best_supported_rsa_hash(
+        session,
+        matches!(private_key.algorithm(), Algorithm::Rsa { .. }),
     )
+        .await
+        .map_err(|error| {
+            SshError::Authentication(user.clone(), host.clone(), port, error.to_string())
+        })?;
+    let auth_result = session
+        .authenticate_publickey(
+            target.user.clone(),
+            PrivateKeyWithHashAlg::new(Arc::new(private_key), hash_alg),
+        )
+        .await
+        .map_err(|error| SshError::Authentication(user, host, port, error.to_string()))?;
+
+    ensure_authentication_success(&target, auth_result.success())
 }
 
-fn build_posix_env_prefix(env: &HashMap<String, String>) -> String {
-    let mut keys = env.keys().collect::<Vec<_>>();
-    keys.sort();
-    keys.into_iter()
-        .filter_map(|key| {
-            env.get(key)
-                .map(|value| quote_posix(&format!("{key}={value}")))
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
+async fn authenticate_with_agent(
+    session: &mut SshSessionHandle,
+    target: SshTarget,
+) -> Result<(), SshError> {
+    let user = target.user.clone();
+    let host = target.host.clone();
+    let port = target.port;
+    let mut agent = connect_to_agent()
+        .await
+        .map_err(|error| SshError::Agent(user.clone(), host.clone(), port, error.to_string()))?;
+    let identities = agent
+        .request_identities()
+        .await
+        .map_err(|error| SshError::Agent(user.clone(), host.clone(), port, error.to_string()))?;
 
-fn build_windows_script(request: &SshCommandRequest) -> String {
-    let mut lines = vec!["$ErrorActionPreference = 'Stop'".to_string()];
-    if let Some(working_directory) = request.working_directory.as_deref() {
-        lines.push(format!(
-            "Set-Location -LiteralPath {}",
-            quote_powershell(working_directory)
+    if identities.is_empty() {
+        return Err(SshError::Authentication(
+            user.clone(),
+            host.clone(),
+            port,
+            "ssh agent returned no identities".to_string(),
         ));
     }
 
-    let mut keys = request.env.keys().collect::<Vec<_>>();
-    keys.sort();
-    for key in keys {
-        if let Some(value) = request.env.get(key) {
-            lines.push(format!(
-                "[System.Environment]::SetEnvironmentVariable({}, {}, 'Process')",
-                quote_powershell(key),
-                quote_powershell(value)
-            ));
+    for identity in identities {
+        let hash_alg = best_supported_rsa_hash(
+            session,
+            matches!(identity.algorithm(), Algorithm::Rsa { .. }),
+        )
+            .await
+            .map_err(|error| {
+                SshError::Authentication(user.clone(), host.clone(), port, error.to_string())
+            })?;
+        let auth_result = session
+            .authenticate_publickey_with(target.user.clone(), identity, hash_alg, &mut agent)
+            .await
+            .map_err(|error| {
+                SshError::Authentication(user.clone(), host.clone(), port, error.to_string())
+            })?;
+
+        if auth_result.success() {
+            return Ok(());
         }
     }
 
-    let command = std::iter::once(quote_powershell(&request.executable))
-        .chain(request.args.iter().map(|value| quote_powershell(value)))
-        .collect::<Vec<_>>()
-        .join(" ");
-    lines.push(format!("& {command}"));
-    lines.push("exit $LASTEXITCODE".to_string());
-    lines.join("\n")
+    Err(SshError::Authentication(
+        user,
+        host,
+        port,
+        "authentication did not complete".to_string(),
+    ))
 }
 
-fn authenticate_session(session: &Session, target: &SshTarget) -> Result<(), SshError> {
-    let auth_result = match &target.auth {
-        SshAuthTarget::Agent => session.userauth_agent(&target.user),
-        SshAuthTarget::IdentityFile(path) => {
-            session.userauth_pubkey_file(&target.user, None, Path::new(path), None)
-        }
-        SshAuthTarget::PasswordEnv(reference) => {
-            let password = resolve_auth_env(reference)?;
-            session.userauth_password(&target.user, &password)
-        }
-        SshAuthTarget::PasswordFile(reference) => {
-            let password = resolve_auth_file(reference)?;
-            session.userauth_password(&target.user, &password)
-        }
-    };
+async fn best_supported_rsa_hash(
+    session: &SshSessionHandle,
+    needs_hash: bool,
+) -> Result<Option<HashAlg>, russh::Error> {
+    if !needs_hash {
+        return Ok(None);
+    }
 
-    auth_result.map_err(|error| {
-        SshError::Authentication(
-            target.user.clone(),
-            target.host.clone(),
-            target.port,
-            error.to_string(),
-        )
-    })?;
+    session
+        .best_supported_rsa_hash()
+        .await
+        .map(|hash| hash.flatten())
+}
 
-    if session.authenticated() {
+fn ensure_authentication_success(target: &SshTarget, success: bool) -> Result<(), SshError> {
+    if success {
         Ok(())
     } else {
         Err(SshError::Authentication(
@@ -418,56 +569,67 @@ fn authenticate_session(session: &Session, target: &SshTarget) -> Result<(), Ssh
     }
 }
 
-fn verify_host_key(session: &Session, target: &SshTarget) -> Result<(), SshError> {
-    let Some(known_hosts_path) = target.known_hosts_file.as_deref() else {
-        return Ok(());
-    };
-    let (host_key, _) = session.host_key().ok_or_else(|| {
-        SshError::HostVerification(
-            target.host.clone(),
-            target.port,
-            known_hosts_path.to_string(),
-        )
-    })?;
+#[cfg(unix)]
+async fn connect_to_agent() -> Result<DynamicAgentClient, russh::keys::Error> {
+    Ok(AgentClient::connect_env().await?.dynamic())
+}
 
-    let mut known_hosts = session.known_hosts().map_err(|error| {
-        SshError::KnownHostsLoad(known_hosts_path.to_string(), error.to_string())
-    })?;
-    known_hosts
-        .read_file(Path::new(known_hosts_path), KnownHostFileKind::OpenSSH)
-        .map_err(|error| {
-            SshError::KnownHostsLoad(known_hosts_path.to_string(), error.to_string())
-        })?;
+#[cfg(windows)]
+async fn connect_to_agent() -> Result<DynamicAgentClient, russh::keys::Error> {
+    Ok(AgentClient::connect_pageant().await?.dynamic())
+}
 
-    match known_hosts.check_port(&target.host, target.port, host_key) {
-        CheckResult::Match => Ok(()),
-        _ => Err(SshError::HostVerification(
-            target.host.clone(),
-            target.port,
-            known_hosts_path.to_string(),
-        )),
+fn map_client_handler_error(host: String, port: u16, error: ClientHandlerError) -> SshError {
+    match error {
+        ClientHandlerError::Russh(error) => SshError::Connect(host, port, error.to_string()),
+        ClientHandlerError::KnownHostsLoad(path, reason) => SshError::KnownHostsLoad(path, reason),
+        ClientHandlerError::HostVerification(host, port, path) => {
+            SshError::HostVerification(host, port, path)
+        }
     }
 }
 
-fn connect_session(target: &SshTarget) -> Result<Session, SshError> {
-    let address = format!("{}:{}", target.host, target.port);
-    let tcp_stream = TcpStream::connect(&address)
-        .map_err(|error| SshError::Connect(target.host.clone(), target.port, error.to_string()))?;
-    tcp_stream
-        .set_nonblocking(true)
-        .map_err(|error| SshError::Connect(target.host.clone(), target.port, error.to_string()))?;
-
-    let mut session = Session::new().map_err(|error| SshError::SessionInit(error.to_string()))?;
-    session.set_tcp_stream(tcp_stream);
-    session.handshake().map_err(|error| {
-        SshError::Handshake(target.host.clone(), target.port, error.to_string())
-    })?;
-    session.set_blocking(false);
-    Ok(session)
+impl SshClientHandler {
+    fn new(target: SshTarget) -> Self {
+        Self {
+            host: target.host,
+            port: target.port,
+            known_hosts_file: target.known_hosts_file,
+        }
+    }
 }
 
-fn disconnect_session(session: Session) {
-    let _ = session.disconnect(None, "idle timeout", None);
+impl client::Handler for SshClientHandler {
+    type Error = ClientHandlerError;
+
+    async fn check_server_key(
+        &mut self,
+        server_public_key: &PublicKey,
+    ) -> Result<bool, Self::Error> {
+        let Some(known_hosts_path) = self.known_hosts_file.clone() else {
+            return Ok(true);
+        };
+
+        match check_known_hosts_path(&self.host, self.port, server_public_key, &known_hosts_path) {
+            Ok(true) => Ok(true),
+            Ok(false) => Err(ClientHandlerError::HostVerification(
+                self.host.clone(),
+                self.port,
+                known_hosts_path,
+            )),
+            Err(russh::keys::Error::KeyChanged { .. }) => {
+                Err(ClientHandlerError::HostVerification(
+                    self.host.clone(),
+                    self.port,
+                    known_hosts_path,
+                ))
+            }
+            Err(error) => Err(ClientHandlerError::KnownHostsLoad(
+                known_hosts_path,
+                error.to_string(),
+            )),
+        }
+    }
 }
 
 fn resolve_auth_env(reference: &str) -> Result<String, SshError> {
@@ -491,93 +653,9 @@ fn resolve_auth_file(reference: &str) -> Result<String, SshError> {
     Ok(secret)
 }
 
-fn quote_posix(value: &str) -> String {
-    if value.is_empty() {
-        return "''".to_string();
-    }
-
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-fn quote_powershell(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-fn encode_powershell_command(script: &str) -> String {
-    let utf16 = script.encode_utf16().collect::<Vec<_>>();
-    let mut bytes = Vec::with_capacity(utf16.len() * 2);
-    for unit in utf16 {
-        let [low, high] = unit.to_le_bytes();
-        bytes.push(low);
-        bytes.push(high);
-    }
-
-    encode_base64(&bytes)
-}
-
-fn encode_base64(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let first = chunk[0];
-        let second = *chunk.get(1).unwrap_or(&0);
-        let third = *chunk.get(2).unwrap_or(&0);
-        let combined = (u32::from(first) << 16) | (u32::from(second) << 8) | u32::from(third);
-
-        encoded.push(TABLE[((combined >> 18) & 0x3f) as usize] as char);
-        encoded.push(TABLE[((combined >> 12) & 0x3f) as usize] as char);
-        if chunk.len() > 1 {
-            encoded.push(TABLE[((combined >> 6) & 0x3f) as usize] as char);
-        } else {
-            encoded.push('=');
-        }
-        if chunk.len() > 2 {
-            encoded.push(TABLE[(combined & 0x3f) as usize] as char);
-        } else {
-            encoded.push('=');
-        }
-    }
-
-    encoded
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn request() -> SshCommandRequest {
-        SshCommandRequest {
-            executable: "cargo".to_string(),
-            args: vec!["build".to_string(), "--release".to_string()],
-            env: HashMap::from([("RUST_LOG".to_string(), "info debug".to_string())]),
-            working_directory: Some("/srv/app".to_string()),
-            timeout_ms: 3_000,
-        }
-    }
-
-    #[test]
-    fn posix_command_uses_shell_safe_wrapping() {
-        let remote_command = build_remote_command(RuntimePlatform::Linux, &request());
-
-        assert!(remote_command.contains("sh -lc"));
-        assert!(remote_command.contains("/srv/app"));
-        assert!(remote_command.contains("RUST_LOG=info debug"));
-        assert!(remote_command.contains("cargo"));
-        assert!(remote_command.contains("--release"));
-    }
-
-    #[test]
-    fn windows_command_uses_encoded_powershell() {
-        let mut request = request();
-        request.executable = "cargo.exe".to_string();
-        request.working_directory = Some("C:\\repo".to_string());
-        let remote_command = build_remote_command(RuntimePlatform::Windows, &request);
-
-        assert!(remote_command.starts_with(
-            "powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand "
-        ));
-    }
 
     #[test]
     fn resolve_auth_env_reads_reference() {
@@ -617,11 +695,6 @@ mod tests {
         let _ = fs::remove_file(&file_path);
 
         assert_eq!(password, "secret");
-    }
-
-    #[test]
-    fn base64_encoder_matches_known_value() {
-        assert_eq!(encode_base64(b"hello"), "aGVsbG8=");
     }
 
     #[test]

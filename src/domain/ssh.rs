@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 mod command;
 mod connection_pool;
@@ -55,8 +55,12 @@ struct WorkerCommand {
     target: SshTarget,
     platform: RuntimePlatform,
     request: SshCommandRequest,
-    output_tx: mpsc::Sender<String>,
-    result_tx: oneshot::Sender<Result<SshCommandResult, SshError>>,
+    event_tx: mpsc::Sender<WorkerEvent>,
+}
+
+enum WorkerEvent {
+    Output(String),
+    Finished(Result<SshCommandResult, SshError>),
 }
 
 #[derive(Debug, Clone)]
@@ -158,15 +162,13 @@ impl SshClient {
     {
         let error_host = target.host.clone();
         let error_port = target.port;
-        let (output_tx, mut output_rx) = mpsc::channel(SSH_OUTPUT_QUEUE_CAPACITY);
-        let (result_tx, result_rx) = oneshot::channel();
+        let (event_tx, mut event_rx) = mpsc::channel(SSH_OUTPUT_QUEUE_CAPACITY);
         self.command_tx
             .send(WorkerCommand {
                 target,
                 platform,
                 request,
-                output_tx,
-                result_tx,
+                event_tx,
             })
             .await
             .map_err(|_| {
@@ -177,23 +179,18 @@ impl SshClient {
                 )
             })?;
 
-        let output_callback: Arc<dyn Fn(String) + Send + Sync> = Arc::new(on_output);
-        let callback = output_callback.clone();
-        let output_task = tokio::spawn(async move {
-            while let Some(text) = output_rx.recv().await {
-                callback(text);
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                WorkerEvent::Output(text) => on_output(text),
+                WorkerEvent::Finished(result) => return result,
             }
-        });
+        }
 
-        let result = result_rx.await.map_err(|_| {
-            SshError::Connect(
-                error_host,
-                error_port,
-                "ssh worker stopped before returning a result".to_string(),
-            )
-        })?;
-        let _ = output_task.await;
-        result
+        Err(SshError::Connect(
+            error_host,
+            error_port,
+            "ssh worker stopped before returning a result".to_string(),
+        ))
     }
 }
 
@@ -212,10 +209,10 @@ impl SshWorkerClient {
                     command.target,
                     command.platform,
                     command.request,
-                    command.output_tx,
+                    command.event_tx.clone(),
                 )
                 .await;
-            let _ = command.result_tx.send(result);
+            let _ = command.event_tx.send(WorkerEvent::Finished(result)).await;
         }
     }
 
@@ -224,7 +221,7 @@ impl SshWorkerClient {
         target: SshTarget,
         platform: RuntimePlatform,
         request: SshCommandRequest,
-        output_tx: mpsc::Sender<String>,
+        event_tx: mpsc::Sender<WorkerEvent>,
     ) -> Result<SshCommandResult, SshError> {
         let mut allow_fresh_retry = true;
         let mut force_fresh_session = false;
@@ -244,7 +241,7 @@ impl SshWorkerClient {
                 target.clone(),
                 platform,
                 request.clone(),
-                output_tx.clone(),
+                event_tx.clone(),
             )
                 .await
             {
@@ -283,7 +280,7 @@ async fn execute_command_with_connection(
     target: SshTarget,
     platform: RuntimePlatform,
     request: SshCommandRequest,
-    output_tx: mpsc::Sender<String>,
+    event_tx: mpsc::Sender<WorkerEvent>,
 ) -> Result<SshCommandResult, CommandAttemptError> {
     let user = target.user.clone();
     let host = target.host.clone();
@@ -322,8 +319,10 @@ async fn execute_command_with_connection(
             match message {
                 ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
                     request_confirmed = true;
-                    let _ = output_tx
-                        .send(String::from_utf8_lossy(data.as_ref()).into_owned())
+                    let _ = event_tx
+                        .send(WorkerEvent::Output(
+                            String::from_utf8_lossy(data.as_ref()).into_owned(),
+                        ))
                         .await;
                 }
                 ChannelMsg::Success => {

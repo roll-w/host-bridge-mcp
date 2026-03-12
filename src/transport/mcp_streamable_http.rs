@@ -168,8 +168,8 @@ fn server_implementation() -> Implementation {
 
 #[cfg(test)]
 mod tests {
-    use super::{server_implementation, ExecuteCommandToolArgs};
     use super::HostBridgeMcpServer;
+    use super::{server_implementation, ExecuteCommandToolArgs};
     use crate::application::execution_service::ExecutionService;
     use crate::application::operator_console::OperatorConsole;
     use crate::config::{

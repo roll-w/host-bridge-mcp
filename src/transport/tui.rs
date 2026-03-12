@@ -91,7 +91,7 @@ fn run(console: OperatorConsole, shutdown_controller: ShutdownController) -> io:
 mod tests {
     use super::*;
     use crate::application::operator_console::ConsoleSnapshot;
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use ratatui::layout::Rect;
 
     fn snapshot(total_log_count: usize) -> ConsoleSnapshot {
@@ -154,10 +154,10 @@ mod tests {
         let mut state = TuiState::default();
         state.set_visible_logs(Rect::new(0, 0, 40, 6), 10, 4, 30);
 
-        state.begin_log_selection(2, 2);
-        state.extend_log_selection(2, 4);
+        state.begin_log_selection(0, 0);
+        state.extend_log_selection(0, 2);
 
-        assert_eq!(state.selected_log_range(), Some((11, 13)));
+        assert_eq!(state.selected_log_range(), Some((10, 12)));
         assert!(state.is_log_line_selected(12));
         assert!(!state.is_log_line_selected(14));
     }
@@ -187,5 +187,70 @@ mod tests {
             &shutdown_controller,
         );
         assert_eq!(state.log_horizontal_offset_columns(), 0);
+    }
+
+    #[test]
+    fn horizontal_wheel_scrolls_logs_horizontally() {
+        let console = OperatorConsole::default();
+        let shutdown_controller = ShutdownController::default();
+        let snapshot = snapshot(1);
+        let mut state = TuiState::default();
+        state.set_log_scroll_area(Rect::new(0, 0, 20, 6));
+        state.set_visible_logs(Rect::new(0, 0, 20, 6), 0, 1, 60);
+
+        handle_input(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollRight,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &console,
+            &snapshot,
+            &mut state,
+            &shutdown_controller,
+        );
+        assert_eq!(state.log_horizontal_offset_columns(), 8);
+
+        handle_input(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollLeft,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &console,
+            &snapshot,
+            &mut state,
+            &shutdown_controller,
+        );
+        assert_eq!(state.log_horizontal_offset_columns(), 0);
+    }
+
+    #[test]
+    fn wheel_input_outside_log_area_does_not_scroll_logs() {
+        let console = OperatorConsole::default();
+        let shutdown_controller = ShutdownController::default();
+        let snapshot = snapshot(100);
+        let mut state = TuiState {
+            log_page_size: 10,
+            ..TuiState::default()
+        };
+        state.set_log_scroll_area(Rect::new(10, 10, 20, 6));
+        state.set_visible_logs(Rect::new(10, 10, 20, 6), 0, 10, 60);
+
+        handle_input(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &console,
+            &snapshot,
+            &mut state,
+            &shutdown_controller,
+        );
+        assert_eq!(state.log_start_index, 0);
     }
 }

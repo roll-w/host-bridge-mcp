@@ -115,13 +115,23 @@ pub(super) fn handle_input(
                 state.clear_log_selection();
                 false
             }
-            MouseEventKind::ScrollUp => {
+            MouseEventKind::ScrollUp if state.is_log_scroll_hit(mouse.column, mouse.row) => {
                 state.scroll_up(snapshot, 3);
                 state.clear_log_selection();
                 false
             }
-            MouseEventKind::ScrollDown => {
+            MouseEventKind::ScrollDown if state.is_log_scroll_hit(mouse.column, mouse.row) => {
                 state.scroll_down(snapshot, 3);
+                state.clear_log_selection();
+                false
+            }
+            MouseEventKind::ScrollLeft if state.is_log_scroll_hit(mouse.column, mouse.row) => {
+                state.scroll_logs_left(8);
+                state.clear_log_selection();
+                false
+            }
+            MouseEventKind::ScrollRight if state.is_log_scroll_hit(mouse.column, mouse.row) => {
+                state.scroll_logs_right(8);
                 state.clear_log_selection();
                 false
             }

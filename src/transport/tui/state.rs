@@ -26,6 +26,7 @@ pub(super) struct TuiState {
     pub(super) follow_logs: bool,
     pub(super) last_pending_count: usize,
     pub(super) logs_area: Option<Rect>,
+    pub(super) log_scroll_area: Option<Rect>,
     pub(super) visible_log_start: usize,
     pub(super) visible_log_count: usize,
     pub(super) active_log_selection: Option<LogSelection>,
@@ -42,6 +43,7 @@ impl Default for TuiState {
             follow_logs: false,
             last_pending_count: 0,
             logs_area: None,
+            log_scroll_area: None,
             visible_log_start: 0,
             visible_log_count: 0,
             active_log_selection: None,
@@ -91,6 +93,10 @@ impl TuiState {
 
     pub(super) fn set_log_page_size(&mut self, page_size: usize) {
         self.log_page_size = page_size.max(1);
+    }
+
+    pub(super) fn set_log_scroll_area(&mut self, area: Rect) {
+        self.log_scroll_area = Some(area);
     }
 
     pub(super) fn set_visible_logs(
@@ -177,6 +183,12 @@ impl TuiState {
         self.log_horizontal_offset
     }
 
+    pub(super) fn is_log_scroll_hit(&self, column: u16, row: u16) -> bool {
+        self.log_scroll_area
+            .map(|area| rect_contains(area, column, row))
+            .unwrap_or(false)
+    }
+
     pub(super) fn begin_log_selection(&mut self, column: u16, row: u16) {
         self.active_log_selection = self
             .log_index_at(column, row)
@@ -220,19 +232,11 @@ impl TuiState {
 
     fn log_index_at(&self, column: u16, row: u16) -> Option<usize> {
         let area = self.logs_area?;
-        if area.width <= 2 || area.height <= 2 {
+        if area.width == 0 || area.height == 0 || !rect_contains(area, column, row) {
             return None;
         }
 
-        let inner_left = area.x.saturating_add(1);
-        let inner_top = area.y.saturating_add(1);
-        let inner_right = area.x.saturating_add(area.width.saturating_sub(1));
-        let inner_bottom = area.y.saturating_add(area.height.saturating_sub(1));
-        if column < inner_left || column >= inner_right || row < inner_top || row >= inner_bottom {
-            return None;
-        }
-
-        let relative_row = row.saturating_sub(inner_top) as usize;
+        let relative_row = row.saturating_sub(area.y) as usize;
         if relative_row >= self.visible_log_count {
             return None;
         }
@@ -242,7 +246,13 @@ impl TuiState {
 }
 
 fn log_view_width(area: Rect) -> usize {
-    area.width.saturating_sub(2) as usize
+    area.width as usize
+}
+
+fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
+    let right = area.x.saturating_add(area.width);
+    let bottom = area.y.saturating_add(area.height);
+    column >= area.x && column < right && row >= area.y && row < bottom
 }
 
 #[cfg(test)]
@@ -255,12 +265,34 @@ mod tests {
         state.set_visible_logs(Rect::new(0, 0, 20, 6), 0, 3, 40);
 
         state.scroll_logs_right(64);
-        assert_eq!(state.log_horizontal_offset_columns(), 22);
+        assert_eq!(state.log_horizontal_offset_columns(), 20);
 
         state.scroll_logs_left(5);
-        assert_eq!(state.log_horizontal_offset_columns(), 17);
+        assert_eq!(state.log_horizontal_offset_columns(), 15);
 
         state.scroll_logs_left(64);
         assert_eq!(state.log_horizontal_offset_columns(), 0);
+    }
+
+    #[test]
+    fn log_selection_uses_content_area_coordinates() {
+        let mut state = TuiState::default();
+        state.set_visible_logs(Rect::new(10, 20, 5, 3), 7, 3, 32);
+
+        state.begin_log_selection(10, 20);
+        state.extend_log_selection(14, 22);
+
+        assert_eq!(state.selected_log_range(), Some((7, 9)));
+    }
+
+    #[test]
+    fn log_scroll_hit_uses_scrollable_area() {
+        let mut state = TuiState::default();
+        state.set_log_scroll_area(Rect::new(4, 5, 6, 3));
+
+        assert!(state.is_log_scroll_hit(4, 5));
+        assert!(state.is_log_scroll_hit(9, 7));
+        assert!(!state.is_log_scroll_hit(10, 7));
+        assert!(!state.is_log_scroll_hit(9, 8));
     }
 }

@@ -21,7 +21,10 @@ use crate::transport::tui::state::TuiState;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState,
+};
 use ratatui::Frame;
 
 pub(super) fn render(
@@ -102,7 +105,7 @@ fn render_status_bar(frame: &mut Frame, area: Rect, snapshot: &ConsoleSnapshot) 
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::raw(
-            "  |  Up/Down select  Left/Right x-scroll  a approve  r reject  Wheel/PgUp/PgDn logs  Home/End head-tail  q shutdown",
+            "  |  Up/Down select  Left/Right/HWheel x-scroll  Wheel/PgUp/PgDn y-scroll  a approve  r reject  Home/End head-tail  q shutdown",
         ),
     ]);
     frame.render_widget(Paragraph::new(text).style(style), area);
@@ -169,17 +172,15 @@ fn render_logs(
     state: &mut TuiState,
     console: &OperatorConsole,
 ) {
-    let visible_height = area.height.saturating_sub(2) as usize;
-    state.set_log_page_size(visible_height.max(1));
-    let start = state.log_start(snapshot, visible_height.max(1));
-    let log_entries = console.read_logs(start, visible_height.max(1));
+    let log_content_area = block_inner(area);
+    state.set_log_scroll_area(log_content_area);
+    let visible_height = log_content_area.height.max(1) as usize;
+    state.set_log_page_size(visible_height);
+    let start = state.log_start(snapshot, visible_height);
+    let log_entries = console.read_logs(start, visible_height);
     let log_lines = visible_logs(&log_entries, state, start);
-    state.set_visible_logs(
-        area,
-        start,
-        log_entries.len(),
-        max_log_line_width(&log_entries),
-    );
+    let max_line_width = max_log_line_width(&log_entries);
+    state.set_visible_logs(log_content_area, start, log_entries.len(), max_line_width);
     let end = if log_entries.is_empty() {
         start
     } else {
@@ -204,10 +205,105 @@ fn render_logs(
             snapshot.log_file_path
         )
     };
-    let logs = Paragraph::new(log_lines)
-        .scroll((0, state.log_horizontal_offset()))
-        .block(Block::default().title(title).borders(Borders::ALL));
-    frame.render_widget(logs, area);
+
+    frame.render_widget(Block::default().title(title).borders(Borders::ALL), area);
+    frame.render_widget(
+        Paragraph::new(log_lines).scroll((0, state.log_horizontal_offset())),
+        log_content_area,
+    );
+    render_log_scrollbars(frame, snapshot, state, area, max_line_width);
+}
+
+fn render_log_scrollbars(
+    frame: &mut Frame,
+    snapshot: &ConsoleSnapshot,
+    state: &TuiState,
+    area: Rect,
+    max_line_width: usize,
+) {
+    let content_area = block_inner(area);
+    let viewport_height = content_area.height.max(1) as usize;
+    let viewport_width = content_area.width.max(1) as usize;
+
+    if snapshot.total_log_count > viewport_height {
+        let content_height = snapshot.total_log_count.max(viewport_height).max(1);
+        let mut vertical_state = ScrollbarState::default()
+            .content_length(content_height)
+            .viewport_content_length(viewport_height)
+            .position(state.log_start(snapshot, viewport_height));
+        if let Some(vertical_area) = vertical_scrollbar_area(area) {
+            frame.render_stateful_widget(
+                subtle_vertical_scrollbar(),
+                vertical_area,
+                &mut vertical_state,
+            );
+        }
+    }
+
+    if max_line_width > viewport_width {
+        let content_width = max_line_width.max(viewport_width).max(1);
+        let mut horizontal_state = ScrollbarState::default()
+            .content_length(content_width)
+            .viewport_content_length(viewport_width)
+            .position(state.log_horizontal_offset_columns());
+        if let Some(horizontal_area) = horizontal_scrollbar_area(area) {
+            frame.render_stateful_widget(
+                subtle_horizontal_scrollbar(),
+                horizontal_area,
+                &mut horizontal_state,
+            );
+        }
+    }
+}
+
+fn subtle_vertical_scrollbar<'a>() -> Scrollbar<'a> {
+    Scrollbar::default()
+        .orientation(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .track_symbol(None)
+        .thumb_symbol("│")
+        .thumb_style(subtle_scrollbar_style())
+}
+
+fn subtle_horizontal_scrollbar<'a>() -> Scrollbar<'a> {
+    Scrollbar::default()
+        .orientation(ScrollbarOrientation::HorizontalBottom)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .track_symbol(None)
+        .thumb_symbol("─")
+        .thumb_style(subtle_scrollbar_style())
+}
+
+fn subtle_scrollbar_style() -> Style {
+    Style::default().fg(Color::Gray)
+}
+
+fn block_inner(area: Rect) -> Rect {
+    Block::default().borders(Borders::ALL).inner(area)
+}
+
+fn vertical_scrollbar_area(area: Rect) -> Option<Rect> {
+    (area.height > 2 && area.width > 0).then(|| {
+        Rect::new(
+            area.x + area.width.saturating_sub(1),
+            area.y.saturating_add(1),
+            1,
+            area.height.saturating_sub(2),
+        )
+    })
+}
+
+fn horizontal_scrollbar_area(area: Rect) -> Option<Rect> {
+    (area.width > 2 && area.height > 0).then(|| {
+        Rect::new(
+            area.x.saturating_add(1),
+            area.y + area.height.saturating_sub(1),
+            area.width.saturating_sub(2),
+            1,
+        )
+    })
 }
 
 fn max_log_line_width(entries: &[ConsoleLogEntry]) -> usize {
@@ -301,6 +397,18 @@ mod tests {
         assert_eq!(
             log_line_text(&error_entry),
             "2026-03-09T16:16:21.751592Z ERROR Execution failed"
+        );
+    }
+
+    #[test]
+    fn border_scrollbars_use_existing_frame_edges() {
+        let area = Rect::new(2, 3, 18, 7);
+
+        assert_eq!(block_inner(area), Rect::new(3, 4, 16, 5));
+        assert_eq!(vertical_scrollbar_area(area), Some(Rect::new(19, 4, 1, 5)));
+        assert_eq!(
+            horizontal_scrollbar_area(area),
+            Some(Rect::new(3, 9, 16, 1))
         );
     }
 }

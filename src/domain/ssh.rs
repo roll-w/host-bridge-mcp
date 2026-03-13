@@ -640,6 +640,12 @@ async fn connect_to_agent() -> Result<DynamicAgentClient, russh::keys::Error> {
 
 fn map_client_handler_error(host: String, port: u16, error: ClientHandlerError) -> SshError {
     match error {
+        ClientHandlerError::Russh(russh::Error::WrongServerSig) => SshError::Connect(
+            host,
+            port,
+            "server host key signature verification failed before known_hosts validation"
+                .to_string(),
+        ),
         ClientHandlerError::Russh(error) => SshError::Connect(host, port, error.to_string()),
         ClientHandlerError::KnownHostsLoad(path, reason) => SshError::KnownHostsLoad(path, reason),
         ClientHandlerError::HostVerification(host, port, path) => {
@@ -715,6 +721,13 @@ fn resolve_auth_file(reference: &str) -> Result<String, SshError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SAMPLE_SERVER_PUBLIC_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti user@example.com";
+
+    fn sample_server_public_key() -> PublicKey {
+        PublicKey::from_openssh(SAMPLE_SERVER_PUBLIC_KEY)
+            .expect("sample server public key should parse")
+    }
 
     #[test]
     fn resolve_auth_env_reads_reference() {
@@ -833,5 +846,68 @@ mod tests {
 
         assert!(ssh_rsa_index < rsa_sha512_index);
         assert!(ssh_rsa_index < rsa_sha256_index);
+    }
+
+    #[tokio::test]
+    async fn check_server_key_accepts_any_key_when_known_hosts_is_unset() {
+        let mut handler = SshClientHandler {
+            host: "server.example.com".to_string(),
+            port: 22,
+            known_hosts_file: None,
+        };
+
+        let accepted = <SshClientHandler as client::Handler>::check_server_key(
+            &mut handler,
+            &sample_server_public_key(),
+        )
+        .await
+        .expect("missing known_hosts_file should skip verification");
+
+        assert!(accepted);
+    }
+
+    #[tokio::test]
+    async fn check_server_key_uses_configured_known_hosts_path() {
+        let missing_path = std::env::temp_dir().join(format!(
+            "host-bridge-mcp-missing-known-hosts-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let missing_path = missing_path.to_string_lossy().to_string();
+        let mut handler = SshClientHandler {
+            host: "server.example.com".to_string(),
+            port: 22,
+            known_hosts_file: Some(missing_path.clone()),
+        };
+
+        let error = <SshClientHandler as client::Handler>::check_server_key(
+            &mut handler,
+            &sample_server_public_key(),
+        )
+        .await
+        .expect_err("configured known_hosts_file should be consulted");
+
+        match error {
+            ClientHandlerError::KnownHostsLoad(path, _)
+            | ClientHandlerError::HostVerification(_, _, path) => {
+                assert_eq!(path, missing_path)
+            }
+            other => panic!("expected known_hosts verification error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wrong_server_signature_error_explains_known_hosts_is_not_involved() {
+        let error = map_client_handler_error(
+            "server.example.com".to_string(),
+            22,
+            ClientHandlerError::Russh(russh::Error::WrongServerSig),
+        );
+
+        match error {
+            SshError::Connect(_, _, message) => {
+                assert!(message.contains("before known_hosts validation"));
+            }
+            other => panic!("expected connect error, got {other:?}"),
+        }
     }
 }

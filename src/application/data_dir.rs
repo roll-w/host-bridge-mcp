@@ -235,7 +235,7 @@ mod tests {
             &[blocked_path.clone(), valid_base.clone()],
             EXECUTIONS_DIR_NAME,
         )
-            .expect("fallback candidate should succeed");
+        .expect("fallback candidate should succeed");
 
         assert_eq!(resolved, valid_base.join(EXECUTIONS_DIR_NAME));
 

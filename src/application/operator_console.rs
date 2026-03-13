@@ -336,7 +336,7 @@ mod tests {
                 file_path: Some(log_path.display().to_string()),
                 persist_file: false,
             })
-                .expect("console should initialize");
+            .expect("console should initialize");
             console.push_log(ConsoleLogLevel::Info, "line-1");
             assert!(log_path.exists());
         }
@@ -357,7 +357,7 @@ mod tests {
                 file_path: Some(log_path.display().to_string()),
                 persist_file: true,
             })
-                .expect("console should initialize");
+            .expect("console should initialize");
 
             let initial_entries = console.read_logs(0, 1);
             assert_eq!(initial_entries.len(), 1);

@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-use super::{create_authenticated_session, SshError, SshSessionHandle};
+use super::{SshError, SshSessionHandle, create_authenticated_session};
 use crate::domain::execution_target::SshTarget;
 use russh::Disconnect;
 use std::collections::HashMap;
@@ -267,7 +267,7 @@ fn schedule_disconnect(handle: SshSessionHandle, description: &'static str) {
 
 fn spawn_background_task<F>(future: F) -> Option<JoinHandle<()>>
 where
-    F: Future<Output=()> + Send + 'static,
+    F: Future<Output = ()> + Send + 'static,
 {
     if let Ok(runtime_handle) = tokio::runtime::Handle::try_current() {
         return Some(runtime_handle.spawn(future));

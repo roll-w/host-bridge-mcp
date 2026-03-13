@@ -15,7 +15,7 @@
  */
 
 use crate::config::{PathMappingRule, Platform, TargetPlatform};
-use crate::domain::platform::runtime::{current_is_wsl, resolve_target_platform, RuntimePlatform};
+use crate::domain::platform::runtime::{RuntimePlatform, current_is_wsl, resolve_target_platform};
 
 #[derive(Debug, Clone)]
 pub struct PathMapper {

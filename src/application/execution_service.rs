@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-use crate::application::command_parser::{parse_command_line, CommandParseError};
+use crate::application::command_parser::{CommandParseError, parse_command_line};
 use crate::application::data_dir::execution_output_path;
 use crate::config::AppConfig;
 use crate::domain::execution_target::{
@@ -33,7 +33,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio::time::Duration;
 use uuid::Uuid;
 

@@ -18,10 +18,10 @@ use crate::application::execution_service::{ExecuteCommandInput, ExecutionEvent,
 use crate::application::operator_console::ConsoleApprovalError;
 use crate::transport::mcp_streamable_http::output::OutputRenderOptions;
 use crate::transport::mcp_streamable_http::{ExecuteCommandToolArgs, HostBridgeMcpServer};
+use rmcp::ErrorData as McpError;
 use rmcp::model::{CallToolResult, LoggingLevel, LoggingMessageNotificationParam};
 use rmcp::service::{RequestContext, RoleServer};
-use rmcp::ErrorData as McpError;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub(super) async fn execute_command_tool(
     server: &HostBridgeMcpServer,
@@ -51,7 +51,7 @@ pub(super) async fn execute_command_tool(
                 "preview": request,
             }),
         )
-            .await;
+        .await;
 
         let approved = match server
             .operator_console
@@ -79,7 +79,7 @@ pub(super) async fn execute_command_tool(
                 "approved": approved,
             }),
         )
-            .await;
+        .await;
 
         if !approved {
             return Ok(structured_error("command confirmation was rejected"));
@@ -116,7 +116,7 @@ pub(super) async fn execute_command_tool(
                             "message": message,
                         }),
                     )
-                        .await;
+                    .await;
 
                     if matches!(
                         final_state,
@@ -134,7 +134,7 @@ pub(super) async fn execute_command_tool(
                             "text": text,
                         }),
                     )
-                        .await;
+                    .await;
                 }
                 ExecutionEvent::Exit {
                     code,
@@ -154,7 +154,7 @@ pub(super) async fn execute_command_tool(
                             "timedOut": timed_out,
                         }),
                     )
-                        .await;
+                    .await;
                 }
                 ExecutionEvent::Error { message } => {
                     let _ = notify_mcp_log(
@@ -165,7 +165,7 @@ pub(super) async fn execute_command_tool(
                             "message": message,
                         }),
                     )
-                        .await;
+                    .await;
                 }
             },
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
@@ -177,7 +177,7 @@ pub(super) async fn execute_command_tool(
                         "skipped": skipped,
                     }),
                 )
-                    .await;
+                .await;
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                 break;

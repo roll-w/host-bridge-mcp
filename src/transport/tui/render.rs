@@ -18,11 +18,11 @@ use crate::application::operator_console::{
     ConsoleLogEntry, ConsoleLogLevel, ConsoleSnapshot, OperatorConsole, PendingApprovalView,
 };
 use crate::transport::tui::state::TuiState;
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
-use ratatui::Frame;
 
 pub(super) fn render(
     frame: &mut Frame,

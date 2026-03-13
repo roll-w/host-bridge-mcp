@@ -17,16 +17,16 @@
 use crate::application::execution_service::{ExecutionError, ExecutionEvent};
 use crate::transport::mcp_streamable_http::HttpState;
 use axum::extract::{Path, State};
-use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
-use axum::{http::StatusCode, Json};
-use serde_json::{json, Value};
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::{Json, http::StatusCode};
+use serde_json::{Value, json};
 use std::convert::Infallible;
 use std::time::Duration;
-use tokio_stream::once;
-use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
-use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+use tokio_stream::once;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use uuid::Uuid;
 
 pub(super) async fn health() -> Json<Value> {
@@ -88,7 +88,7 @@ fn lagged_event(skipped: u64) -> Event {
             "type": "lagged",
             "skipped": skipped,
         })
-            .to_string(),
+        .to_string(),
     )
 }
 
@@ -107,6 +107,6 @@ fn serialize_event(event: &ExecutionEvent) -> String {
             "type": "error",
             "message": format!("failed to serialize event: {error}")
         })
-            .to_string()
+        .to_string()
     })
 }

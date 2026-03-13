@@ -30,7 +30,7 @@ pub struct CliError {
 
 pub fn parse_args<I>(args: I) -> Result<CliOptions, CliError>
 where
-    I: IntoIterator<Item=String>,
+    I: IntoIterator<Item = String>,
 {
     let mut iterator = args.into_iter();
     let program_name = iterator
@@ -110,7 +110,7 @@ mod tests {
             "--config".to_string(),
             "custom.yaml".to_string(),
         ])
-            .expect("should parse");
+        .expect("should parse");
 
         assert_eq!(
             outcome,

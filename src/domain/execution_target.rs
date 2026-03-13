@@ -16,7 +16,7 @@
 
 use crate::config::{ExecutionConfig, ExecutionServerConfig, SshAuthConfig, SshAuthType};
 use crate::domain::path_mapping::PathMapper;
-use crate::domain::platform::runtime::{resolve_target_platform, RuntimePlatform};
+use crate::domain::platform::runtime::{RuntimePlatform, resolve_target_platform};
 use std::collections::HashMap;
 use std::time::Duration;
 

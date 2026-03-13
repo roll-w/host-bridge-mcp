@@ -25,9 +25,9 @@ use self::tooling::execute_command_tool;
 use crate::application::execution_service::ExecutionService;
 use crate::application::operator_console::OperatorConsole;
 use crate::config::AccessConfig;
+use axum::Router;
 use axum::middleware;
 use axum::routing::get;
-use axum::Router;
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{
     CallToolResult, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
@@ -35,9 +35,9 @@ use rmcp::model::{
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::{
-    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
-use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
+use rmcp::{ErrorData as McpError, ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
@@ -169,7 +169,7 @@ fn server_implementation() -> Implementation {
 #[cfg(test)]
 mod tests {
     use super::HostBridgeMcpServer;
-    use super::{server_implementation, ExecuteCommandToolArgs};
+    use super::{ExecuteCommandToolArgs, server_implementation};
     use crate::application::execution_service::ExecutionService;
     use crate::application::operator_console::OperatorConsole;
     use crate::config::{
@@ -195,7 +195,7 @@ mod tests {
                 "RUST_LOG": "debug"
             }
         }))
-            .expect("arguments should deserialize");
+        .expect("arguments should deserialize");
 
         assert_eq!(args.command, "cargo test");
         assert_eq!(args.server.as_deref(), Some("prod"));
@@ -281,9 +281,9 @@ mod tests {
         assert!(environments.iter().any(|environment| {
             environment.get("name") == Some(&json!("host"))
                 && environment
-                .get("platform")
-                .and_then(serde_json::Value::as_str)
-                .is_some()
+                    .get("platform")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some()
         }));
     }
 }

@@ -22,7 +22,7 @@ mod terminal;
 use self::input::handle_input;
 use self::render::render;
 use self::state::TuiState;
-use self::terminal::{setup_terminal, TerminalGuard};
+use self::terminal::{TerminalGuard, setup_terminal};
 use crate::application::operator_console::OperatorConsole;
 use crate::application::shutdown_controller::ShutdownController;
 use crossterm::event;

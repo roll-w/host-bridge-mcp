@@ -195,7 +195,7 @@ fn reject_ssh_server_with_auto_target_platform() {
     assert!(
         error
             .to_string()
-            .contains("target-platform must be explicit for ssh servers")
+            .contains("target-platform must be explicit for SSH servers")
     );
 }
 

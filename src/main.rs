@@ -33,7 +33,7 @@ use std::sync::Arc;
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::field::Visit;
 use tracing_subscriber::layer::{Context, SubscriberExt};
-use tracing_subscriber::{fmt as tracing_fmt, util::SubscriberInitExt, EnvFilter, Layer};
+use tracing_subscriber::{EnvFilter, Layer, fmt as tracing_fmt, util::SubscriberInitExt};
 use transport::mcp_streamable_http::router;
 use transport::tui;
 

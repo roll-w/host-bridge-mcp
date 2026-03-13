@@ -18,7 +18,7 @@ use super::{
     ExecutionEvent, ExecutionRecord, ExecutionState, HostRunExecution, RunExecution,
     RunExecutionBackend, SshRunExecution, TERMINATION_GRACE_PERIOD,
 };
-use crate::domain::platform::spawn::{apply_spawn_plan, SpawnPlanner};
+use crate::domain::platform::spawn::{SpawnPlanner, apply_spawn_plan};
 use crate::domain::ssh::SshClient;
 use std::io as std_io;
 use std::process::Stdio;
@@ -26,7 +26,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::task::JoinHandle;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
 pub(super) async fn run_execution(

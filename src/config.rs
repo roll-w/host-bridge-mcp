@@ -433,7 +433,7 @@ impl AppConfig {
                     }
                     if *target_platform == TargetPlatform::Auto {
                         return Err(ConfigError::Validation(format!(
-                            "execution.servers[{index}].target-platform must be explicit for ssh servers"
+                            "execution.servers[{index}].target-platform must be explicit for SSH servers"
                         )));
                     }
                     validate_non_empty(user, &format!("execution.servers[{index}].user"))?;

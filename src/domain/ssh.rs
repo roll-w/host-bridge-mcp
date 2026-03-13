@@ -19,11 +19,10 @@ use crate::domain::platform::runtime::RuntimePlatform;
 use russh::ChannelMsg;
 use russh::client;
 use russh::keys::{
-    Algorithm, EcdsaCurve, HashAlg, PrivateKeyWithHashAlg, PublicKey,
+    Algorithm, HashAlg, PrivateKeyWithHashAlg, PublicKey,
     agent::client::{AgentClient, AgentStream},
     check_known_hosts_path, load_secret_key,
 };
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
@@ -402,22 +401,15 @@ pub(super) async fn create_authenticated_session(
 async fn connect_session(target: SshTarget) -> Result<SshSessionHandle, SshError> {
     let host = target.host.clone();
     let port = target.port;
-    match connect_session_with_config(target.clone(), false).await {
-        Ok(session) => Ok(session),
-        Err(error) if should_retry_with_legacy_rsa_host_key(&error) => {
-            connect_session_with_config(target, true)
-                .await
-                .map_err(|retry_error| map_session_connect_error(host, port, retry_error))
-        }
-        Err(error) => Err(map_session_connect_error(host, port, error)),
-    }
+    connect_session_with_config(target)
+        .await
+        .map_err(|error| map_session_connect_error(host, port, error))
 }
 
 async fn connect_session_with_config(
     target: SshTarget,
-    prefer_legacy_rsa_host_key: bool,
 ) -> Result<SshSessionHandle, SessionConnectError> {
-    let config = Arc::new(build_client_config(&target, prefer_legacy_rsa_host_key));
+    let config = Arc::new(build_client_config(&target));
     let handler = SshClientHandler::new(target.clone());
     let address = format!("{}:{}", target.host, target.port);
     let socket = tokio::net::TcpStream::connect(address)
@@ -433,7 +425,7 @@ async fn connect_session_with_config(
         .map_err(SessionConnectError::Handler)
 }
 
-fn build_client_config(target: &SshTarget, prefer_legacy_rsa_host_key: bool) -> client::Config {
+fn build_client_config(target: &SshTarget) -> client::Config {
     let mut config = client::Config::default();
     config.nodelay = true;
     config.inactivity_timeout = Some(target.connection_idle_timeout);
@@ -441,39 +433,7 @@ fn build_client_config(target: &SshTarget, prefer_legacy_rsa_host_key: bool) -> 
     if let Some(interval) = keepalive_interval_for(target.connection_idle_timeout) {
         config.keepalive_interval = Some(interval);
     }
-    if prefer_legacy_rsa_host_key {
-        config.preferred.key = Cow::Owned(legacy_rsa_host_key_preference());
-    }
     config
-}
-
-fn legacy_rsa_host_key_preference() -> Vec<Algorithm> {
-    vec![
-        Algorithm::Ed25519,
-        Algorithm::Ecdsa {
-            curve: EcdsaCurve::NistP256,
-        },
-        Algorithm::Ecdsa {
-            curve: EcdsaCurve::NistP384,
-        },
-        Algorithm::Ecdsa {
-            curve: EcdsaCurve::NistP521,
-        },
-        Algorithm::Rsa { hash: None },
-        Algorithm::Rsa {
-            hash: Some(HashAlg::Sha512),
-        },
-        Algorithm::Rsa {
-            hash: Some(HashAlg::Sha256),
-        },
-    ]
-}
-
-fn should_retry_with_legacy_rsa_host_key(error: &SessionConnectError) -> bool {
-    matches!(
-        error,
-        SessionConnectError::Handler(ClientHandlerError::Russh(russh::Error::WrongServerSig))
-    )
 }
 
 fn map_session_connect_error(host: String, port: u16, error: SessionConnectError) -> SshError {
@@ -791,61 +751,6 @@ mod tests {
             true,
             CommandAttemptStage::Runtime
         ));
-    }
-
-    #[test]
-    fn retry_legacy_rsa_host_key_only_for_wrong_server_signature() {
-        assert!(should_retry_with_legacy_rsa_host_key(
-            &SessionConnectError::Handler(ClientHandlerError::Russh(russh::Error::WrongServerSig))
-        ));
-        assert!(!should_retry_with_legacy_rsa_host_key(
-            &SessionConnectError::Handler(ClientHandlerError::Russh(
-                russh::Error::ConnectionTimeout
-            ))
-        ));
-        assert!(!should_retry_with_legacy_rsa_host_key(
-            &SessionConnectError::Handler(ClientHandlerError::KnownHostsLoad(
-                "/home/dev/.ssh/known_hosts".to_string(),
-                "invalid format".to_string()
-            ))
-        ));
-        assert!(!should_retry_with_legacy_rsa_host_key(
-            &SessionConnectError::Socket(std::io::Error::other("connection refused"))
-        ));
-    }
-
-    #[test]
-    fn legacy_rsa_host_key_preference_prioritizes_ssh_rsa_before_rsa_sha2() {
-        let algorithms = legacy_rsa_host_key_preference();
-        let ssh_rsa_index = algorithms
-            .iter()
-            .position(|algorithm| matches!(algorithm, Algorithm::Rsa { hash: None }))
-            .expect("ssh-rsa should be present");
-        let rsa_sha512_index = algorithms
-            .iter()
-            .position(|algorithm| {
-                matches!(
-                    algorithm,
-                    Algorithm::Rsa {
-                        hash: Some(HashAlg::Sha512)
-                    }
-                )
-            })
-            .expect("rsa-sha2-512 should be present");
-        let rsa_sha256_index = algorithms
-            .iter()
-            .position(|algorithm| {
-                matches!(
-                    algorithm,
-                    Algorithm::Rsa {
-                        hash: Some(HashAlg::Sha256)
-                    }
-                )
-            })
-            .expect("rsa-sha2-256 should be present");
-
-        assert!(ssh_rsa_index < rsa_sha512_index);
-        assert!(ssh_rsa_index < rsa_sha256_index);
     }
 
     #[tokio::test]

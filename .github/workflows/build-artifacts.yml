@@ -109,7 +109,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Read version and commit
         id: meta
@@ -142,8 +142,12 @@ jobs:
           toolchain: stable
           target: ${{ matrix.target }}
           rustflags: ""
-          cache: true
-          cache-key: build-artifacts-${{ matrix.target }}
+          cache: false
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2.9.1
+        with:
+          key: build-artifacts-${{ matrix.target }}
 
       - name: Install Rust LLVM tools
         if: matrix.build_tool == 'xwin'
@@ -153,7 +157,7 @@ jobs:
           rustup component add llvm-tools || rustup component add llvm-tools-preview
 
       - name: Cache cross-compilation tool data
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cache/cargo-xwin
@@ -228,7 +232,7 @@ jobs:
 
       - name: Upload artifact
         if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.ARTIFACT_NAME }}
           path: ${{ steps.package.outputs.artifact_path }}

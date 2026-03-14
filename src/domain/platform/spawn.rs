@@ -28,6 +28,12 @@ pub struct SpawnPlan {
     pub windows_raw_tail: Option<OsString>,
 }
 
+impl SpawnPlan {
+    fn windows_raw_tail(&self) -> Option<&OsString> {
+        self.windows_raw_tail.as_ref()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeEnvironment {
     platform: RuntimePlatform,
@@ -104,10 +110,15 @@ impl SpawnPlanner {
 }
 
 pub fn apply_spawn_plan(_command: &mut Command, _spawn_plan: &SpawnPlan) {
-    #[cfg(windows)]
-    {
-        if let Some(raw_tail) = &_spawn_plan.windows_raw_tail {
+    if let Some(raw_tail) = _spawn_plan.windows_raw_tail() {
+        #[cfg(windows)]
+        {
             _command.raw_arg(raw_tail);
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = raw_tail;
         }
     }
 }

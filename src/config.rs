@@ -15,10 +15,14 @@
  */
 
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::path::Path;
 
 const CONFIG_ENV_KEY: &str = "HOST_BRIDGE_CONFIG";
 const DEFAULT_CONFIG_FILE: &str = "host-bridge.yaml";
+const DEFAULT_EXECUTION_SERVER: &str = "host";
+const DEFAULT_SSH_PORT: u16 = 22;
+const DEFAULT_SSH_CONNECTION_IDLE_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
@@ -57,11 +61,76 @@ pub struct ExecutionConfig {
     #[serde(default)]
     pub commands: Vec<CommandPolicyConfig>,
     pub default_working_directory: Option<String>,
+    pub default_server: String,
+    #[serde(default)]
+    pub servers: Vec<ExecutionServerConfig>,
     pub path_mappings: Vec<PathMappingRule>,
     pub target_platform: TargetPlatform,
-    pub enable_builtin_wsl_mapping: bool,
     pub default_timeout_ms: u64,
     pub max_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(
+    tag = "transport",
+    rename_all_fields = "kebab-case",
+    deny_unknown_fields
+)]
+pub enum ExecutionServerConfig {
+    #[serde(rename = "host")]
+    Host {
+        name: String,
+        #[serde(default)]
+        target_platform: TargetPlatform,
+        #[serde(default)]
+        path_mappings: Vec<PathMappingRule>,
+    },
+    #[serde(rename = "ssh")]
+    Ssh {
+        name: String,
+        host: String,
+        #[serde(default = "default_ssh_port")]
+        port: u16,
+        user: String,
+        target_platform: TargetPlatform,
+        #[serde(default)]
+        path_mappings: Vec<PathMappingRule>,
+        #[serde(default)]
+        auth: SshAuthConfig,
+        #[serde(default)]
+        known_hosts_file: Option<String>,
+        #[serde(default = "default_ssh_connection_idle_timeout_ms")]
+        connection_idle_timeout_ms: u64,
+    },
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct SshAuthConfig {
+    #[serde(rename = "type")]
+    pub kind: SshAuthType,
+    pub r#ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SshAuthType {
+    #[default]
+    Agent,
+    IdentityFile,
+    PasswordEnv,
+    PasswordFile,
+}
+
+impl SshAuthType {
+    fn as_config_value(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::IdentityFile => "identity-file",
+            Self::PasswordEnv => "password-env",
+            Self::PasswordFile => "password-file",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -131,7 +200,7 @@ pub enum ConfigError {
     Parse {
         path: String,
         #[source]
-        source: serde_yaml::Error,
+        source: serde_saphyr::Error,
     },
     #[error("invalid config: {0}")]
     Validation(String),
@@ -178,9 +247,10 @@ impl Default for ExecutionConfig {
             default_action: PolicyAction::Confirm,
             commands: Vec::new(),
             default_working_directory: None,
+            default_server: DEFAULT_EXECUTION_SERVER.to_string(),
+            servers: Vec::new(),
             path_mappings: Vec::new(),
             target_platform: TargetPlatform::Auto,
-            enable_builtin_wsl_mapping: true,
             default_timeout_ms: 30 * 60 * 1000,
             max_timeout_ms: 2 * 60 * 60 * 1000,
         }
@@ -195,6 +265,22 @@ impl Default for PathMappingRule {
             platforms: Vec::new(),
         }
     }
+}
+
+impl ExecutionServerConfig {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Host { name, .. } | Self::Ssh { name, .. } => name,
+        }
+    }
+}
+
+fn default_ssh_port() -> u16 {
+    DEFAULT_SSH_PORT
+}
+
+fn default_ssh_connection_idle_timeout_ms() -> u64 {
+    DEFAULT_SSH_CONNECTION_IDLE_TIMEOUT_MS
 }
 
 impl AppConfig {
@@ -227,14 +313,7 @@ impl AppConfig {
             path: path.clone(),
             source,
         })?;
-        let value = serde_yaml::from_str::<serde_yaml::Value>(&raw).map_err(|source| {
-            ConfigError::Parse {
-                path: path.clone(),
-                source,
-            }
-        })?;
-        reject_legacy_execution_keys(&value)?;
-        let config = serde_yaml::from_str::<Self>(&raw)
+        let config = serde_saphyr::from_str::<Self>(&raw)
             .map_err(|source| ConfigError::Parse { path, source })?;
         config.validate()?;
         Ok(config)
@@ -248,6 +327,8 @@ impl AppConfig {
         }
 
         validate_server_access(&self.server.access, "server.access")?;
+
+        validate_server_name(&self.execution.default_server, "execution.default-server")?;
 
         if self.execution.default_timeout_ms == 0 {
             return Err(ConfigError::Validation(
@@ -298,12 +379,84 @@ impl AppConfig {
             }
         }
 
-        for rule in &self.execution.path_mappings {
-            if rule.from.trim().is_empty() || rule.to.trim().is_empty() {
-                return Err(ConfigError::Validation(
-                    "execution.path-mappings entries require non-empty from/to".to_string(),
-                ));
+        validate_path_mappings(&self.execution.path_mappings, "execution.path-mappings")?;
+
+        let mut server_names = HashSet::new();
+        for (index, server) in self.execution.servers.iter().enumerate() {
+            let name = server.name();
+            validate_server_name(name, &format!("execution.servers[{index}].name"))?;
+            if !server_names.insert(name.to_string()) {
+                return Err(ConfigError::Validation(format!(
+                    "execution.servers[{index}].name duplicates server '{name}'"
+                )));
             }
+
+            match server {
+                ExecutionServerConfig::Host { path_mappings, .. } => {
+                    validate_path_mappings(
+                        path_mappings,
+                        &format!("execution.servers[{index}].path-mappings"),
+                    )?;
+                }
+                ExecutionServerConfig::Ssh {
+                    name,
+                    host,
+                    port,
+                    user,
+                    target_platform,
+                    path_mappings,
+                    auth,
+                    known_hosts_file,
+                    connection_idle_timeout_ms,
+                    ..
+                } => {
+                    if name == DEFAULT_EXECUTION_SERVER {
+                        return Err(ConfigError::Validation(
+                            "execution.servers[*].name 'host' is reserved for the local host transport"
+                                .to_string(),
+                        ));
+                    }
+                    if host.trim().is_empty() {
+                        return Err(ConfigError::Validation(format!(
+                            "execution.servers[{index}].host cannot be empty"
+                        )));
+                    }
+                    if *port == 0 {
+                        return Err(ConfigError::Validation(format!(
+                            "execution.servers[{index}].port must be greater than zero"
+                        )));
+                    }
+                    if *connection_idle_timeout_ms == 0 {
+                        return Err(ConfigError::Validation(format!(
+                            "execution.servers[{index}].connection-idle-timeout-ms must be greater than zero"
+                        )));
+                    }
+                    if *target_platform == TargetPlatform::Auto {
+                        return Err(ConfigError::Validation(format!(
+                            "execution.servers[{index}].target-platform must be explicit for ssh servers"
+                        )));
+                    }
+                    validate_non_empty(user, &format!("execution.servers[{index}].user"))?;
+                    validate_ssh_auth(auth, &format!("execution.servers[{index}].auth"))?;
+                    validate_optional_non_empty(
+                        known_hosts_file.as_deref(),
+                        &format!("execution.servers[{index}].known-hosts-file"),
+                    )?;
+                    validate_path_mappings(
+                        path_mappings,
+                        &format!("execution.servers[{index}].path-mappings"),
+                    )?;
+                }
+            }
+        }
+
+        if self.execution.default_server != DEFAULT_EXECUTION_SERVER
+            && !server_names.contains(&self.execution.default_server)
+        {
+            return Err(ConfigError::Validation(format!(
+                "execution.default-server '{}' must reference a configured server",
+                self.execution.default_server
+            )));
         }
 
         if self.logging.memory_buffer_lines == 0 {
@@ -328,26 +481,15 @@ fn validate_command_name(command: &str, location: &str) -> Result<(), ConfigErro
     Ok(())
 }
 
-fn reject_legacy_execution_keys(value: &serde_yaml::Value) -> Result<(), ConfigError> {
-    let Some(execution) = value
-        .as_mapping()
-        .and_then(|root| root.get(serde_yaml::Value::String("execution".to_string())))
-        .and_then(serde_yaml::Value::as_mapping)
-    else {
-        return Ok(());
-    };
+fn validate_server_name(name: &str, location: &str) -> Result<(), ConfigError> {
+    validate_non_empty(name, location)
+}
 
-    if execution.contains_key(&serde_yaml::Value::String("default_policy".to_string())) {
-        return Err(ConfigError::Validation(
-            "execution.default-policy is no longer supported; use execution.default-action"
-                .to_string(),
-        ));
-    }
-
-    if execution.contains_key(&serde_yaml::Value::String("rules".to_string())) {
-        return Err(ConfigError::Validation(
-            "execution.rules is no longer supported; migrate to execution.commands".to_string(),
-        ));
+fn validate_non_empty(value: &str, location: &str) -> Result<(), ConfigError> {
+    if value.trim().is_empty() {
+        return Err(ConfigError::Validation(format!(
+            "{location} cannot be empty"
+        )));
     }
 
     Ok(())
@@ -389,189 +531,58 @@ fn validate_working_directory(path: Option<&str>, location: &str) -> Result<(), 
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[test]
-    fn default_config_is_valid() {
-        assert!(AppConfig::default().validate().is_ok());
+fn validate_optional_non_empty(value: Option<&str>, location: &str) -> Result<(), ConfigError> {
+    if let Some(value) = value {
+        if value.trim().is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "{location} cannot be empty when provided"
+            )));
+        }
     }
 
-    #[test]
-    fn reject_command_policy_with_empty_command() {
-        let config = AppConfig {
-            execution: ExecutionConfig {
-                commands: vec![CommandPolicyConfig {
-                    command: "   ".to_string(),
-                    action: PolicyAction::Allow,
-                    default_working_directory: None,
-                    rules: Vec::new(),
-                }],
-                ..ExecutionConfig::default()
-            },
-            ..AppConfig::default()
-        };
+    Ok(())
+}
 
-        let error = config.validate().expect_err("config should be invalid");
-        assert!(error.to_string().contains("execution.commands[0].command"));
-    }
+fn validate_ssh_auth(auth: &SshAuthConfig, location: &str) -> Result<(), ConfigError> {
+    validate_optional_non_empty(auth.r#ref.as_deref(), &format!("{location}.ref"))?;
 
-    #[test]
-    fn reject_nested_command_rule_without_args_prefix() {
-        let config = AppConfig {
-            execution: ExecutionConfig {
-                commands: vec![CommandPolicyConfig {
-                    command: "cargo".to_string(),
-                    action: PolicyAction::Allow,
-                    default_working_directory: None,
-                    rules: vec![CommandRuleConfig {
-                        args_prefix: Vec::new(),
-                        action: PolicyAction::Confirm,
-                        default_working_directory: None,
-                    }],
-                }],
-                ..ExecutionConfig::default()
-            },
-            ..AppConfig::default()
-        };
-
-        let error = config.validate().expect_err("config should be invalid");
-        assert!(error.to_string().contains(
-            "execution.commands[0].rules[0].args-prefix must contain at least one token"
-        ));
-    }
-
-    #[test]
-    fn reject_empty_nested_command_rule_token() {
-        let config = AppConfig {
-            execution: ExecutionConfig {
-                commands: vec![CommandPolicyConfig {
-                    command: "cargo".to_string(),
-                    action: PolicyAction::Allow,
-                    default_working_directory: None,
-                    rules: vec![CommandRuleConfig {
-                        args_prefix: vec!["build".to_string(), "   ".to_string()],
-                        action: PolicyAction::Confirm,
-                        default_working_directory: None,
-                    }],
-                }],
-                ..ExecutionConfig::default()
-            },
-            ..AppConfig::default()
-        };
-
-        let error = config.validate().expect_err("config should be invalid");
-        assert!(
-            error
-                .to_string()
-                .contains("execution.commands[0].rules[0].args-prefix[1]")
-        );
-    }
-
-    #[test]
-    fn reject_legacy_default_policy_key_when_loading() {
-        let path = write_temp_config(
-            r#"execution:
-  default_policy: allow
-"#,
-        );
-
-        let error = AppConfig::load_with_path(Some(path.to_str().expect("valid temp path")))
-            .expect_err("legacy default_policy should be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("execution.default-policy is no longer supported")
-        );
-
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn reject_legacy_rules_key_when_loading() {
-        let path = write_temp_config(
-            r#"execution:
-  default-action: confirm
-  rules:
-    - command: cargo
-      action: deny
-      args-prefix:
-        - publish
-"#,
-        );
-
-        let error = AppConfig::load_with_path(Some(path.to_str().expect("valid temp path")))
-            .expect_err("legacy execution.rules should be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("execution.rules is no longer supported")
-        );
-
-        let _ = fs::remove_file(path);
-    }
-
-    fn write_temp_config(contents: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be after unix epoch")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("host-bridge-config-{unique}.yaml"));
-        fs::write(&path, contents).expect("temp config should be written");
-        path
-    }
-
-    #[test]
-    fn default_config_uses_single_server() {
-        let config = AppConfig::default();
-
-        assert_eq!(config.server.bind_address, "127.0.0.1:8787");
-        assert_eq!(config.server.access, AccessConfig::default());
-    }
-
-    #[test]
-    fn explicit_missing_config_path_fails_to_load() {
-        let error = AppConfig::load_with_path(Some("definitely-missing-config.yaml"))
-            .expect_err("missing explicit config should fail");
-
-        assert!(matches!(error, ConfigError::Read { .. }));
-    }
-
-    #[test]
-    fn unknown_yaml_fields_are_rejected() {
-        let path = write_temp_config(
-            r#"server:
-  bind-process: 127.0.0.1:8787
-    unexpected: true
-"#,
-        );
-
-        let error = AppConfig::load_with_path(Some(path.to_str().expect("valid temp path")))
-            .expect_err("unknown fields should be rejected");
-
-        assert!(matches!(error, ConfigError::Parse { .. }));
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn legacy_access_header_fields_are_rejected() {
-        let path = write_temp_config(
-            r#"server:
-  bind-process: 127.0.0.1:8787
-  access:
-    api-key-env: HOST_BRIDGE_API_KEY
-    header-name: Authorization
-"#,
-        );
-
-        let error = AppConfig::load_with_path(Some(path.to_str().expect("valid temp path")))
-            .expect_err("legacy auth header config should be rejected");
-
-        assert!(matches!(error, ConfigError::Parse { .. }));
-        let _ = fs::remove_file(path);
+    match auth.kind {
+        SshAuthType::Agent => {
+            if auth.r#ref.is_some() {
+                Err(ConfigError::Validation(format!(
+                    "{location}.ref must be omitted when auth.type is agent"
+                )))
+            } else {
+                Ok(())
+            }
+        }
+        SshAuthType::IdentityFile | SshAuthType::PasswordEnv | SshAuthType::PasswordFile => {
+            if auth.r#ref.is_none() {
+                Err(ConfigError::Validation(format!(
+                    "{location}.ref is required when auth.type is {}",
+                    auth.kind.as_config_value()
+                )))
+            } else {
+                Ok(())
+            }
+        }
     }
 }
+
+fn validate_path_mappings(
+    path_mappings: &[PathMappingRule],
+    location: &str,
+) -> Result<(), ConfigError> {
+    for (index, rule) in path_mappings.iter().enumerate() {
+        if rule.from.trim().is_empty() || rule.to.trim().is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "{location}[{index}] entries require non-empty from/to"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;

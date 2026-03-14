@@ -61,6 +61,11 @@ struct ExecuteCommandToolArgs {
     command: String,
     #[serde(default)]
     #[schemars(
+        description = "Optional configured execution server name. Omit this field to use the default server, which is usually 'host'."
+    )]
+    server: Option<String>,
+    #[serde(default)]
+    #[schemars(
         description = "Optional working directory for the child process. If omitted, the server uses the current directory or a policy default after path mapping."
     )]
     working_directory: Option<String>,
@@ -109,7 +114,7 @@ impl HostBridgeMcpServer {
     }
 
     #[tool(
-        description = "Execute exactly one host command without shell chaining. If approval is required, the call stays pending until the TUI operator approves or rejects it."
+        description = "Execute exactly one command in the selected execution server without shell chaining. If approval is required, the call stays pending until the TUI operator approves or rejects it."
     )]
     async fn execute_command(
         &self,
@@ -120,11 +125,12 @@ impl HostBridgeMcpServer {
     }
 
     #[tool(
-        description = "Return the specific platform name where commands currently execute, so agents can choose the right command syntax and path format."
+        description = "Return the configured execution environments with their names and platform types, plus the default environment name."
     )]
     async fn get_execution_environment(&self) -> Result<CallToolResult, McpError> {
         Ok(CallToolResult::structured(json!({
-            "environment": self.execution_service.command_environment_name(),
+            "defaultEnvironment": self.execution_service.default_server_name(),
+            "environments": self.execution_service.available_environments(),
         })))
     }
 }
@@ -162,15 +168,24 @@ fn server_implementation() -> Implementation {
 
 #[cfg(test)]
 mod tests {
+    use super::HostBridgeMcpServer;
     use super::{server_implementation, ExecuteCommandToolArgs};
+    use crate::application::execution_service::ExecutionService;
+    use crate::application::operator_console::OperatorConsole;
+    use crate::config::{
+        AppConfig, ExecutionConfig, ExecutionServerConfig, SshAuthConfig, SshAuthType,
+        TargetPlatform,
+    };
     use rmcp::schemars;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     #[test]
     fn deserializes_output_limit_arguments() {
         let args: ExecuteCommandToolArgs = serde_json::from_value(json!({
             "command": "cargo test",
+            "server": "prod",
             "workingDirectory": "/workspace/project",
             "timeoutMs": 120000,
             "headLines": 12,
@@ -183,6 +198,7 @@ mod tests {
             .expect("arguments should deserialize");
 
         assert_eq!(args.command, "cargo test");
+        assert_eq!(args.server.as_deref(), Some("prod"));
         assert_eq!(
             args.working_directory.as_deref(),
             Some("/workspace/project")
@@ -215,6 +231,60 @@ mod tests {
 
         assert_eq!(implementation.name, env!("CARGO_PKG_NAME"));
         assert_eq!(implementation.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn get_execution_environment_reports_named_environments() {
+        let server = HostBridgeMcpServer::new(
+            ExecutionService::new(Arc::new(AppConfig {
+                execution: ExecutionConfig {
+                    default_server: "prod".to_string(),
+                    servers: vec![ExecutionServerConfig::Ssh {
+                        name: "prod".to_string(),
+                        host: "prod.example.com".to_string(),
+                        port: 22,
+                        user: "deploy".to_string(),
+                        target_platform: TargetPlatform::Linux,
+                        path_mappings: Vec::new(),
+                        auth: SshAuthConfig {
+                            kind: SshAuthType::Agent,
+                            r#ref: None,
+                        },
+                        known_hosts_file: None,
+                        connection_idle_timeout_ms: 30_000,
+                    }],
+                    ..ExecutionConfig::default()
+                },
+                ..AppConfig::default()
+            })),
+            OperatorConsole::default(),
+        );
+
+        let result = server
+            .get_execution_environment()
+            .await
+            .expect("environment query should succeed");
+        let payload = result
+            .structured_content
+            .expect("structured payload should exist");
+
+        assert_eq!(payload.get("defaultEnvironment"), Some(&json!("prod")));
+        let environments = payload
+            .get("environments")
+            .and_then(serde_json::Value::as_array)
+            .expect("environments should be an array");
+        assert_eq!(environments.len(), 2);
+        assert!(environments.iter().any(|environment| {
+            environment.get("name") == Some(&json!("prod"))
+                && environment.get("platform") == Some(&json!("linux"))
+        }));
+        assert!(environments.iter().any(|environment| {
+            environment.get("name") == Some(&json!("host"))
+                && environment
+                .get("platform")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+        }));
     }
 }
 

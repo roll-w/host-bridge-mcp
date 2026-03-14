@@ -134,11 +134,6 @@ fn resolve_windows_home_dir() -> Option<PathBuf> {
         })
 }
 
-#[cfg(not(windows))]
-fn resolve_windows_home_dir() -> Option<PathBuf> {
-    None
-}
-
 fn ensure_directory(path: &Path) -> io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {

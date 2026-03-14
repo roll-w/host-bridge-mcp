@@ -250,10 +250,12 @@ mod tests {
 
     fn sample_request() -> ConfirmationRequest {
         ConfirmationRequest {
+            server: "host".to_string(),
+            platform: "linux".to_string(),
             command_line: "cargo build".to_string(),
             executable: "cargo".to_string(),
             args: vec!["build".to_string()],
-            working_directory: "/workspace".to_string(),
+            working_directory: Some("/workspace".to_string()),
             timeout_ms: 1_000,
             env: HashMap::new(),
         }

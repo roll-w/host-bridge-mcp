@@ -31,6 +31,7 @@ pub(super) async fn execute_command_tool(
     let output_options = OutputRenderOptions::new(args.head_lines, args.tail_lines, args.max_chars);
     let input = ExecuteCommandInput {
         command: args.command,
+        server: args.server,
         working_directory: args.working_directory,
         env: args.env,
         timeout_ms: args.timeout_ms,

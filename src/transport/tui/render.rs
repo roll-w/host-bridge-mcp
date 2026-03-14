@@ -220,15 +220,19 @@ fn max_log_line_width(entries: &[ConsoleLogEntry]) -> usize {
 }
 
 fn approval_detail_lines(approval: &PendingApprovalView) -> Vec<Line<'static>> {
+    let working_directory = approval
+        .request
+        .working_directory
+        .as_deref()
+        .unwrap_or("<remote default>");
     let mut lines = vec![
         Line::from(format!("id         : {}", approval.id)),
+        Line::from(format!("server     : {}", approval.request.server)),
+        Line::from(format!("platform   : {}", approval.request.platform)),
         Line::from(format!("commandLine: {}", approval.request.command_line)),
         Line::from(format!("executable : {}", approval.request.executable)),
         Line::from(format!("args       : {:?}", approval.request.args)),
-        Line::from(format!(
-            "workdir    : {}",
-            approval.request.working_directory
-        )),
+        Line::from(format!("workdir    : {}", working_directory)),
         Line::from(format!("timeoutMs  : {}", approval.request.timeout_ms)),
         Line::from(format!("createdAt  : {:?}", approval.created_at)),
     ];

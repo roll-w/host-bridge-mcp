@@ -35,11 +35,37 @@ execution:
   # Hard cap for timeoutMs passed from tool calls.
   max-timeout-ms: 7200000
 
-  # Enable built-in /mnt/<drive>/... -> <DRIVE>:\... mapping for Windows targets.
-  enable-builtin-wsl-mapping: true
-
   # Optional global default working directory.
   # default-working-directory: /workspace
+
+  # Default execution environment.
+  default-server: host
+
+  # Additional execution environments.
+  # host: local execution inside the current machine.
+  # ssh: remote execution over SSH using the built-in SSH library backend.
+  servers:
+    - name: build-linux
+      transport: ssh
+      host: build-linux.internal
+      user: dev
+      port: 22
+      target-platform: linux
+      auth:
+        type: identity-file
+        ref: /home/dev/.ssh/id_ed25519
+      # auth:
+      #   type: password-env
+      #   ref: BUILD_LINUX_SSH_PASSWORD
+      # auth:
+      #   type: password-file
+      #   ref: /run/secrets/build-linux-password
+      connection-idle-timeout-ms: 300000
+      # Omit known-hosts-file to disable strict host verification.
+      known-hosts-file: /home/dev/.ssh/known_hosts
+      path-mappings:
+        - from: /workspace
+          to: /srv/workspace
 
   # Command execution strategy.
   # Group each command with its default action and optional subcommand overrides.
@@ -81,8 +107,7 @@ execution:
     - command: rustc
       action: allow
 
-  # Path mapping is platform-agnostic.
-  # You can map container paths, WSL paths, remote mount paths, or host paths.
+  # Path mappings for the implicit host environment.
   # Rules are prefix-based and are applied in order.
   path-mappings:
     - from: /workspace/mnt/d

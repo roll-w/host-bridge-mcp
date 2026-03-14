@@ -26,7 +26,7 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Read version
         id: meta
@@ -83,13 +83,23 @@ jobs:
 
           printf 'note_file=%s\n' "$note_file" >> "$GITHUB_OUTPUT"
 
-      - name: Create draft release
-        uses: softprops/action-gh-release@v2
-        with:
-          name: Host Bridge MCP ${{ github.ref_name }}
-          tag_name: ${{ github.ref_name }}
-          body_path: ${{ steps.notes.outputs.note_file }}
-          draft: true
+      - name: Create or update draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release edit "${GITHUB_REF_NAME}" \
+              --draft \
+              --title "Host Bridge MCP ${GITHUB_REF_NAME}" \
+              --notes-file "${{ steps.notes.outputs.note_file }}"
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --draft \
+              --title "Host Bridge MCP ${GITHUB_REF_NAME}" \
+              --notes-file "${{ steps.notes.outputs.note_file }}"
+          fi
 
   build:
     name: ${{ matrix.platform }}-${{ matrix.arch }}
@@ -168,7 +178,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set artifact name
         shell: bash
@@ -187,11 +197,22 @@ jobs:
           toolchain: stable
           target: ${{ matrix.target }}
           rustflags: ""
-          cache: true
-          cache-key: release-${{ matrix.target }}
+          cache: false
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2.9.1
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install Rust LLVM tools
+        if: matrix.build_tool == 'xwin'
+        shell: bash
+        run: |
+          # cargo-xwin derives lld-link/llvm-lib from rust-lld/llvm-ar.
+          rustup component add llvm-tools || rustup component add llvm-tools-preview
 
       - name: Cache cross-compilation tool data
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cache/cargo-xwin
@@ -224,6 +245,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          if [[ "${{ matrix.target }}" == "aarch64-pc-windows-msvc" ]]; then
+            # ring forces plain clang for Windows ARM64 C code, so match cargo-xwin's backend.
+            export XWIN_CROSS_COMPILER=clang
+          fi
           cargo xwin build --release --locked --target ${{ matrix.target }}
 
       - name: Build with cargo
@@ -261,10 +286,9 @@ jobs:
           printf 'artifact_path=%s\n' "$artifact_path" >> "$GITHUB_OUTPUT"
 
       - name: Upload release asset
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          draft: true
-          files: ${{ steps.package.outputs.artifact_path }}
-          overwrite_files: true
-          fail_on_unmatched_files: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "${GITHUB_REF_NAME}" "${{ steps.package.outputs.artifact_path }}" --clobber

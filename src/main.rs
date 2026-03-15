@@ -20,6 +20,7 @@ mod config;
 mod domain;
 mod transport;
 
+use application::config_reload::{spawn_config_reloader, ConfigReloadParticipant};
 use application::execution_service::ExecutionService;
 use application::operator_console::{ConsoleLogLevel, OperatorConsole};
 use application::shutdown_controller::ShutdownController;
@@ -34,7 +35,7 @@ use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::field::Visit;
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::{fmt as tracing_fmt, util::SubscriberInitExt, EnvFilter, Layer};
-use transport::mcp_streamable_http::router;
+use transport::mcp_streamable_http::{router, RequestAuthController};
 use transport::tui;
 
 #[tokio::main(flavor = "multi_thread")]
@@ -60,11 +61,8 @@ async fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let config_path = cli_options.config_path;
-    let load_result = match config_path.as_deref() {
-        Some(path) => AppConfig::load_with_path(Some(path)),
-        None => AppConfig::load(),
-    };
+    let config_path = AppConfig::resolve_config_path(cli_options.config_path.as_deref());
+    let load_result = AppConfig::load_from_resolved_path(&config_path);
 
     let config = match load_result {
         Ok(config) => Arc::new(config),
@@ -96,18 +94,30 @@ async fn main() -> ExitCode {
 
     spawn_system_signal_handler(shutdown_controller.clone());
 
-    let execution_service = ExecutionService::new(config.clone());
-    let app = match router(
-        execution_service,
-        operator_console.clone(),
-        config.server.access.clone(),
-    ) {
-        Ok(app) => app,
+    let auth_controller = match RequestAuthController::new(&config.server.access) {
+        Ok(controller) => controller,
         Err(error) => {
             tracing::error!(error = %error, "Failed to initialize request authentication");
             return ExitCode::FAILURE;
         }
     };
+    let execution_service = ExecutionService::new(config.clone());
+    let app = router(
+        execution_service.clone(),
+        operator_console.clone(),
+        auth_controller.clone(),
+    );
+    let reload_participants: Vec<Box<dyn ConfigReloadParticipant>> = vec![
+        Box::new(operator_console.clone()),
+        Box::new(auth_controller.clone()),
+        Box::new(execution_service.clone()),
+    ];
+    spawn_config_reloader(
+        config_path,
+        (*config).clone(),
+        reload_participants,
+        shutdown_controller.clone(),
+    );
     let bind_address = &config.server.bind_address;
     let listener = match bind_server_listener(bind_address).await {
         Ok(listener) => listener,
@@ -142,7 +152,7 @@ async fn bind_server_listener(bind_address: &str) -> io::Result<tokio::net::TcpL
 fn format_bind_error(bind_address: &str, error: &io::Error) -> String {
     if error.kind() == io::ErrorKind::AddrInUse {
         return format!(
-            "Failed to bind {bind_address}: the port is already in use. Stop the other process or change `server.bind-process` in the config."
+            "Failed to bind {bind_address}: the port is already in use. Stop the other process or change `server.address` in the config."
         );
     }
 
@@ -233,7 +243,7 @@ mod tests {
 
         assert!(message.contains("127.0.0.1:8787"));
         assert!(message.contains("already in use"));
-        assert!(message.contains("server.bind-process"));
+        assert!(message.contains("server.address"));
     }
 
     #[tokio::test]

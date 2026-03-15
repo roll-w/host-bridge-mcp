@@ -15,6 +15,7 @@
  */
 
 pub mod command_parser;
+pub mod config_reload;
 pub mod data_dir;
 pub mod execution_service;
 pub mod operator_console;

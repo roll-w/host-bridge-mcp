@@ -234,7 +234,7 @@ fn approval_detail_lines(approval: &PendingApprovalView) -> Vec<Line<'static>> {
         Line::from(format!("args       : {:?}", approval.request.args)),
         Line::from(format!("workdir    : {}", working_directory)),
         Line::from(format!("timeoutMs  : {}", approval.request.timeout_ms)),
-        Line::from(format!("createdAt  : {:?}", approval.created_at)),
+        Line::from(format!("createdAt  : {}", approval.created_at)),
     ];
 
     if approval.request.env.is_empty() {
@@ -284,6 +284,9 @@ fn log_line(entry: &ConsoleLogEntry, selected: bool) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::execution_service::ConfirmationRequest;
+    use std::collections::HashMap;
+    use uuid::Uuid;
 
     #[test]
     fn log_line_text_uses_timestamp_and_aligned_level() {
@@ -306,6 +309,33 @@ mod tests {
             log_line_text(&error_entry),
             "2026-03-09T16:16:21.751592Z ERROR Execution failed"
         );
+    }
+
+    #[test]
+    fn approval_detail_lines_format_created_at_as_timestamp() {
+        let approval = PendingApprovalView {
+            id: Uuid::parse_str("123e4567-e89b-12d3-a456-426614174000").expect("uuid should parse"),
+            request: ConfirmationRequest {
+                server: "host".to_string(),
+                platform: "linux".to_string(),
+                command_line: "cargo build".to_string(),
+                executable: "cargo".to_string(),
+                args: vec!["build".to_string()],
+                working_directory: Some("/workspace".to_string()),
+                timeout_ms: 1_000,
+                env: HashMap::new(),
+            },
+            created_at: "2026-03-15T10:20:30.123456Z".to_string(),
+        };
+
+        let lines = approval_detail_lines(&approval);
+        let created_at_line: String = lines[8]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        assert_eq!(created_at_line, "createdAt  : 2026-03-15T10:20:30.123456Z");
     }
 }
 

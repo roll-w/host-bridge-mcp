@@ -18,19 +18,37 @@ use crate::application::data_dir::{default_persisted_log_path, default_temporary
 use crate::application::operator_console::{ConsoleLogEntry, ConsoleLogLevel};
 use crate::config::LoggingConfig;
 use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use tracing_subscriber::fmt::format::Writer;
-use tracing_subscriber::fmt::time::{FormatTime, SystemTime as TracingSystemTime};
 
 pub(super) struct LogStore {
     buffer_limit: usize,
     buffered_logs: VecDeque<ConsoleLogEntry>,
     total_log_count: usize,
     storage: LogFileStorage,
+}
+
+pub(super) enum PreparedLogStore {
+    UpdatePolicy {
+        buffer_limit: usize,
+        delete_on_drop: bool,
+    },
+    Replace {
+        replacement: LogStore,
+        source_total_log_count: usize,
+    },
+}
+
+pub(super) struct LogStoreReconfigureSnapshot {
+    buffer_limit: usize,
+    buffered_logs: VecDeque<ConsoleLogEntry>,
+    total_log_count: usize,
+    current_path: PathBuf,
+    delete_on_drop: bool,
 }
 
 struct LogFileStorage {
@@ -63,17 +81,68 @@ impl LogStore {
     }
 
     pub(super) fn append(&mut self, level: ConsoleLogLevel, message: String) {
-        let entry = ConsoleLogEntry {
-            timestamp: current_log_timestamp(),
+        self.push_entry(ConsoleLogEntry {
+            timestamp: super::current_console_timestamp(),
             level,
             message,
-        };
+        });
+    }
+
+    pub(super) fn reconfigure_snapshot(&self) -> LogStoreReconfigureSnapshot {
+        LogStoreReconfigureSnapshot {
+            buffer_limit: self.buffer_limit,
+            buffered_logs: self.buffered_logs.clone(),
+            total_log_count: self.total_log_count,
+            current_path: self.storage.path().to_path_buf(),
+            delete_on_drop: self.storage.delete_on_drop(),
+        }
+    }
+
+    pub(super) fn apply_reconfigure(&mut self, prepared: PreparedLogStore) {
+        match prepared {
+            PreparedLogStore::UpdatePolicy {
+                buffer_limit,
+                delete_on_drop,
+            } => {
+                self.buffer_limit = buffer_limit;
+                self.trim_buffer_to_limit();
+                self.storage.set_delete_on_drop(delete_on_drop);
+            }
+            PreparedLogStore::Replace {
+                mut replacement,
+                source_total_log_count,
+            } => {
+                if self.total_log_count > source_total_log_count {
+                    let pending_entries = self.read_range(
+                        source_total_log_count,
+                        self.total_log_count - source_total_log_count,
+                    );
+                    for entry in pending_entries {
+                        replacement.restore_entry(entry);
+                    }
+                }
+                *self = replacement;
+            }
+        }
+    }
+
+    fn push_entry(&mut self, entry: ConsoleLogEntry) {
         if self.buffered_logs.len() >= self.buffer_limit {
             self.buffered_logs.pop_front();
         }
         self.buffered_logs.push_back(entry.clone());
         self.storage.append(&entry);
         self.total_log_count += 1;
+    }
+
+    fn restore_entry(&mut self, entry: ConsoleLogEntry) {
+        self.push_entry(entry);
+    }
+
+    fn trim_buffer_to_limit(&mut self) {
+        while self.buffered_logs.len() > self.buffer_limit {
+            self.buffered_logs.pop_front();
+        }
     }
 
     pub(super) fn read_range(&mut self, start: usize, limit: usize) -> Vec<ConsoleLogEntry> {
@@ -105,6 +174,36 @@ impl LogStore {
     }
 }
 
+impl LogStoreReconfigureSnapshot {
+    pub(super) fn prepare(self, logging: LoggingConfig) -> io::Result<Option<PreparedLogStore>> {
+        let next_path = resolve_log_path(&logging)?;
+        let next_delete_on_drop = !logging.persist_file;
+        let next_buffer_limit = logging.memory_buffer_lines;
+
+        if self.current_path == next_path {
+            if self.buffer_limit == next_buffer_limit && self.delete_on_drop == next_delete_on_drop
+            {
+                return Ok(None);
+            }
+
+            return Ok(Some(PreparedLogStore::UpdatePolicy {
+                buffer_limit: next_buffer_limit,
+                delete_on_drop: next_delete_on_drop,
+            }));
+        }
+
+        let mut replacement = LogStore::new(logging)?;
+        for entry in self.buffered_logs {
+            replacement.restore_entry(entry);
+        }
+
+        Ok(Some(PreparedLogStore::Replace {
+            replacement,
+            source_total_log_count: self.total_log_count,
+        }))
+    }
+}
+
 impl LogFileStorage {
     fn new(logging: LoggingConfig) -> io::Result<Self> {
         let path = resolve_log_path(&logging)?;
@@ -115,11 +214,11 @@ impl LogFileStorage {
         }
 
         let append_mode = logging.persist_file;
-        let (line_offsets, next_offset) = if append_mode {
-            index_log_file(&path)?
-        } else {
-            (Vec::new(), 0)
-        };
+        if append_mode {
+            archive_existing_log_file(&path)?;
+        }
+
+        let (line_offsets, next_offset) = (Vec::new(), 0);
         let writer = open_private_write_file(&path, append_mode)?;
 
         Ok(Self {
@@ -133,6 +232,18 @@ impl LogFileStorage {
 
     fn line_count(&self) -> usize {
         self.line_offsets.len()
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn delete_on_drop(&self) -> bool {
+        self.delete_on_drop
+    }
+
+    fn set_delete_on_drop(&mut self, delete_on_drop: bool) {
+        self.delete_on_drop = delete_on_drop;
     }
 
     fn append(&mut self, entry: &ConsoleLogEntry) {
@@ -192,6 +303,65 @@ impl LogFileStorage {
     }
 }
 
+fn archive_existing_log_file(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => fs::rename(path, archived_log_path(path)?),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn archived_log_path(path: &Path) -> io::Result<PathBuf> {
+    let date = archive_date_label();
+    let mut index = 1_usize;
+
+    loop {
+        let archived_path = path.with_file_name(archived_log_file_name(path, &date, index)?);
+        match fs::symlink_metadata(&archived_path) {
+            Ok(_) => index += 1,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(archived_path),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn archived_log_file_name(path: &Path, date: &str, index: usize) -> io::Result<OsString> {
+    let Some(stem) = path.file_stem() else {
+        let Some(file_name) = path.file_name() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("log path '{}' must include a file name", path.display()),
+            ));
+        };
+
+        let mut archived_name = OsString::from(file_name);
+        archived_name.push(format!(".{date}.{index}"));
+        return Ok(archived_name);
+    };
+
+    let mut archived_name = OsString::from(stem);
+    archived_name.push(format!(".{date}.{index}"));
+    if let Some(extension) = path.extension() {
+        archived_name.push(".");
+        archived_name.push(extension);
+    }
+
+    Ok(archived_name)
+}
+
+fn archive_date_label() -> String {
+    sanitize_archive_date(&super::current_console_timestamp())
+}
+
+fn sanitize_archive_date(timestamp: &str) -> String {
+    timestamp
+        .chars()
+        .take_while(|character| *character != 'T')
+        .filter(|character| character.is_ascii_digit() || *character == '-')
+        .collect()
+}
+
 impl Drop for LogFileStorage {
     fn drop(&mut self) {
         if let Some(mut writer) = self.writer.take() {
@@ -232,31 +402,6 @@ fn open_private_write_file(path: &Path, append_mode: bool) -> io::Result<File> {
     options.open(path)
 }
 
-fn index_log_file(path: &Path) -> io::Result<(Vec<u64>, u64)> {
-    if !path.exists() {
-        return Ok((Vec::new(), 0));
-    }
-
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let mut line_offsets = Vec::new();
-    let mut next_offset = 0_u64;
-    let mut buffer = Vec::new();
-
-    loop {
-        buffer.clear();
-        let read = reader.read_until(b'\n', &mut buffer)?;
-        if read == 0 {
-            break;
-        }
-
-        line_offsets.push(next_offset);
-        next_offset += read as u64;
-    }
-
-    Ok((line_offsets, next_offset))
-}
-
 fn parse_log_line(raw: &str) -> Option<ConsoleLogEntry> {
     let (timestamp, remainder) = raw.split_once(' ')?;
     if remainder.len() < 6 {
@@ -271,19 +416,6 @@ fn parse_log_line(raw: &str) -> Option<ConsoleLogEntry> {
         level: parse_log_level(level_field.trim())?,
         message: message.to_string(),
     })
-}
-
-fn current_log_timestamp() -> String {
-    let timer = TracingSystemTime::default();
-    let mut output = String::new();
-    let mut writer = Writer::new(&mut output);
-
-    if timer.format_time(&mut writer).is_err() {
-        return "1970-01-01T00:00:00.000000Z".to_string();
-    }
-
-    output.truncate(output.trim_end().len());
-    output
 }
 
 fn serialize_log_entry(entry: &ConsoleLogEntry) -> String {
@@ -317,8 +449,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn current_log_timestamp_matches_expected_utc_shape() {
-        let timestamp = current_log_timestamp();
+    fn current_console_timestamp_matches_expected_utc_shape() {
+        let timestamp = super::super::current_console_timestamp();
         let bytes = timestamp.as_bytes();
 
         assert_eq!(timestamp.len(), 27);
@@ -351,6 +483,26 @@ mod tests {
         assert_eq!(
             serialize_log_entry(&error_entry),
             "2026-03-09T16:16:21.751592Z ERROR failed\n"
+        );
+    }
+
+    #[test]
+    fn archived_log_file_name_preserves_extension() {
+        let archived_name =
+            archived_log_file_name(Path::new("/tmp/host-bridge-mcp.log"), "2026-03-15", 2)
+                .expect("archived log file name should be generated");
+
+        assert_eq!(
+            archived_name,
+            OsString::from("host-bridge-mcp.2026-03-15.2.log")
+        );
+    }
+
+    #[test]
+    fn sanitize_archive_date_keeps_only_year_month_day() {
+        assert_eq!(
+            sanitize_archive_date("2026-03-15T09:13:41.123456Z"),
+            "2026-03-15"
         );
     }
 }

@@ -32,7 +32,7 @@ use std::io::{self as std_io, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::time::Duration;
 use uuid::Uuid;
@@ -144,12 +144,18 @@ pub struct PreparedExecution {
 
 #[derive(Clone)]
 pub struct ExecutionService {
-    config: Arc<AppConfig>,
-    policy_engine: Arc<PolicyEngine>,
-    targets: Arc<ExecutionTargetRegistry>,
+    runtime: Arc<StdRwLock<Arc<ExecutionRuntimeConfig>>>,
     spawn_planner: SpawnPlanner,
     ssh_client: Arc<SshClient>,
     records: Arc<RwLock<HashMap<Uuid, Arc<ExecutionRecord>>>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ExecutionRuntimeConfig {
+    policy_engine: PolicyEngine,
+    targets: ExecutionTargetRegistry,
+    default_timeout_ms: u64,
+    max_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -308,41 +314,56 @@ impl Drop for RawOutputStore {
 
 impl ExecutionService {
     pub fn new(config: Arc<AppConfig>) -> Self {
-        let policy_engine = PolicyEngine::new((*config).clone());
-        let targets = ExecutionTargetRegistry::from_config(&config.execution);
+        let runtime = Self::prepare_runtime(&config);
 
         Self {
-            config,
-            policy_engine: Arc::new(policy_engine),
-            targets: Arc::new(targets),
+            runtime: Arc::new(StdRwLock::new(runtime)),
             spawn_planner: SpawnPlanner::current(),
             ssh_client: Arc::new(SshClient::new()),
             records: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    pub fn default_server_name(&self) -> &str {
-        &self.targets.default_target().name
+    pub(crate) fn prepare_runtime(config: &AppConfig) -> Arc<ExecutionRuntimeConfig> {
+        Arc::new(ExecutionRuntimeConfig::from_app_config(config))
+    }
+
+    pub(crate) fn apply_runtime(&self, runtime: Arc<ExecutionRuntimeConfig>) {
+        *self
+            .runtime
+            .write()
+            .expect("execution runtime lock poisoned") = runtime;
+    }
+
+    pub fn default_server_name(&self) -> String {
+        self.runtime_snapshot()
+            .targets
+            .default_target()
+            .name
+            .clone()
     }
 
     pub fn available_environments(&self) -> Vec<ExecutionEnvironmentSummary> {
-        self.targets.environments()
+        self.runtime_snapshot().targets.environments()
     }
 
     pub async fn prepare_command(
         &self,
         input: ExecuteCommandInput,
     ) -> Result<PreparedExecution, ExecutionError> {
+        let runtime = self.runtime_snapshot();
         let parsed = parse_command_line(&input.command)?;
-        let policy = self.policy_engine.evaluate(&parsed.program, &parsed.args);
+        let policy = runtime
+            .policy_engine
+            .evaluate(&parsed.program, &parsed.args);
 
         if policy.decision == PolicyDecision::Deny {
             tracing::warn!(command = %input.command, "Policy denied command");
             return Err(ExecutionError::Denied);
         }
 
-        let target = self.resolve_target(input.server.as_deref())?;
-        let timeout_ms = self.resolve_timeout(input.timeout_ms)?;
+        let target = runtime.resolve_target(input.server.as_deref())?;
+        let timeout_ms = runtime.resolve_timeout(input.timeout_ms)?;
         let executable = target.path_mapper.map_command_if_path(&parsed.program);
         let args = parsed
             .args
@@ -490,23 +511,6 @@ impl ExecutionService {
         });
     }
 
-    fn resolve_timeout(&self, requested_timeout_ms: Option<u64>) -> Result<u64, ExecutionError> {
-        let timeout_ms = requested_timeout_ms.unwrap_or(self.config.execution.default_timeout_ms);
-        if timeout_ms == 0 {
-            return Err(ExecutionError::InvalidTimeout);
-        }
-        Ok(timeout_ms.min(self.config.execution.max_timeout_ms))
-    }
-
-    fn resolve_target(
-        &self,
-        requested_server: Option<&str>,
-    ) -> Result<&ExecutionTarget, ExecutionError> {
-        self.targets.resolve(requested_server).ok_or_else(|| {
-            ExecutionError::UnknownServer(requested_server.unwrap_or_default().to_string())
-        })
-    }
-
     fn resolve_local_working_directory(
         &self,
         target: &ExecutionTarget,
@@ -569,6 +573,42 @@ impl ExecutionService {
                     .filter(|value| !value.is_empty())
             })
             .map(ToOwned::to_owned)
+    }
+
+    fn runtime_snapshot(&self) -> Arc<ExecutionRuntimeConfig> {
+        self.runtime
+            .read()
+            .expect("execution runtime lock poisoned")
+            .clone()
+    }
+}
+
+impl ExecutionRuntimeConfig {
+    fn from_app_config(config: &AppConfig) -> Self {
+        Self {
+            policy_engine: PolicyEngine::new(config.clone()),
+            targets: ExecutionTargetRegistry::from_config(&config.execution),
+            default_timeout_ms: config.execution.default_timeout_ms,
+            max_timeout_ms: config.execution.max_timeout_ms,
+        }
+    }
+
+    fn resolve_timeout(&self, requested_timeout_ms: Option<u64>) -> Result<u64, ExecutionError> {
+        let timeout_ms = requested_timeout_ms.unwrap_or(self.default_timeout_ms);
+        if timeout_ms == 0 {
+            return Err(ExecutionError::InvalidTimeout);
+        }
+
+        Ok(timeout_ms.min(self.max_timeout_ms))
+    }
+
+    fn resolve_target(
+        &self,
+        requested_server: Option<&str>,
+    ) -> Result<&ExecutionTarget, ExecutionError> {
+        self.targets.resolve(requested_server).ok_or_else(|| {
+            ExecutionError::UnknownServer(requested_server.unwrap_or_default().to_string())
+        })
     }
 }
 

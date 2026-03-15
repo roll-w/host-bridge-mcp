@@ -179,7 +179,7 @@ Key sections in `host-bridge.yaml`:
 
 Highlights:
 
-- `server.bind-process`: HTTP bind address
+- `server.address`: HTTP bind address (requires restart if changed at runtime)
 - `server.access.api-key-env`: optional environment-variable-backed API key for fixed `Authorization: Bearer <key>`
   request authentication
 - `logging.memory-buffer-lines`: hot in-memory log window for the TUI

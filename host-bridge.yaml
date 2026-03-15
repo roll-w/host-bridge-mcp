@@ -4,7 +4,7 @@
 #   HOST_BRIDGE_CONFIG=/path/to/host-bridge.yaml
 
 server:
-  bind-process: 127.0.0.1:8787
+  address: 127.0.0.1:8787
   access:
   # Set api-key-env to require:
   # Authorization: Bearer <value from HOST_BRIDGE_API_KEY>

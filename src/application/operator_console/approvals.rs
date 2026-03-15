@@ -16,14 +16,13 @@
 
 use crate::application::execution_service::ConfirmationRequest;
 use crate::application::operator_console::OperatorConsole;
-use std::time::SystemTime;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
 pub(super) struct PendingApproval {
     pub(super) id: Uuid,
     pub(super) request: ConfirmationRequest,
-    pub(super) created_at: SystemTime,
+    pub(super) created_at: String,
     responder: Option<oneshot::Sender<bool>>,
 }
 
@@ -42,7 +41,7 @@ impl PendingApproval {
         Self {
             id,
             request,
-            created_at: SystemTime::now(),
+            created_at: super::current_console_timestamp(),
             responder: Some(responder),
         }
     }

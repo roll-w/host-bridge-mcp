@@ -107,6 +107,13 @@ fn write_temp_config(contents: &str) -> PathBuf {
     path
 }
 
+fn resolved_temp_config(path: &PathBuf) -> ResolvedConfigPath {
+    ResolvedConfigPath {
+        path: path.display().to_string(),
+        explicit: true,
+    }
+}
+
 #[test]
 fn default_config_uses_single_server() {
     let config = AppConfig::default();
@@ -311,7 +318,10 @@ fn reject_zero_ssh_connection_idle_timeout() {
 
 #[test]
 fn explicit_missing_config_path_fails_to_load() {
-    let error = AppConfig::load_with_path(Some("definitely-missing-config.yaml"))
+    let error = AppConfig::load_from_resolved_path(&ResolvedConfigPath {
+        path: "definitely-missing-config.yaml".to_string(),
+        explicit: true,
+    })
         .expect_err("missing explicit config should fail");
 
     assert!(matches!(error, ConfigError::Read { .. }));
@@ -321,12 +331,12 @@ fn explicit_missing_config_path_fails_to_load() {
 fn unknown_yaml_fields_are_rejected() {
     let path = write_temp_config(
         r#"server:
-  bind-process: 127.0.0.1:8787
+  address: 127.0.0.1:8787
     unexpected: true
 "#,
     );
 
-    let error = AppConfig::load_with_path(Some(path.to_str().expect("valid temp path")))
+    let error = AppConfig::load_from_resolved_path(&resolved_temp_config(&path))
         .expect_err("unknown fields should be rejected");
 
     assert!(matches!(error, ConfigError::Parse { .. }));
@@ -337,15 +347,30 @@ fn unknown_yaml_fields_are_rejected() {
 fn legacy_access_header_fields_are_rejected() {
     let path = write_temp_config(
         r#"server:
-  bind-process: 127.0.0.1:8787
+  address: 127.0.0.1:8787
   access:
     api-key-env: HOST_BRIDGE_API_KEY
     header-name: Authorization
 "#,
     );
 
-    let error = AppConfig::load_with_path(Some(path.to_str().expect("valid temp path")))
+    let error = AppConfig::load_from_resolved_path(&resolved_temp_config(&path))
         .expect_err("legacy auth header config should be rejected");
+
+    assert!(matches!(error, ConfigError::Parse { .. }));
+    let _ = fs::remove_file(path);
+}
+
+#[test]
+fn legacy_bind_process_field_is_rejected() {
+    let path = write_temp_config(
+        r#"server:
+  bind-process: 127.0.0.1:8787
+"#,
+    );
+
+    let error = AppConfig::load_from_resolved_path(&resolved_temp_config(&path))
+        .expect_err("legacy bind-process field should be rejected");
 
     assert!(matches!(error, ConfigError::Parse { .. }));
     let _ = fs::remove_file(path);

@@ -19,12 +19,11 @@ mod output;
 mod streaming;
 mod tooling;
 
-use self::auth::{require_request_auth, resolve_request_auth};
+use self::auth::require_request_auth;
 use self::streaming::{health, stream_execution};
 use self::tooling::execute_command_tool;
 use crate::application::execution_service::ExecutionService;
 use crate::application::operator_console::OperatorConsole;
-use crate::config::AccessConfig;
 use axum::middleware;
 use axum::routing::get;
 use axum::Router;
@@ -42,7 +41,8 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 
-pub use self::auth::TransportAuthError;
+pub use self::auth::RequestAuthController;
+pub(crate) use self::auth::{RequestAuthState, TransportAuthError};
 
 const MCP_SERVER_NAME: &str = env!("CARGO_PKG_NAME");
 const MCP_SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -291,8 +291,8 @@ mod tests {
 pub fn router(
     execution_service: ExecutionService,
     operator_console: OperatorConsole,
-    access: AccessConfig,
-) -> Result<Router, TransportAuthError> {
+    auth_controller: RequestAuthController,
+) -> Router {
     let stream_state = HttpState {
         execution_service: execution_service.clone(),
     };
@@ -316,17 +316,16 @@ pub fn router(
             mcp_config,
         );
 
-    let auth_state = resolve_request_auth(&access)?;
     let protected_routes = Router::new()
         .route("/executions/{execution_id}/stream", get(stream_execution))
         .nest_service("/mcp", mcp_service)
         .route_layer(middleware::from_fn_with_state(
-            auth_state,
+            auth_controller,
             require_request_auth,
         ));
 
-    Ok(Router::new()
+    Router::new()
         .route("/health", get(health))
         .merge(protected_routes)
-        .with_state(stream_state))
+        .with_state(stream_state)
 }

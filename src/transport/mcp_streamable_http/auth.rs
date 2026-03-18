@@ -21,14 +21,19 @@ use axum::http::header::WWW_AUTHENTICATE;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 const AUTH_REALM: &str = "host-bridge-mcp";
 const AUTH_SCHEME: &str = "Bearer";
 
 #[derive(Clone)]
-pub(super) struct RequestAuthState {
+pub(crate) struct RequestAuthState {
     auth: Option<RequestAuth>,
+}
+
+#[derive(Clone)]
+pub struct RequestAuthController {
+    state: Arc<RwLock<RequestAuthState>>,
 }
 
 #[derive(Clone)]
@@ -42,6 +47,29 @@ pub enum TransportAuthError {
     MissingApiKeyEnv(String),
     #[error("server.access.api-key-env '{0}' resolved to an empty value")]
     EmptyApiKeyEnv(String),
+}
+
+impl RequestAuthController {
+    pub fn new(access: &AccessConfig) -> Result<Self, TransportAuthError> {
+        Ok(Self {
+            state: Arc::new(RwLock::new(Self::prepare(access)?)),
+        })
+    }
+
+    pub(crate) fn prepare(access: &AccessConfig) -> Result<RequestAuthState, TransportAuthError> {
+        resolve_request_auth(access)
+    }
+
+    pub(crate) fn apply(&self, state: RequestAuthState) {
+        *self.state.write().expect("request auth lock poisoned") = state;
+    }
+
+    fn snapshot(&self) -> RequestAuthState {
+        self.state
+            .read()
+            .expect("request auth lock poisoned")
+            .clone()
+    }
 }
 
 pub(super) fn resolve_request_auth(
@@ -66,10 +94,11 @@ pub(super) fn resolve_request_auth(
 }
 
 pub(super) async fn require_request_auth(
-    State(state): State<RequestAuthState>,
+    State(controller): State<RequestAuthController>,
     request: Request,
     next: Next,
 ) -> Response {
+    let state = controller.snapshot();
     let Some(auth) = state.auth.as_ref() else {
         return next.run(request).await;
     };

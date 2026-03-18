@@ -24,7 +24,7 @@ const DEFAULT_EXECUTION_SERVER: &str = "host";
 const DEFAULT_SSH_PORT: u16 = 22;
 const DEFAULT_SSH_CONNECTION_IDLE_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct AppConfig {
     pub server: ServerConfig,
@@ -32,10 +32,10 @@ pub struct AppConfig {
     pub logging: LoggingConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ServerConfig {
-    #[serde(rename = "bind-process")]
+    #[serde(rename = "address")]
     pub bind_address: String,
     pub access: AccessConfig,
 }
@@ -46,7 +46,7 @@ pub struct AccessConfig {
     pub api_key_env: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct LoggingConfig {
     pub memory_buffer_lines: usize,
@@ -54,7 +54,7 @@ pub struct LoggingConfig {
     pub persist_file: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ExecutionConfig {
     pub default_action: PolicyAction,
@@ -70,7 +70,7 @@ pub struct ExecutionConfig {
     pub max_timeout_ms: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(
     tag = "transport",
     rename_all_fields = "kebab-case",
@@ -104,7 +104,7 @@ pub enum ExecutionServerConfig {
     },
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct SshAuthConfig {
     #[serde(rename = "type")]
@@ -133,7 +133,7 @@ impl SshAuthType {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct CommandPolicyConfig {
     pub command: String,
@@ -143,7 +143,7 @@ pub struct CommandPolicyConfig {
     pub rules: Vec<CommandRuleConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct CommandRuleConfig {
     #[serde(default)]
@@ -152,7 +152,7 @@ pub struct CommandRuleConfig {
     pub default_working_directory: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct PathMappingRule {
     pub from: String,
@@ -204,6 +204,12 @@ pub enum ConfigError {
     },
     #[error("invalid config: {0}")]
     Validation(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedConfigPath {
+    pub path: String,
+    pub explicit: bool,
 }
 
 impl Default for AppConfig {
@@ -284,21 +290,21 @@ fn default_ssh_connection_idle_timeout_ms() -> u64 {
 }
 
 impl AppConfig {
-    pub fn load() -> Result<Self, ConfigError> {
-        Self::load_with_path(None)
+    pub fn resolve_config_path(config_path: Option<&str>) -> ResolvedConfigPath {
+        let explicit = config_path.is_some() || std::env::var(CONFIG_ENV_KEY).is_ok();
+        let path = config_path
+            .map(|value| value.to_string())
+            .or_else(|| std::env::var(CONFIG_ENV_KEY).ok())
+            .unwrap_or_else(|| DEFAULT_CONFIG_FILE.to_string());
+
+        ResolvedConfigPath { path, explicit }
     }
 
-    pub fn load_with_path(config_path: Option<&str>) -> Result<Self, ConfigError> {
-        let explicit_path = config_path
-            .map(|value| value.to_string())
-            .or_else(|| std::env::var(CONFIG_ENV_KEY).ok());
-        let path = explicit_path
-            .clone()
-            .unwrap_or_else(|| DEFAULT_CONFIG_FILE.to_string());
-        if !Path::new(&path).exists() {
-            return if explicit_path.is_some() {
+    pub fn load_from_resolved_path(resolved: &ResolvedConfigPath) -> Result<Self, ConfigError> {
+        if !Path::new(&resolved.path).exists() {
+            return if resolved.explicit {
                 Err(ConfigError::Read {
-                    path,
+                    path: resolved.path.clone(),
                     source: std::io::Error::new(
                         std::io::ErrorKind::NotFound,
                         "configuration file was not found",
@@ -309,12 +315,14 @@ impl AppConfig {
             };
         }
 
-        let raw = std::fs::read_to_string(&path).map_err(|source| ConfigError::Read {
-            path: path.clone(),
+        let raw = std::fs::read_to_string(&resolved.path).map_err(|source| ConfigError::Read {
+            path: resolved.path.clone(),
             source,
         })?;
-        let config = serde_saphyr::from_str::<Self>(&raw)
-            .map_err(|source| ConfigError::Parse { path, source })?;
+        let config = serde_saphyr::from_str::<Self>(&raw).map_err(|source| ConfigError::Parse {
+            path: resolved.path.clone(),
+            source,
+        })?;
         config.validate()?;
         Ok(config)
     }
@@ -322,7 +330,7 @@ impl AppConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         if self.server.bind_address.trim().is_empty() {
             return Err(ConfigError::Validation(
-                "server.bind-process cannot be empty".to_string(),
+                "server.address cannot be empty".to_string(),
             ));
         }
 

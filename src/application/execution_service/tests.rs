@@ -27,14 +27,22 @@ fn test_config(execution: ExecutionConfig) -> Arc<AppConfig> {
     Arc::new(config)
 }
 
-#[test]
-fn reject_zero_timeout() {
+#[tokio::test]
+async fn reject_zero_timeout() {
     let config = test_config(ExecutionConfig {
         default_action: PolicyAction::Allow,
         ..ExecutionConfig::default()
     });
     let service = ExecutionService::new(config);
-    let result = service.resolve_timeout(Some(0));
+    let result = service
+        .prepare_command(ExecuteCommandInput {
+            command: "cargo build".to_string(),
+            server: None,
+            working_directory: None,
+            env: HashMap::new(),
+            timeout_ms: Some(0),
+        })
+        .await;
     assert!(matches!(result, Err(ExecutionError::InvalidTimeout)));
 }
 

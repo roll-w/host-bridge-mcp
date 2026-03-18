@@ -19,14 +19,15 @@ mod log_store;
 mod sanitize;
 
 use self::approvals::{PendingApproval, PendingApprovalGuard};
-use self::log_store::LogStore;
+use self::log_store::{LogStore, PreparedLogStore};
 use self::sanitize::sanitize_console_text;
 use crate::application::execution_service::ConfirmationRequest;
 use crate::config::LoggingConfig;
 use std::io;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
 use tokio::sync::oneshot;
+use tracing_subscriber::fmt::format::Writer;
+use tracing_subscriber::fmt::time::{FormatTime, SystemTime as TracingSystemTime};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +48,7 @@ pub struct ConsoleLogEntry {
 pub struct PendingApprovalView {
     pub id: Uuid,
     pub request: ConfirmationRequest,
-    pub created_at: SystemTime,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +57,19 @@ pub struct ConsoleSnapshot {
     pub total_log_count: usize,
     pub log_file_path: String,
     pub pending_approvals: Vec<PendingApprovalView>,
+}
+
+fn current_console_timestamp() -> String {
+    let timer = TracingSystemTime::default();
+    let mut output = String::new();
+    let mut writer = Writer::new(&mut output);
+
+    if timer.format_time(&mut writer).is_err() {
+        return "1970-01-01T00:00:00.000000Z".to_string();
+    }
+
+    output.truncate(output.trim_end().len());
+    output
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -69,6 +83,10 @@ pub enum ConsoleApprovalError {
 #[derive(Clone)]
 pub struct OperatorConsole {
     state: Arc<Mutex<ConsoleState>>,
+}
+
+pub(crate) struct PreparedLoggingReconfigure {
+    prepared: PreparedLogStore,
 }
 
 struct ConsoleState {
@@ -126,7 +144,7 @@ impl OperatorConsole {
                 .map(|approval| PendingApprovalView {
                     id: approval.id,
                     request: approval.request.clone(),
-                    created_at: approval.created_at,
+                    created_at: approval.created_at.clone(),
                 })
                 .collect(),
         }
@@ -140,6 +158,38 @@ impl OperatorConsole {
             .read_range(start, limit)
     }
 
+    #[cfg(test)]
+    pub fn reconfigure_logging(&self, logging: LoggingConfig) -> io::Result<()> {
+        let prepared = self.prepare_logging_reconfigure(logging)?;
+        if let Some(prepared) = prepared {
+            self.apply_logging_reconfigure(prepared);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn prepare_logging_reconfigure(
+        &self,
+        logging: LoggingConfig,
+    ) -> io::Result<Option<PreparedLoggingReconfigure>> {
+        let snapshot = {
+            self.state
+                .lock()
+                .expect("console lock poisoned")
+                .log_store
+                .reconfigure_snapshot()
+        };
+        let prepared = snapshot.prepare(logging)?;
+        Ok(prepared.map(|prepared| PreparedLoggingReconfigure { prepared }))
+    }
+
+    pub(crate) fn apply_logging_reconfigure(&self, prepared: PreparedLoggingReconfigure) {
+        self.state
+            .lock()
+            .expect("console lock poisoned")
+            .log_store
+            .apply_reconfigure(prepared.prepared);
+    }
+
     pub async fn request_confirmation(
         &self,
         request: ConfirmationRequest,
@@ -148,6 +198,7 @@ impl OperatorConsole {
             return Err(ConsoleApprovalError::Unavailable);
         }
 
+        // TODO: approval id needs to use the execution id, or we need to correlate approvals with executions in some other way. Using a random UUID is just a temporary placeholder.
         let approval_id = Uuid::new_v4();
         let request_preview = request.command_line.clone();
         let (sender, receiver) = oneshot::channel();
@@ -345,9 +396,11 @@ mod tests {
     }
 
     #[test]
-    fn persistent_log_file_is_reused_without_truncation() {
-        let log_path =
-            std::env::temp_dir().join(format!("host-bridge-mcp-persist-{}.log", Uuid::new_v4()));
+    fn persistent_log_file_is_archived_on_startup() {
+        let log_dir =
+            std::env::temp_dir().join(format!("host-bridge-mcp-persist-{}", Uuid::new_v4()));
+        fs::create_dir_all(&log_dir).expect("log directory should be created");
+        let log_path = log_dir.join("session.log");
         let seed_line = "2026-03-09T16:16:21.751592Z  INFO line-0\n";
         fs::write(&log_path, seed_line).expect("seed log file should be written");
 
@@ -359,23 +412,108 @@ mod tests {
             })
                 .expect("console should initialize");
 
-            let initial_entries = console.read_logs(0, 1);
-            assert_eq!(initial_entries.len(), 1);
-            assert_eq!(initial_entries[0].timestamp, "2026-03-09T16:16:21.751592Z");
-            assert_eq!(initial_entries[0].message, "line-0");
+            assert!(console.read_logs(0, 1).is_empty());
 
             console.push_log(ConsoleLogLevel::Warn, "line-1");
 
             let entries = console.read_logs(0, 2);
-            assert_eq!(entries.len(), 2);
-            assert_eq!(entries[0].message, "line-0");
-            assert_eq!(entries[1].message, "line-1");
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].message, "line-1");
         }
 
         let contents = fs::read_to_string(&log_path).expect("log file should remain readable");
-        assert!(contents.contains(seed_line));
+        assert!(!contents.contains(seed_line));
         assert!(contents.contains(" WARN line-1\n"));
 
-        let _ = fs::remove_file(log_path);
+        let archived_logs: Vec<_> = fs::read_dir(&log_dir)
+            .expect("log directory should remain readable")
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("session.") && name != "session.log")
+            })
+            .collect();
+        assert_eq!(archived_logs.len(), 1);
+
+        let archived_name = archived_logs[0]
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("archived log file should have a valid file name");
+        assert!(archived_name.contains(".20"));
+        assert!(archived_name.ends_with(".1.log"));
+
+        let archived_contents = fs::read_to_string(&archived_logs[0])
+            .expect("archived log file should remain readable");
+        assert!(archived_contents.contains(seed_line));
+        assert!(!archived_contents.contains(" WARN line-1\n"));
+
+        let _ = fs::remove_dir_all(log_dir);
+    }
+
+    #[test]
+    fn reconfigure_logging_preserves_buffered_entries() {
+        let initial_path =
+            std::env::temp_dir().join(format!("host-bridge-mcp-log-a-{}.log", Uuid::new_v4()));
+        let next_path =
+            std::env::temp_dir().join(format!("host-bridge-mcp-log-b-{}.log", Uuid::new_v4()));
+        let console = OperatorConsole::new(LoggingConfig {
+            memory_buffer_lines: 4,
+            file_path: Some(initial_path.display().to_string()),
+            persist_file: true,
+        })
+            .expect("console should initialize");
+        console.push_log(ConsoleLogLevel::Info, "line-1");
+        console.push_log(ConsoleLogLevel::Warn, "line-2");
+
+        console
+            .reconfigure_logging(LoggingConfig {
+                memory_buffer_lines: 4,
+                file_path: Some(next_path.display().to_string()),
+                persist_file: true,
+            })
+            .expect("logging should reconfigure");
+
+        let entries = console.read_logs(0, 2);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].message, "line-1");
+        assert_eq!(entries[1].message, "line-2");
+
+        let _ = fs::remove_file(initial_path);
+        let _ = fs::remove_file(next_path);
+    }
+
+    #[test]
+    fn prepared_logging_reconfigure_keeps_logs_written_before_commit() {
+        let initial_path =
+            std::env::temp_dir().join(format!("host-bridge-mcp-log-a-{}.log", Uuid::new_v4()));
+        let next_path =
+            std::env::temp_dir().join(format!("host-bridge-mcp-log-b-{}.log", Uuid::new_v4()));
+        let console = OperatorConsole::new(LoggingConfig {
+            memory_buffer_lines: 4,
+            file_path: Some(initial_path.display().to_string()),
+            persist_file: true,
+        })
+            .expect("console should initialize");
+        console.push_log(ConsoleLogLevel::Info, "line-1");
+
+        let prepared = console
+            .prepare_logging_reconfigure(LoggingConfig {
+                memory_buffer_lines: 4,
+                file_path: Some(next_path.display().to_string()),
+                persist_file: true,
+            })
+            .expect("logging reconfigure should prepare")
+            .expect("logging reconfigure should be needed");
+        console.push_log(ConsoleLogLevel::Warn, "line-2");
+        console.apply_logging_reconfigure(prepared);
+
+        let entries = console.read_logs(0, 2);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].message, "line-1");
+        assert_eq!(entries[1].message, "line-2");
+
+        let _ = fs::remove_file(initial_path);
+        let _ = fs::remove_file(next_path);
     }
 }

@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 axum = { version = "0.8.8", features = ["json", "macros"] }
 crossterm = "0.29.0"
+notify = "8.2.0"
 ratatui = { version = "0.30.0", default-features = false, features = ["crossterm"] }
 rmcp = { version = "1.2.0", features = ["server", "macros", "transport-streamable-http-server", "elicitation"] }
 russh = { version = "0.56.0", default-features = false, features = ["ring"] }

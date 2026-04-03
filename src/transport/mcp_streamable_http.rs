@@ -299,11 +299,9 @@ pub fn router(
 
     let mcp_execution_service = execution_service.clone();
     let mcp_operator_console = operator_console.clone();
-    let mcp_config = StreamableHttpServerConfig {
-        stateful_mode: true,
-        json_response: false,
-        ..StreamableHttpServerConfig::default()
-    };
+    let mut mcp_config = StreamableHttpServerConfig::default();
+    mcp_config.stateful_mode = true;
+    mcp_config.json_response = false;
     let mcp_service: StreamableHttpService<HostBridgeMcpServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || {

@@ -1201,7 +1201,7 @@ dependencies = [
 
 [[package]]
 name = "host-bridge-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "crossterm",

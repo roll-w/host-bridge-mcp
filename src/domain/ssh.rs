@@ -202,17 +202,20 @@ impl SshWorkerClient {
     }
 
     async fn run(mut command_rx: mpsc::Receiver<WorkerCommand>) {
-        let worker = Self::new();
+        let worker = Arc::new(Self::new());
         while let Some(command) = command_rx.recv().await {
-            let result = worker
-                .execute_command(
-                    command.target,
-                    command.platform,
-                    command.request,
-                    command.event_tx.clone(),
-                )
-                .await;
-            let _ = command.event_tx.send(WorkerEvent::Finished(result)).await;
+            let worker = worker.clone();
+            tokio::task::spawn_local(async move {
+                let result = worker
+                    .execute_command(
+                        command.target,
+                        command.platform,
+                        command.request,
+                        command.event_tx.clone(),
+                    )
+                    .await;
+                let _ = command.event_tx.send(WorkerEvent::Finished(result)).await;
+            });
         }
     }
 
@@ -270,7 +273,8 @@ fn spawn_ssh_worker(command_rx: mpsc::Receiver<WorkerCommand>) {
                 .enable_all()
                 .build()
                 .expect("ssh worker runtime should initialize");
-            runtime.block_on(SshWorkerClient::run(command_rx));
+            let local_set = tokio::task::LocalSet::new();
+            runtime.block_on(local_set.run_until(SshWorkerClient::run(command_rx)));
         })
         .expect("ssh worker thread should start");
 }

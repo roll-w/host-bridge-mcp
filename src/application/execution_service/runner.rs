@@ -64,17 +64,28 @@ async fn run_host_execution(
     run: HostRunExecution,
     spawn_planner: SpawnPlanner,
 ) {
-    let spawn_plan = spawn_planner.build(&run.program, &run.args, &run.env, &run.working_directory);
-    let mut command = Command::new(&spawn_plan.program);
-    command
-        .args(&spawn_plan.args)
-        .current_dir(&run.working_directory)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    apply_spawn_plan(&mut command, &spawn_plan);
+    let mut command = if run.shell_wrapped {
+        let full_command_line = build_shell_command_line(&run.program, &run.args);
+        let mut cmd = build_shell_invocation(&full_command_line);
+        cmd.current_dir(&run.working_directory)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        cmd
+    } else {
+        let spawn_plan =
+            spawn_planner.build(&run.program, &run.args, &run.env, &run.working_directory);
+        let mut cmd = Command::new(&spawn_plan.program);
+        cmd.args(&spawn_plan.args)
+            .current_dir(&run.working_directory)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        apply_spawn_plan(&mut cmd, &spawn_plan);
+        cmd
+    };
 
     for (key, value) in &run.env {
         command.env(key, value);
@@ -395,4 +406,22 @@ fn log_execution_event(execution_id: Uuid, event: &ExecutionEvent) {
 
 fn short_id(execution_id: Uuid) -> String {
     execution_id.to_string().chars().take(8).collect()
+}
+
+fn build_shell_command_line(program: &str, args: &[String]) -> String {
+    let mut parts = vec![program.to_string()];
+    parts.extend(args.iter().cloned());
+    parts.join(" ")
+}
+
+fn build_shell_invocation(command_line: &str) -> Command {
+    if cfg!(windows) {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", command_line]);
+        cmd
+    } else {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", command_line]);
+        cmd
+    }
 }

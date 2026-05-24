@@ -30,11 +30,12 @@ pub(super) fn render(
     state: &mut TuiState,
     console: &OperatorConsole,
 ) {
+    let approval_height = approval_panel_height(snapshot);
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
-            Constraint::Length(10),
+            Constraint::Length(approval_height),
             Constraint::Min(8),
         ])
         .split(frame.area());
@@ -225,7 +226,22 @@ fn approval_detail_lines(approval: &PendingApprovalView) -> Vec<Line<'static>> {
         .working_directory
         .as_deref()
         .unwrap_or("<remote default>");
-    let mut lines = vec![
+    let mut lines = Vec::new();
+
+    if approval.request.contains_shell_operator {
+        lines.push(Line::from(Span::styled(
+            "SHELL COMMAND: contains shell operators (&&, |, ;, etc.)",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  This command will be executed through a system shell.",
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+
+    lines.extend([
         Line::from(format!("id         : {}", approval.id)),
         Line::from(format!("server     : {}", approval.request.server)),
         Line::from(format!("platform   : {}", approval.request.platform)),
@@ -235,7 +251,7 @@ fn approval_detail_lines(approval: &PendingApprovalView) -> Vec<Line<'static>> {
         Line::from(format!("workdir    : {}", working_directory)),
         Line::from(format!("timeoutMs  : {}", approval.request.timeout_ms)),
         Line::from(format!("createdAt  : {}", approval.created_at)),
-    ];
+    ]);
 
     if approval.request.env.is_empty() {
         lines.push(Line::from("env        : <none>"));
@@ -251,6 +267,35 @@ fn approval_detail_lines(approval: &PendingApprovalView) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+fn approval_panel_height(snapshot: &ConsoleSnapshot) -> u16 {
+    if snapshot.pending_approvals.is_empty() {
+        return 5;
+    }
+
+    let max_detail_lines = snapshot
+        .pending_approvals
+        .iter()
+        .map(|approval| {
+            let base = 10;
+            let shell_warning = if approval.request.contains_shell_operator {
+                2
+            } else {
+                0
+            };
+            let env_lines = if approval.request.env.is_empty() {
+                1
+            } else {
+                1 + approval.request.env.len()
+            };
+            base + shell_warning + env_lines
+        })
+        .max()
+        .unwrap_or(5);
+
+    // +2 for border
+    (max_detail_lines + 2).min(20) as u16
 }
 
 fn log_line(entry: &ConsoleLogEntry, selected: bool) -> Line<'static> {
@@ -321,6 +366,7 @@ mod tests {
                 command_line: "cargo build".to_string(),
                 executable: "cargo".to_string(),
                 args: vec!["build".to_string()],
+                contains_shell_operator: false,
                 working_directory: Some("/workspace".to_string()),
                 timeout_ms: 1_000,
                 env: HashMap::new(),

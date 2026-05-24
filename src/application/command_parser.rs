@@ -20,26 +20,27 @@ pub enum CommandParseError {
     Empty,
     #[error("unclosed quote in command")]
     UnclosedQuote,
-    #[error(
-        "command must contain exactly one command; shell operators like &&, ||, ;, and | are not allowed"
-    )]
-    MultipleCommandsNotAllowed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedCommand {
     pub program: String,
     pub args: Vec<String>,
+    pub contains_shell_operator: bool,
 }
 
 pub fn parse_command_line(input: &str) -> Result<ParsedCommand, CommandParseError> {
-    ensure_single_command(input)?;
+    let has_shell_operator = detect_shell_operators(input);
     let tokens = split_command_line(input)?;
     let mut iter = tokens.into_iter();
     let program = iter.next().ok_or(CommandParseError::Empty)?;
     let args = iter.collect::<Vec<_>>();
 
-    Ok(ParsedCommand { program, args })
+    Ok(ParsedCommand {
+        program,
+        args,
+        contains_shell_operator: has_shell_operator,
+    })
 }
 
 fn split_command_line(input: &str) -> Result<Vec<String>, CommandParseError> {
@@ -100,7 +101,7 @@ fn split_command_line(input: &str) -> Result<Vec<String>, CommandParseError> {
     Ok(tokens)
 }
 
-fn ensure_single_command(input: &str) -> Result<(), CommandParseError> {
+fn detect_shell_operators(input: &str) -> bool {
     let mut chars = input.chars().peekable();
     let mut in_single_quote = false;
     let mut in_double_quote = false;
@@ -127,20 +128,20 @@ fn ensure_single_command(input: &str) -> Result<(), CommandParseError> {
             continue;
         }
 
-        if ch == ';' || ch == '|' || ch == '\n' || ch == '\r' {
-            return Err(CommandParseError::MultipleCommandsNotAllowed);
-        }
-
         if in_single_quote || in_double_quote {
             continue;
         }
 
+        if ch == ';' || ch == '|' || ch == '\n' || ch == '\r' {
+            return true;
+        }
+
         if ch == '&' && matches!(chars.peek(), Some('&')) {
-            return Err(CommandParseError::MultipleCommandsNotAllowed);
+            return true;
         }
     }
 
-    Ok(())
+    false
 }
 
 #[cfg(test)]
@@ -169,10 +170,33 @@ mod tests {
     }
 
     #[test]
-    fn rejects_shell_chaining() {
-        let error =
-            parse_command_line("cargo build && cargo test").expect_err("should reject chaining");
-        assert_eq!(error, CommandParseError::MultipleCommandsNotAllowed);
+    fn detects_shell_chaining() {
+        let parsed =
+            parse_command_line("cargo build && cargo test").expect("should parse chained command");
+        assert!(parsed.contains_shell_operator);
+        assert_eq!(parsed.program, "cargo");
+    }
+
+    #[test]
+    fn detects_pipe_operator() {
+        let parsed =
+            parse_command_line("ls -la | grep foo").expect("should parse piped command");
+        assert!(parsed.contains_shell_operator);
+        assert_eq!(parsed.program, "ls");
+    }
+
+    #[test]
+    fn detects_semicolon_operator() {
+        let parsed =
+            parse_command_line("cd /tmp; ls").expect("should parse semicolon command");
+        assert!(parsed.contains_shell_operator);
+        assert_eq!(parsed.program, "cd");
+    }
+
+    #[test]
+    fn simple_command_has_no_shell_operator() {
+        let parsed = parse_command_line("cargo build --release").expect("should parse");
+        assert!(!parsed.contains_shell_operator);
     }
 
     #[test]
@@ -184,9 +208,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_newline_inside_quotes() {
-        let error = parse_command_line("python -c \"line1\nline2\"")
-            .expect_err("newline should be rejected even inside quotes");
-        assert_eq!(error, CommandParseError::MultipleCommandsNotAllowed);
+    fn newline_inside_quotes_not_detected_as_shell_operator() {
+        let parsed = parse_command_line("python -c \"line1\nline2\"")
+            .expect("newline inside quotes should be allowed");
+        assert!(!parsed.contains_shell_operator);
+    }
+
+    #[test]
+    fn newline_outside_quotes_detected_as_shell_operator() {
+        let parsed = parse_command_line("echo hello\necho world")
+            .expect("should parse");
+        assert!(parsed.contains_shell_operator);
     }
 }

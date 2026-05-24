@@ -56,7 +56,7 @@ pub struct HttpState {
 #[serde(rename_all = "camelCase")]
 struct ExecuteCommandToolArgs {
     #[schemars(
-        description = "Exactly one command line to execute. Shell chaining operators such as &&, ||, ;, and | are rejected."
+        description = "Exactly one command line to execute."
     )]
     command: String,
     #[serde(default)]

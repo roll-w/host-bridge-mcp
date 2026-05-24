@@ -309,6 +309,7 @@ mod tests {
             working_directory: Some("/workspace".to_string()),
             timeout_ms: 1_000,
             env: HashMap::new(),
+            contains_shell_operator: false,
         }
     }
 

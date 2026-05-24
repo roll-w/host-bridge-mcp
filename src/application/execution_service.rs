@@ -89,6 +89,7 @@ pub struct ConfirmationRequest {
     pub working_directory: Option<String>,
     pub timeout_ms: u64,
     pub env: HashMap<String, String>,
+    pub contains_shell_operator: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -175,6 +176,7 @@ enum RunExecutionBackend {
 struct HostRunExecution {
     program: String,
     args: Vec<String>,
+    shell_wrapped: bool,
     working_directory: PathBuf,
     env: HashMap<String, String>,
     timeout_ms: u64,
@@ -357,9 +359,20 @@ impl ExecutionService {
             .policy_engine
             .evaluate(&parsed.program, &parsed.args);
 
-        if policy.decision == PolicyDecision::Deny {
+        if policy.decision == PolicyDecision::Deny && !parsed.contains_shell_operator {
             tracing::warn!(command = %input.command, "Policy denied command");
             return Err(ExecutionError::Denied);
+        }
+
+        let requires_confirmation = parsed.contains_shell_operator
+            || policy.decision == PolicyDecision::RequireConfirmation
+            || policy.decision == PolicyDecision::Deny;
+
+        if parsed.contains_shell_operator {
+            tracing::info!(
+                command = %input.command,
+                "Command contains shell operators, requiring confirmation"
+            );
         }
 
         let target = runtime.resolve_target(input.server.as_deref())?;
@@ -382,6 +395,7 @@ impl ExecutionService {
                     RunExecutionBackend::Host(HostRunExecution {
                         program: executable.clone(),
                         args: args.clone(),
+                        shell_wrapped: parsed.contains_shell_operator,
                         working_directory: working_directory.clone(),
                         env: input.env.clone(),
                         timeout_ms,
@@ -413,7 +427,7 @@ impl ExecutionService {
         };
 
         let confirmation_request =
-            (policy.decision == PolicyDecision::RequireConfirmation).then(|| ConfirmationRequest {
+            requires_confirmation.then(|| ConfirmationRequest {
                 server: target.name.clone(),
                 platform: target.target_platform.as_name().to_string(),
                 command_line: input.command.clone(),
@@ -422,6 +436,7 @@ impl ExecutionService {
                 working_directory: preview_working_directory.clone(),
                 timeout_ms,
                 env: input.env.clone(),
+                contains_shell_operator: parsed.contains_shell_operator,
             });
 
         Ok(PreparedExecution {

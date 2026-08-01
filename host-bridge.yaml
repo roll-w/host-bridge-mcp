@@ -18,7 +18,7 @@ logging:
   # When omitted and persist-file = true, the server writes under its host-bridge data directory.
   # file-path: /absolute/path/to/host-bridge-mcp.log
 
-  persist-file: false
+  persist-file: true
 
 execution:
   # Merged execution output files are stored under the host-bridge data directory as executions/<executionId>.log.
@@ -45,24 +45,24 @@ execution:
   # host: local execution inside the current machine.
   # ssh: remote execution over SSH using the built-in SSH library backend.
   servers:
-    - name: build-linux
+    - name: lab
       transport: ssh
-      host: build-linux.internal
-      user: dev
-      port: 22
+      host: build.example.com
+      user: lab
+      port: 2165
       target-platform: linux
-      auth:
-        type: identity-file
-        ref: /home/dev/.ssh/id_ed25519
+      #      auth:
+      #        type: identity-file
+      #        ref: /home/dev/.ssh/id_ed25519
       # auth:
       #   type: password-env
       #   ref: BUILD_LINUX_SSH_PASSWORD
-      # auth:
-      #   type: password-file
-      #   ref: /run/secrets/build-linux-password
+      auth:
+        type: password-file
+        ref: password.tmp
       connection-idle-timeout-ms: 300000
       # Omit known-hosts-file to disable strict host verification.
-      known-hosts-file: /home/dev/.ssh/known_hosts
+      # known-hosts-file: /home/dev/.ssh/known_hosts
       path-mappings:
         - from: /workspace
           to: /srv/workspace
@@ -71,7 +71,7 @@ execution:
   # Group each command with its default action and optional subcommand overrides.
   commands:
     - command: java
-      action: confirm
+      action: allow
 
     - command: mvn
       action: allow

@@ -38,7 +38,7 @@ pub struct PolicyEngine {
 
 #[derive(Debug, Clone)]
 struct CompiledExecutionRule {
-    command: String,
+    command_pattern: String,
     args_prefix: Vec<String>,
     action: PolicyAction,
     default_working_directory: Option<String>,
@@ -67,9 +67,18 @@ impl PolicyEngine {
             .rules
             .iter()
             .filter(|rule| {
-                rule.command == key && prefix_match(&rule.args_prefix, &normalized_arguments)
+                command_pattern_matches(&rule.command_pattern, &key)
+                    && prefix_match(&rule.args_prefix, &normalized_arguments)
             })
-            .max_by_key(|rule| (rule.args_prefix.len(), rule.order));
+            .max_by_key(|rule| {
+                let (is_exact, literal_count) = command_pattern_specificity(&rule.command_pattern);
+                (
+                    is_exact,
+                    literal_count,
+                    rule.args_prefix.len(),
+                    rule.order,
+                )
+            });
 
         let action = matching_rule
             .map(|rule| rule.action)
@@ -98,7 +107,7 @@ fn compile_command_policies(commands: &[CommandPolicyConfig]) -> Vec<CompiledExe
 
     for command_policy in commands {
         compiled_rules.push(CompiledExecutionRule {
-            command: normalize_command(&command_policy.command),
+            command_pattern: normalize_command(&command_policy.command),
             args_prefix: Vec::new(),
             action: command_policy.action,
             default_working_directory: command_policy.default_working_directory.clone(),
@@ -121,7 +130,7 @@ fn compile_nested_rule(
     rule: &CommandRuleConfig,
 ) -> CompiledExecutionRule {
     CompiledExecutionRule {
-        command: normalize_command(&command_policy.command),
+        command_pattern: normalize_command(&command_policy.command),
         args_prefix: rule
             .args_prefix
             .iter()
@@ -134,6 +143,47 @@ fn compile_nested_rule(
             .or_else(|| command_policy.default_working_directory.clone()),
         order,
     }
+}
+
+fn command_pattern_matches(pattern: &str, command: &str) -> bool {
+    let pattern_tokens = pattern.chars().collect::<Vec<_>>();
+    let command_tokens = command.chars().collect::<Vec<_>>();
+    let mut pattern_index = 0;
+    let mut command_index = 0;
+    let mut wildcard_index = None;
+    let mut wildcard_match_index = 0;
+
+    while command_index < command_tokens.len() {
+        if pattern_index < pattern_tokens.len()
+            && pattern_tokens[pattern_index] == command_tokens[command_index]
+        {
+            pattern_index += 1;
+            command_index += 1;
+        } else if pattern_index < pattern_tokens.len() && pattern_tokens[pattern_index] == '*'
+        {
+            wildcard_index = Some(pattern_index);
+            wildcard_match_index = command_index;
+            pattern_index += 1;
+        } else if let Some(index) = wildcard_index {
+            pattern_index = index + 1;
+            wildcard_match_index += 1;
+            command_index = wildcard_match_index;
+        } else {
+            return false;
+        }
+    }
+
+    while pattern_index < pattern_tokens.len() && pattern_tokens[pattern_index] == '*' {
+        pattern_index += 1;
+    }
+
+    pattern_index == pattern_tokens.len()
+}
+
+fn command_pattern_specificity(pattern: &str) -> (bool, usize) {
+    let is_exact = !pattern.contains('*');
+    let literal_count = pattern.chars().filter(|character| *character != '*').count();
+    (is_exact, literal_count)
 }
 
 fn normalize_subcommand_token(value: &str) -> String {
@@ -331,6 +381,92 @@ mod tests {
         assert_eq!(
             publish_result.default_working_directory,
             Some("/workspace/frontend".to_string())
+        );
+    }
+
+    #[test]
+    fn wildcard_command_policy_matches_multiple_commands() {
+        let config = test_config(ExecutionConfig {
+            default_action: PolicyAction::Deny,
+            commands: vec![CommandPolicyConfig {
+                command: "*".to_string(),
+                action: PolicyAction::Allow,
+                default_working_directory: None,
+                rules: Vec::new(),
+            }],
+            ..ExecutionConfig::default()
+        });
+        let engine = PolicyEngine::new(config);
+
+        assert_eq!(
+            engine.evaluate("ls", &[]).decision,
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            engine.evaluate("mkdir", &["-p".to_string(), "workspace".to_string()])
+                .decision,
+            PolicyDecision::Allow
+        );
+    }
+
+    #[test]
+    fn exact_command_policy_overrides_wildcard_command_policy() {
+        let config = test_config(ExecutionConfig {
+            default_action: PolicyAction::Deny,
+            commands: vec![
+                CommandPolicyConfig {
+                    command: "rm".to_string(),
+                    action: PolicyAction::Deny,
+                    default_working_directory: None,
+                    rules: Vec::new(),
+                },
+                CommandPolicyConfig {
+                    command: "*".to_string(),
+                    action: PolicyAction::Allow,
+                    default_working_directory: None,
+                    rules: Vec::new(),
+                },
+            ],
+            ..ExecutionConfig::default()
+        });
+        let engine = PolicyEngine::new(config);
+
+        assert_eq!(
+            engine.evaluate("rm", &["-rf".to_string(), "workspace".to_string()])
+                .decision,
+            PolicyDecision::Deny
+        );
+        assert_eq!(
+            engine.evaluate("ls", &[]).decision,
+            PolicyDecision::Allow
+        );
+    }
+
+    #[test]
+    fn wildcard_command_pattern_matches_only_matching_names() {
+        let config = test_config(ExecutionConfig {
+            default_action: PolicyAction::Deny,
+            commands: vec![CommandPolicyConfig {
+                command: "mk*".to_string(),
+                action: PolicyAction::Allow,
+                default_working_directory: None,
+                rules: Vec::new(),
+            }],
+            ..ExecutionConfig::default()
+        });
+        let engine = PolicyEngine::new(config);
+
+        assert_eq!(
+            engine.evaluate("mkdir", &[]).decision,
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            engine.evaluate("mktemp", &[]).decision,
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            engine.evaluate("ls", &[]).decision,
+            PolicyDecision::Deny
         );
     }
 }

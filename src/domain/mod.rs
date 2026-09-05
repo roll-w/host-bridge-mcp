@@ -15,7 +15,6 @@
  */
 
 pub mod execution_target;
-pub mod path_mapping;
 pub mod platform;
 pub mod policy;
 pub mod ssh;

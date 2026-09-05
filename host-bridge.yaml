@@ -2,22 +2,22 @@
 #
 # This file is safe for a local development start:
 # - the HTTP server binds to loopback
-# - command execution requires TUI confirmation by default
-# - only the implicit local `host` execution target is enabled
+# - normal commands require approval from the local TUI
+# - only the local `host` execution target is enabled
 #
 # Configuration lookup order:
 # 1. --config <PATH>
 # 2. HOST_BRIDGE_CONFIG
-# 3. host-bridge.yaml in the current working directory
+# 3. host-bridge.yaml in the current directory
 #
-# Uncomment and adapt optional sections only after reviewing their security impact.
+# YAML note: quote a standalone wildcard, for example `command: "*"`.
 
 server:
   # HTTP bind address. Keep this on loopback unless the network is trusted.
   address: 127.0.0.1:8787
 
-  # Optional fixed bearer-token authentication for /mcp and execution streams.
-  # The value is the name of an environment variable, not the secret itself.
+  # Optional bearer-token authentication for /mcp and execution streams.
+  # The value is an environment variable name, not the secret itself.
   # access:
   #   api-key-env: HOST_BRIDGE_API_KEY
 
@@ -25,107 +25,77 @@ logging:
   # Number of recent log lines kept in memory for fast TUI access.
   memory-buffer-lines: 2000
 
-  # Keep the current log file after shutdown. Set to true for persistent logs.
-  # Existing persistent logs are archived on startup before a new current log is opened.
+  # Keep the current log file after shutdown.
   persist-file: false
 
-  # Optional explicit backing log file.
-  # When omitted, logs are stored below the host-bridge data directory.
+  # Optional explicit backing log file. If omitted, logs live under the
+  # host-bridge data directory.
   # file-path: /absolute/path/to/host-bridge-mcp.log
 
 execution:
-  # Fallback action when no command policy matches.
-  # allow   = execute a normal command without approval
-  # confirm = require approval from the local TUI operator
-  # deny    = reject a normal request
+  # Fallback for commands without a matching command policy.
+  # allow   = run a normal command without approval
+  # confirm = wait for approval in the local TUI
+  # deny    = reject a normal command
   default-action: confirm
 
-  # Default command timeout in milliseconds: 30 minutes.
-  default-timeout-ms: 1800000
-
-  # Maximum timeout accepted from an execute_command request: 2 hours.
-  max-timeout-ms: 7200000
-
-  # The implicit local execution target is always named `host`.
+  # The local execution target is always named `host`.
   default-server: host
 
-  # Target platform for the implicit local `host` target.
-  # Supported values: auto, windows, linux, macos.
+  # Platform used by the local target. Supported values: auto, windows,
+  # linux, macos.
   target-platform: auto
 
+  # Default timeout for execute_command requests: 30 minutes.
+  default-timeout-ms: 1800000
+
+  # Maximum request timeout: 2 hours.
+  max-timeout-ms: 7200000
+
   # Optional working directory used when a request does not provide one.
+  # Use a path that exists on the selected target.
   # default-working-directory: /path/to/workspace
 
-  # Optional command policy overrides.
-  # The global default above remains `confirm` for every command not listed here.
+  # Optional command policies. The command value supports `*`, matching zero
+  # or more characters. Exact command policies take precedence over wildcard
+  # policies. Review a catch-all `allow` policy carefully.
   # commands:
+  #   - command: "*"
+  #     action: allow
+  #   - command: rm
+  #     action: deny
+  #   - command: "sudo*"
+  #     action: confirm
   #   - command: cargo
   #     action: allow
   #     rules:
   #       - args-prefix:
   #           - publish
   #         action: confirm
-  #
-  #   - command: npm
-  #     action: allow
-  #     rules:
-  #       - args-prefix:
-  #           - publish
-  #         action: deny
-  #
-  #   - command: mvn
-  #     action: allow
-  #     rules:
-  #       - args-prefix:
-  #           - deploy
-  #         action: deny
 
-  # Optional named execution targets.
-  # The local `host` target above is always available without an entry here.
+  # Optional named SSH execution targets.
+  # An SSH target must specify target-platform explicitly.
   # servers:
-  #   - name: build-linux
-  #     transport: ssh
+  #   - transport: ssh
+  #     name: build-linux
   #     host: build.example.com
   #     port: 22
-  #     user: build-user
+  #     user: builder
   #     target-platform: linux
-  #
-  #     # Choose exactly one authentication block.
-  #     # Supported types: agent, identity-file, password-env, password-file.
-  #     # `ref` is required for every type except `agent`.
   #     auth:
   #       type: agent
-  #     # identity-file example:
+  #
+  #     # Recommended: keep strict SSH host-key verification enabled.
+  #     known-hosts-file: /home/builder/.ssh/known_hosts
+  #     connection-idle-timeout-ms: 300000
+  #
+  #     # Other authentication forms:
   #     # auth:
   #     #   type: identity-file
   #     #   ref: /path/to/private/key
-  #     # password-env example:
   #     # auth:
   #     #   type: password-env
   #     #   ref: BUILD_SSH_PASSWORD
-  #     # password-file example:
   #     # auth:
   #     #   type: password-file
   #     #   ref: /path/to/password-file
-  #
-  #     # Set this to keep strict SSH host key verification enabled.
-  #     known-hosts-file: /path/to/known_hosts
-  #     connection-idle-timeout-ms: 300000
-  #
-  #     # Optional mappings for this target.
-  #     path-mappings:
-  #       - from: /client/workspace
-  #         to: /remote/workspace
-
-  # Optional prefix-based path mappings for the implicit local `host` target.
-  # Rules are checked in order; the first applicable match wins.
-  # Mappings can apply to executable paths, path-like arguments, and working directories.
-  # path-mappings:
-  #   - from: /client/workspace
-  #     to: /host/workspace
-  #
-  #   - from: /workspace/mnt/d
-  #     to: "D:\\"
-  #     platforms:
-  #       - windows
-  #       - wsl

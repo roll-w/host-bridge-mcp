@@ -18,11 +18,11 @@ use crate::application::operator_console::{
     ConsoleLogEntry, ConsoleLogLevel, ConsoleSnapshot, OperatorConsole, PendingApprovalView,
 };
 use crate::transport::tui::state::TuiState;
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
-use ratatui::Frame;
 
 pub(super) fn render(
     frame: &mut Frame,
@@ -103,7 +103,7 @@ fn render_status_bar(frame: &mut Frame, area: Rect, snapshot: &ConsoleSnapshot) 
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::raw(
-            "  |  Up/Down select  Left/Right x-scroll  a approve  r reject  Wheel/PgUp/PgDn logs  Home/End head-tail  q shutdown",
+            "  |  Up/Down select  Left/Right x-scroll  a approve once  s approve same request for session  r reject  Wheel/PgUp/PgDn logs  Home/End head-tail  q shutdown",
         ),
     ]);
     frame.render_widget(Paragraph::new(text).style(style), area);

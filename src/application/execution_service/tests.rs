@@ -17,7 +17,7 @@
 use super::*;
 use crate::config::{
     CommandPolicyConfig, CommandRuleConfig, ExecutionConfig, ExecutionServerConfig,
-    PathMappingRule, PolicyAction, SshAuthConfig, SshAuthType, TargetPlatform,
+    PolicyAction, SshAuthConfig, SshAuthType, TargetPlatform,
 };
 use crate::domain::execution_target::SshAuthTarget;
 
@@ -86,6 +86,81 @@ async fn prepare_command_marks_confirmation_when_policy_requires_it() {
 }
 
 #[tokio::test]
+async fn prepare_command_applies_wildcard_policy_and_exact_deny() {
+    let config = test_config(ExecutionConfig {
+        default_action: PolicyAction::Deny,
+        commands: vec![
+            CommandPolicyConfig {
+                command: "rm".to_string(),
+                action: PolicyAction::Deny,
+                default_working_directory: None,
+                rules: Vec::new(),
+            },
+            CommandPolicyConfig {
+                command: "*".to_string(),
+                action: PolicyAction::Allow,
+                default_working_directory: None,
+                rules: Vec::new(),
+            },
+        ],
+        ..ExecutionConfig::default()
+    });
+    let service = ExecutionService::new(config);
+
+    let prepared = service
+        .prepare_command(ExecuteCommandInput {
+            command: "ls".to_string(),
+            server: None,
+            working_directory: None,
+            env: HashMap::new(),
+            timeout_ms: None,
+        })
+        .await
+        .expect("wildcard allow policy should prepare ls");
+    assert!(prepared.confirmation_request().is_none());
+
+    let error = service
+        .prepare_command(ExecuteCommandInput {
+            command: "rm -rf workspace".to_string(),
+            server: None,
+            working_directory: None,
+            env: HashMap::new(),
+            timeout_ms: None,
+        })
+        .await
+        .expect_err("exact deny policy should reject rm");
+    assert!(matches!(error, ExecutionError::Denied));
+}
+
+#[tokio::test]
+async fn prepare_command_does_not_allow_shell_operator_to_override_policy_deny() {
+    let config = test_config(ExecutionConfig {
+        default_action: PolicyAction::Deny,
+        commands: vec![CommandPolicyConfig {
+            command: "rm".to_string(),
+            action: PolicyAction::Deny,
+            default_working_directory: None,
+            rules: Vec::new(),
+        }],
+        ..ExecutionConfig::default()
+    });
+    let service = ExecutionService::new(config);
+
+    let error = service
+        .prepare_command(ExecuteCommandInput {
+            command: "rm -rf workspace && echo done".to_string(),
+            server: None,
+            working_directory: None,
+            env: HashMap::new(),
+            timeout_ms: None,
+        })
+        .await
+        .expect_err("policy deny should reject a shell command");
+
+    assert!(matches!(error, ExecutionError::Denied));
+}
+
+#[tokio::test]
 async fn prepare_command_rejects_unknown_server() {
     let service = ExecutionService::new(test_config(ExecutionConfig {
         default_action: PolicyAction::Allow,
@@ -116,11 +191,6 @@ async fn prepare_command_builds_ssh_invocation_for_remote_server() {
             port: 2222,
             user: "deploy".to_string(),
             target_platform: TargetPlatform::Linux,
-            path_mappings: vec![PathMappingRule {
-                from: "/workspace".to_string(),
-                to: "/srv/workspace".to_string(),
-                platforms: Vec::new(),
-            }],
             auth: SshAuthConfig {
                 kind: SshAuthType::PasswordEnv,
                 r#ref: Some("SSH_PASSWORD".to_string()),
@@ -149,7 +219,7 @@ async fn prepare_command_builds_ssh_invocation_for_remote_server() {
     assert_eq!(confirmation.platform, "linux");
     assert_eq!(
         confirmation.working_directory.as_deref(),
-        Some("/srv/workspace/app")
+        Some("/workspace/app")
     );
     match &prepared.run.backend {
         RunExecutionBackend::Ssh(remote_run) => {
@@ -166,7 +236,7 @@ async fn prepare_command_builds_ssh_invocation_for_remote_server() {
             }
             assert_eq!(
                 remote_run.request.working_directory.as_deref(),
-                Some("/srv/workspace/app")
+                Some("/workspace/app")
             );
             assert_eq!(remote_run.request.executable, "cargo");
             assert_eq!(remote_run.request.args, vec!["build".to_string()]);

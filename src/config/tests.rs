@@ -25,6 +25,26 @@ fn default_config_is_valid() {
 }
 
 #[test]
+fn load_wildcard_command_policy() {
+    let path = write_temp_config(
+        r#"server:
+  address: 127.0.0.1:8787
+execution:
+  default-action: deny
+  commands:
+    - command: "*"
+      action: allow
+"#,
+    );
+
+    let config = AppConfig::load_from_resolved_path(&resolved_temp_config(&path))
+        .expect("wildcard command policy should load");
+
+    assert_eq!(config.execution.commands[0].command, "*");
+    let _ = fs::remove_file(path);
+}
+
+#[test]
 fn reject_command_policy_with_empty_command() {
     let config = AppConfig {
         execution: ExecutionConfig {
@@ -135,7 +155,6 @@ fn reject_default_server_when_missing_from_configured_servers() {
                 port: 22,
                 user: "deploy".to_string(),
                 target_platform: TargetPlatform::Linux,
-                path_mappings: Vec::new(),
                 auth: SshAuthConfig::default(),
                 known_hosts_file: None,
                 connection_idle_timeout_ms: 30_000,
@@ -161,12 +180,10 @@ fn reject_duplicate_server_names() {
                 ExecutionServerConfig::Host {
                     name: "build".to_string(),
                     target_platform: TargetPlatform::Auto,
-                    path_mappings: Vec::new(),
                 },
                 ExecutionServerConfig::Host {
                     name: "build".to_string(),
                     target_platform: TargetPlatform::Auto,
-                    path_mappings: Vec::new(),
                 },
             ],
             ..ExecutionConfig::default()
@@ -188,7 +205,6 @@ fn reject_ssh_server_with_auto_target_platform() {
                 port: 22,
                 user: "deploy".to_string(),
                 target_platform: TargetPlatform::Auto,
-                path_mappings: Vec::new(),
                 auth: SshAuthConfig::default(),
                 known_hosts_file: None,
                 connection_idle_timeout_ms: 30_000,
@@ -216,7 +232,6 @@ fn reject_ssh_server_named_host() {
                 port: 22,
                 user: "deploy".to_string(),
                 target_platform: TargetPlatform::Linux,
-                path_mappings: Vec::new(),
                 auth: SshAuthConfig::default(),
                 known_hosts_file: None,
                 connection_idle_timeout_ms: 30_000,
@@ -240,7 +255,6 @@ fn reject_missing_auth_ref_for_password_file() {
                 port: 22,
                 user: "deploy".to_string(),
                 target_platform: TargetPlatform::Linux,
-                path_mappings: Vec::new(),
                 auth: SshAuthConfig {
                     kind: SshAuthType::PasswordFile,
                     r#ref: None,
@@ -267,7 +281,6 @@ fn reject_auth_ref_for_agent_auth() {
                 port: 22,
                 user: "deploy".to_string(),
                 target_platform: TargetPlatform::Linux,
-                path_mappings: Vec::new(),
                 auth: SshAuthConfig {
                     kind: SshAuthType::Agent,
                     r#ref: Some("unexpected".to_string()),
@@ -298,7 +311,6 @@ fn reject_zero_ssh_connection_idle_timeout() {
                 port: 22,
                 user: "deploy".to_string(),
                 target_platform: TargetPlatform::Linux,
-                path_mappings: Vec::new(),
                 auth: SshAuthConfig::default(),
                 known_hosts_file: None,
                 connection_idle_timeout_ms: 0,

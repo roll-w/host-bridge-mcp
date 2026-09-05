@@ -24,19 +24,19 @@ use self::streaming::{health, stream_execution};
 use self::tooling::execute_command_tool;
 use crate::application::execution_service::ExecutionService;
 use crate::application::operator_console::OperatorConsole;
+use axum::Router;
 use axum::middleware;
 use axum::routing::get;
-use axum::Router;
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{
     CallToolResult, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
     SetLevelRequestParams,
 };
 use rmcp::service::{RequestContext, RoleServer};
-use rmcp::transport::streamable_http_server::{
-    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService,
+                                              session::local::LocalSessionManager,
 };
-use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
+use rmcp::{ErrorData as McpError, ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
@@ -56,7 +56,7 @@ pub struct HttpState {
 #[serde(rename_all = "camelCase")]
 struct ExecuteCommandToolArgs {
     #[schemars(
-        description = "Exactly one command line to execute."
+        description = "Exactly one command line to execute. Shell operators such as &&, ||, ;, |, and redirections enter the local TUI approval flow."
     )]
     command: String,
     #[serde(default)]
@@ -66,7 +66,7 @@ struct ExecuteCommandToolArgs {
     server: Option<String>,
     #[serde(default)]
     #[schemars(
-        description = "Optional working directory for the child process. If omitted, the server uses the current directory or a policy default after path mapping."
+        description = "Optional working directory for the child process. If omitted, the server uses the current directory or a policy default."
     )]
     working_directory: Option<String>,
     #[serde(default)]
@@ -114,7 +114,7 @@ impl HostBridgeMcpServer {
     }
 
     #[tool(
-        description = "Execute exactly one command in the selected execution server without shell chaining. If approval is required, the call stays pending until the TUI operator approves or rejects it."
+        description = "Execute exactly one command line in the selected execution server. Shell operators such as &&, ||, ;, |, and redirections enter the local TUI approval flow. If approval is required, the call stays pending until the TUI operator approves or rejects it."
     )]
     async fn execute_command(
         &self,
@@ -169,7 +169,7 @@ fn server_implementation() -> Implementation {
 #[cfg(test)]
 mod tests {
     use super::HostBridgeMcpServer;
-    use super::{server_implementation, ExecuteCommandToolArgs};
+    use super::{ExecuteCommandToolArgs, server_implementation};
     use crate::application::execution_service::ExecutionService;
     use crate::application::operator_console::OperatorConsole;
     use crate::config::{
@@ -219,7 +219,9 @@ mod tests {
         let schema_json = serde_json::to_string(&schema).expect("schema should serialize");
 
         assert!(
-            schema_json.contains("Shell chaining operators such as &&, ||, ;, and | are rejected.")
+            schema_json.contains(
+                "Shell operators such as &&, ||, ;, |, and redirections enter the local TUI approval flow."
+            )
         );
         assert!(schema_json.contains("Use 0 to disable the character cap."));
         assert!(schema_json.contains("merged command output"));
@@ -245,7 +247,6 @@ mod tests {
                         port: 22,
                         user: "deploy".to_string(),
                         target_platform: TargetPlatform::Linux,
-                        path_mappings: Vec::new(),
                         auth: SshAuthConfig {
                             kind: SshAuthType::Agent,
                             r#ref: None,

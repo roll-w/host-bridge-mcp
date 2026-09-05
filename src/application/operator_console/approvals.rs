@@ -19,10 +19,61 @@ use crate::application::operator_console::OperatorConsole;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct SessionApprovalKey {
+    session_id: String,
+    scope: ExecutionApprovalScope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ExecutionApprovalScope {
+    // This scope covers execution semantics; per-request limits and output rendering are separate.
+    server: String,
+    platform: String,
+    command_line: String,
+    executable: String,
+    args: Vec<String>,
+    working_directory: Option<String>,
+    env: Vec<(String, String)>,
+    contains_shell_operator: bool,
+}
+
+impl ExecutionApprovalScope {
+    fn from_request(request: &ConfirmationRequest) -> Self {
+        let mut env = request
+            .env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        env.sort();
+
+        Self {
+            server: request.server.clone(),
+            platform: request.platform.clone(),
+            command_line: request.command_line.clone(),
+            executable: request.executable.clone(),
+            args: request.args.clone(),
+            working_directory: request.working_directory.clone(),
+            env,
+            contains_shell_operator: request.contains_shell_operator,
+        }
+    }
+}
+
+impl SessionApprovalKey {
+    pub(super) fn new(session_id: &str, request: &ConfirmationRequest) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            scope: ExecutionApprovalScope::from_request(request),
+        }
+    }
+}
+
 pub(super) struct PendingApproval {
     pub(super) id: Uuid,
     pub(super) request: ConfirmationRequest,
     pub(super) created_at: String,
+    session_approval_key: Option<SessionApprovalKey>,
     responder: Option<oneshot::Sender<bool>>,
 }
 
@@ -37,13 +88,19 @@ impl PendingApproval {
         id: Uuid,
         request: ConfirmationRequest,
         responder: oneshot::Sender<bool>,
+        session_approval_key: Option<SessionApprovalKey>,
     ) -> Self {
         Self {
             id,
             request,
             created_at: super::current_console_timestamp(),
+            session_approval_key,
             responder: Some(responder),
         }
+    }
+
+    pub(super) fn session_approval_key(&self) -> Option<&SessionApprovalKey> {
+        self.session_approval_key.as_ref()
     }
 
     pub(super) fn deliver(&mut self, approved: bool) {

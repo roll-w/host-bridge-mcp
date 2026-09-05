@@ -26,7 +26,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 const CONFIG_RELOAD_FALLBACK_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -68,9 +68,9 @@ struct PreparedExecutionReload {
     execution_runtime: Arc<ExecutionRuntimeConfig>,
 }
 
-struct PreparedLoggingReload {
+struct PreparedConsoleReload {
     operator_console: OperatorConsole,
-    logging_reconfigure: PreparedLoggingReconfigure,
+    logging_reconfigure: Option<PreparedLoggingReconfigure>,
 }
 
 struct ConfigReloadState {
@@ -370,18 +370,14 @@ impl ConfigReloadParticipant for OperatorConsole {
         config: &AppConfig,
         applied_logging: &LoggingConfig,
     ) -> Result<Option<Box<dyn PreparedConfigReloadAction>>, ReloadPrepareError> {
-        if &config.logging == applied_logging {
-            return Ok(None);
-        }
-
-        let Some(logging_reconfigure) = self
-            .prepare_logging_reconfigure(config.logging.clone())
-            .map_err(ReloadPrepareError::Logging)?
-        else {
-            return Ok(None);
+        let logging_reconfigure = if &config.logging == applied_logging {
+            None
+        } else {
+            self.prepare_logging_reconfigure(config.logging.clone())
+                .map_err(ReloadPrepareError::Logging)?
         };
 
-        Ok(Some(Box::new(PreparedLoggingReload {
+        Ok(Some(Box::new(PreparedConsoleReload {
             operator_console: self.clone(),
             logging_reconfigure,
         })))
@@ -408,13 +404,16 @@ impl PreparedConfigReloadAction for PreparedExecutionReload {
     }
 }
 
-impl PreparedConfigReloadAction for PreparedLoggingReload {
+impl PreparedConfigReloadAction for PreparedConsoleReload {
     fn apply(self: Box<Self>) {
         let Self {
             operator_console,
             logging_reconfigure,
         } = *self;
-        operator_console.apply_logging_reconfigure(logging_reconfigure);
+        operator_console.clear_session_approvals();
+        if let Some(logging_reconfigure) = logging_reconfigure {
+            operator_console.apply_logging_reconfigure(logging_reconfigure);
+        }
     }
 }
 
@@ -677,6 +676,14 @@ execution:
             .expect("updated config should be written");
 
         state.reload_if_needed(&resolved_path, &reload_context);
+
+        let launch_result = service
+            .launch_prepared_command(initial_prepare)
+            .await;
+        assert!(matches!(
+            launch_result,
+            Err(ExecutionError::ConfigurationChanged)
+        ));
 
         let result = service
             .prepare_command(ExecuteCommandInput {

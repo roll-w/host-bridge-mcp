@@ -15,7 +15,6 @@
  */
 
 use crate::config::TargetPlatform;
-use std::fs;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimePlatform {
@@ -54,16 +53,5 @@ pub fn resolve_target_platform(target: TargetPlatform) -> RuntimePlatform {
         TargetPlatform::Windows => RuntimePlatform::Windows,
         TargetPlatform::Linux => RuntimePlatform::Linux,
         TargetPlatform::Macos => RuntimePlatform::Macos,
-    }
-}
-
-pub fn current_is_wsl() -> bool {
-    if RuntimePlatform::current() != RuntimePlatform::Linux {
-        return false;
-    }
-
-    match fs::read_to_string("/proc/sys/kernel/osrelease") {
-        Ok(value) => value.to_ascii_lowercase().contains("microsoft"),
-        Err(_) => false,
     }
 }

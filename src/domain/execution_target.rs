@@ -15,8 +15,7 @@
  */
 
 use crate::config::{ExecutionConfig, ExecutionServerConfig, SshAuthConfig, SshAuthType};
-use crate::domain::path_mapping::PathMapper;
-use crate::domain::platform::runtime::{resolve_target_platform, RuntimePlatform};
+use crate::domain::platform::runtime::{RuntimePlatform, resolve_target_platform};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -33,7 +32,6 @@ pub struct ExecutionTarget {
     pub name: String,
     pub transport: ExecutionTransport,
     pub target_platform: RuntimePlatform,
-    pub path_mapper: PathMapper,
 }
 
 #[derive(Debug, Clone)]
@@ -113,7 +111,6 @@ fn implicit_host_target(execution: &ExecutionConfig) -> ExecutionTarget {
         name: HOST_TARGET_NAME.to_string(),
         transport: ExecutionTransport::Host,
         target_platform: resolve_target_platform(execution.target_platform),
-        path_mapper: PathMapper::new(execution.path_mappings.clone(), execution.target_platform),
     }
 }
 
@@ -122,12 +119,10 @@ fn build_target(server: &ExecutionServerConfig) -> ExecutionTarget {
         ExecutionServerConfig::Host {
             name,
             target_platform,
-            path_mappings,
         } => ExecutionTarget {
             name: name.clone(),
             transport: ExecutionTransport::Host,
             target_platform: resolve_target_platform(*target_platform),
-            path_mapper: PathMapper::new(path_mappings.clone(), *target_platform),
         },
         ExecutionServerConfig::Ssh {
             name,
@@ -135,7 +130,6 @@ fn build_target(server: &ExecutionServerConfig) -> ExecutionTarget {
             port,
             user,
             target_platform,
-            path_mappings,
             auth,
             known_hosts_file,
             connection_idle_timeout_ms,
@@ -150,7 +144,6 @@ fn build_target(server: &ExecutionServerConfig) -> ExecutionTarget {
                 connection_idle_timeout: Duration::from_millis(*connection_idle_timeout_ms),
             }),
             target_platform: resolve_target_platform(*target_platform),
-            path_mapper: PathMapper::new(path_mappings.clone(), *target_platform),
         },
     }
 }
@@ -173,7 +166,7 @@ fn build_ssh_auth_target(auth: &SshAuthConfig) -> SshAuthTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ExecutionServerConfig, PathMappingRule, TargetPlatform};
+    use crate::config::{ExecutionServerConfig, TargetPlatform};
 
     #[test]
     fn registry_includes_implicit_host_target() {
@@ -195,11 +188,6 @@ mod tests {
             servers: vec![ExecutionServerConfig::Host {
                 name: "host".to_string(),
                 target_platform: TargetPlatform::Windows,
-                path_mappings: vec![PathMappingRule {
-                    from: "/workspace/mnt/d".to_string(),
-                    to: "D:\\".to_string(),
-                    platforms: Vec::new(),
-                }],
             }],
             ..ExecutionConfig::default()
         });
@@ -208,10 +196,6 @@ mod tests {
             .resolve(Some("host"))
             .expect("host target should exist");
         assert_eq!(target.target_platform, RuntimePlatform::Windows);
-        assert_eq!(
-            target.path_mapper.map_path("/workspace/mnt/d/repo"),
-            "D:\\repo"
-        );
     }
 
     #[test]
@@ -224,7 +208,6 @@ mod tests {
                 port: 22,
                 user: "deploy".to_string(),
                 target_platform: TargetPlatform::Linux,
-                path_mappings: Vec::new(),
                 auth: SshAuthConfig {
                     kind: SshAuthType::PasswordEnv,
                     r#ref: Some("SSH_PASSWORD".to_string()),

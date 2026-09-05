@@ -14,7 +14,9 @@
  * limitations under the License.
  */
 
-use crate::application::operator_console::{ConsoleLogLevel, ConsoleSnapshot, OperatorConsole};
+use crate::application::operator_console::{
+    ApprovalDecision, ConsoleLogLevel, ConsoleSnapshot, OperatorConsole,
+};
 use crate::application::shutdown_controller::ShutdownController;
 use crate::transport::tui::render::log_line_text;
 use crate::transport::tui::state::TuiState;
@@ -77,15 +79,24 @@ pub(super) fn handle_input(
                     state.clear_log_selection();
                     false
                 }
-                KeyCode::Char('a') => {
+                KeyCode::Char(character) if character.eq_ignore_ascii_case(&'a') => {
                     if let Some(approval) = state.selected_approval(snapshot) {
-                        console.resolve_confirmation(approval.id, true);
+                        console.resolve_confirmation(approval.id, ApprovalDecision::ApproveOnce);
                     }
                     false
                 }
-                KeyCode::Char('r') => {
+                KeyCode::Char(character) if character.eq_ignore_ascii_case(&'s') => {
                     if let Some(approval) = state.selected_approval(snapshot) {
-                        console.resolve_confirmation(approval.id, false);
+                        console.resolve_confirmation(
+                            approval.id,
+                            ApprovalDecision::ApproveForSession,
+                        );
+                    }
+                    false
+                }
+                KeyCode::Char(character) if character.eq_ignore_ascii_case(&'r') => {
+                    if let Some(approval) = state.selected_approval(snapshot) {
+                        console.resolve_confirmation(approval.id, ApprovalDecision::Reject);
                     }
                     false
                 }

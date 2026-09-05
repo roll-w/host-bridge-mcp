@@ -132,7 +132,7 @@ fn detect_shell_operators(input: &str) -> bool {
             continue;
         }
 
-        if ch == ';' || ch == '|' || ch == '\n' || ch == '\r' {
+        if ch == ';' || ch == '|' || ch == '<' || ch == '>' || ch == '\n' || ch == '\r' {
             return true;
         }
 
@@ -194,6 +194,17 @@ mod tests {
     }
 
     #[test]
+    fn detects_redirection_operator() {
+        let output = parse_command_line("echo hello > output.txt")
+            .expect("should parse output redirection");
+        assert!(output.contains_shell_operator);
+
+        let input = parse_command_line("sort < input.txt")
+            .expect("should parse input redirection");
+        assert!(input.contains_shell_operator);
+    }
+
+    #[test]
     fn simple_command_has_no_shell_operator() {
         let parsed = parse_command_line("cargo build --release").expect("should parse");
         assert!(!parsed.contains_shell_operator);
@@ -205,6 +216,13 @@ mod tests {
             .expect("quoted operator should be allowed");
         assert_eq!(parsed.program, "python");
         assert_eq!(parsed.args, vec!["-c", "print('a && b')"]);
+    }
+
+    #[test]
+    fn allows_redirection_character_inside_quotes() {
+        let parsed = parse_command_line("echo \"a > b\"")
+            .expect("quoted redirection character should be allowed");
+        assert!(!parsed.contains_shell_operator);
     }
 
     #[test]

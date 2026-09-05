@@ -18,10 +18,11 @@ use crate::application::execution_service::{ExecuteCommandInput, ExecutionEvent,
 use crate::application::operator_console::ConsoleApprovalError;
 use crate::transport::mcp_streamable_http::output::OutputRenderOptions;
 use crate::transport::mcp_streamable_http::{ExecuteCommandToolArgs, HostBridgeMcpServer};
+use axum::http::request::Parts;
+use rmcp::ErrorData as McpError;
 use rmcp::model::{CallToolResult, LoggingLevel, LoggingMessageNotificationParam};
 use rmcp::service::{RequestContext, RoleServer};
-use rmcp::ErrorData as McpError;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub(super) async fn execute_command_tool(
     server: &HostBridgeMcpServer,
@@ -43,6 +44,7 @@ pub(super) async fn execute_command_tool(
     };
 
     if let Some(request) = prepared.confirmation_request().cloned() {
+        let session_id = mcp_session_id(&context);
         let _ = notify_mcp_log(
             &context.peer,
             LoggingLevel::Info,
@@ -55,7 +57,7 @@ pub(super) async fn execute_command_tool(
 
         let approved = match server
             .operator_console
-            .request_confirmation(request.clone())
+            .request_confirmation(request.clone(), session_id)
             .await
         {
             Ok(approved) => approved,
@@ -207,6 +209,19 @@ pub(super) async fn execute_command_tool(
     })))
 }
 
+fn mcp_session_id(context: &RequestContext<RoleServer>) -> Option<String> {
+    let parts = context.extensions.get::<Parts>()?;
+    mcp_session_id_from_parts(parts)
+}
+
+fn mcp_session_id_from_parts(parts: &Parts) -> Option<String> {
+    parts
+        .headers
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned)
+}
+
 fn structured_error(message: impl Into<String>) -> CallToolResult {
     CallToolResult::structured_error(json!({
         "message": message.into()
@@ -231,4 +246,34 @@ async fn notify_mcp_log(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mcp_session_id_from_parts;
+    use axum::http::{HeaderValue, Request};
+
+    #[test]
+    fn reads_mcp_session_id_from_request_headers() {
+        let (mut parts, _) = Request::new(()).into_parts();
+        parts
+            .headers
+            .insert("mcp-session-id", HeaderValue::from_static("session-123"));
+
+        assert_eq!(
+            mcp_session_id_from_parts(&parts).as_deref(),
+            Some("session-123")
+        );
+    }
+
+    #[test]
+    fn ignores_invalid_mcp_session_id_header() {
+        let (mut parts, _) = Request::new(()).into_parts();
+        parts.headers.insert(
+            "mcp-session-id",
+            HeaderValue::from_bytes(&[0xff]).expect("raw header value should be accepted"),
+        );
+
+        assert!(mcp_session_id_from_parts(&parts).is_none());
+    }
 }

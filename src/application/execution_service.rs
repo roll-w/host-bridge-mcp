@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-use crate::application::command_parser::{parse_command_line, CommandParseError};
+use crate::application::command_parser::{CommandParseError, parse_command_line};
 use crate::application::data_dir::execution_output_path;
 use crate::config::AppConfig;
 use crate::domain::execution_target::{
@@ -33,7 +33,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, broadcast};
 use tokio::time::Duration;
 use uuid::Uuid;
 
@@ -62,6 +62,8 @@ pub enum ExecutionError {
     NotFound(Uuid),
     #[error("invalid working directory: {0}")]
     InvalidWorkingDirectory(String),
+    #[error("execution configuration changed before the command could start")]
+    ConfigurationChanged,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -139,6 +141,7 @@ pub struct ExecutionSubscription {
 
 #[derive(Debug, Clone)]
 pub struct PreparedExecution {
+    runtime: Arc<ExecutionRuntimeConfig>,
     run: RunExecution,
     confirmation_request: Option<ConfirmationRequest>,
 }
@@ -359,14 +362,13 @@ impl ExecutionService {
             .policy_engine
             .evaluate(&parsed.program, &parsed.args);
 
-        if policy.decision == PolicyDecision::Deny && !parsed.contains_shell_operator {
+        if policy.decision == PolicyDecision::Deny {
             tracing::warn!(command = %input.command, "Policy denied command");
             return Err(ExecutionError::Denied);
         }
 
         let requires_confirmation = parsed.contains_shell_operator
-            || policy.decision == PolicyDecision::RequireConfirmation
-            || policy.decision == PolicyDecision::Deny;
+            || policy.decision == PolicyDecision::RequireConfirmation;
 
         if parsed.contains_shell_operator {
             tracing::info!(
@@ -375,19 +377,14 @@ impl ExecutionService {
             );
         }
 
-        let target = runtime.resolve_target(input.server.as_deref())?;
+        let target = runtime.resolve_target(input.server.as_deref())?.clone();
         let timeout_ms = runtime.resolve_timeout(input.timeout_ms)?;
-        let executable = target.path_mapper.map_command_if_path(&parsed.program);
-        let args = parsed
-            .args
-            .iter()
-            .map(|argument| target.path_mapper.map_argument_if_path(argument))
-            .collect::<Vec<_>>();
+        let executable = parsed.program.clone();
+        let args = parsed.args.clone();
 
         let (backend, preview_working_directory) = match &target.transport {
             ExecutionTransport::Host => {
                 let working_directory = self.resolve_local_working_directory(
-                    target,
                     input.working_directory.as_deref(),
                     policy.default_working_directory.as_deref(),
                 )?;
@@ -405,7 +402,6 @@ impl ExecutionService {
             }
             ExecutionTransport::Ssh(ssh_target) => {
                 let remote_working_directory = self.resolve_remote_working_directory(
-                    target,
                     input.working_directory.as_deref(),
                     policy.default_working_directory.as_deref(),
                 );
@@ -440,6 +436,7 @@ impl ExecutionService {
             });
 
         Ok(PreparedExecution {
+            runtime,
             run: RunExecution {
                 command_line: input.command,
                 server_name: target.name.clone(),
@@ -453,6 +450,15 @@ impl ExecutionService {
         &self,
         prepared: PreparedExecution,
     ) -> Result<(ExecutionLaunch, broadcast::Receiver<ExecutionEvent>), ExecutionError> {
+        let current_runtime = self.runtime_snapshot();
+        if !Arc::ptr_eq(&prepared.runtime, &current_runtime) {
+            tracing::warn!(
+                command = %prepared.run.command_line,
+                "Execution configuration changed before command launch"
+            );
+            return Err(ExecutionError::ConfigurationChanged);
+        }
+
         let execution_id = Uuid::new_v4();
         let command_line = prepared.run.command_line.clone();
         let record = Arc::new(ExecutionRecord::new(execution_id)?);
@@ -528,7 +534,6 @@ impl ExecutionService {
 
     fn resolve_local_working_directory(
         &self,
-        target: &ExecutionTarget,
         requested: Option<&str>,
         default_from_policy: Option<&str>,
     ) -> Result<PathBuf, ExecutionError> {
@@ -539,8 +544,7 @@ impl ExecutionService {
             return Ok(current_directory);
         };
 
-        let mapped = target.path_mapper.map_path(&raw_path);
-        let candidate = PathBuf::from(mapped);
+        let candidate = PathBuf::from(raw_path);
         let resolved = if candidate.is_relative() {
             current_directory.join(candidate)
         } else {
@@ -566,12 +570,10 @@ impl ExecutionService {
 
     fn resolve_remote_working_directory(
         &self,
-        target: &ExecutionTarget,
         requested: Option<&str>,
         default_from_policy: Option<&str>,
     ) -> Option<String> {
         self.selected_working_directory(requested, default_from_policy)
-            .map(|path| target.path_mapper.map_path(&path))
     }
 
     fn selected_working_directory(

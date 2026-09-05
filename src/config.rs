@@ -64,7 +64,6 @@ pub struct ExecutionConfig {
     pub default_server: String,
     #[serde(default)]
     pub servers: Vec<ExecutionServerConfig>,
-    pub path_mappings: Vec<PathMappingRule>,
     pub target_platform: TargetPlatform,
     pub default_timeout_ms: u64,
     pub max_timeout_ms: u64,
@@ -82,8 +81,6 @@ pub enum ExecutionServerConfig {
         name: String,
         #[serde(default)]
         target_platform: TargetPlatform,
-        #[serde(default)]
-        path_mappings: Vec<PathMappingRule>,
     },
     #[serde(rename = "ssh")]
     Ssh {
@@ -93,8 +90,6 @@ pub enum ExecutionServerConfig {
         port: u16,
         user: String,
         target_platform: TargetPlatform,
-        #[serde(default)]
-        path_mappings: Vec<PathMappingRule>,
         #[serde(default)]
         auth: SshAuthConfig,
         #[serde(default)]
@@ -152,14 +147,6 @@ pub struct CommandRuleConfig {
     pub default_working_directory: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
-pub struct PathMappingRule {
-    pub from: String,
-    pub to: String,
-    pub platforms: Vec<Platform>,
-}
-
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum PolicyAction {
@@ -177,15 +164,6 @@ pub enum TargetPlatform {
     Windows,
     Linux,
     Macos,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum Platform {
-    Windows,
-    Linux,
-    Macos,
-    Wsl,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -255,20 +233,9 @@ impl Default for ExecutionConfig {
             default_working_directory: None,
             default_server: DEFAULT_EXECUTION_SERVER.to_string(),
             servers: Vec::new(),
-            path_mappings: Vec::new(),
             target_platform: TargetPlatform::Auto,
             default_timeout_ms: 30 * 60 * 1000,
             max_timeout_ms: 2 * 60 * 60 * 1000,
-        }
-    }
-}
-
-impl Default for PathMappingRule {
-    fn default() -> Self {
-        Self {
-            from: String::new(),
-            to: String::new(),
-            platforms: Vec::new(),
         }
     }
 }
@@ -387,8 +354,6 @@ impl AppConfig {
             }
         }
 
-        validate_path_mappings(&self.execution.path_mappings, "execution.path-mappings")?;
-
         let mut server_names = HashSet::new();
         for (index, server) in self.execution.servers.iter().enumerate() {
             let name = server.name();
@@ -400,19 +365,13 @@ impl AppConfig {
             }
 
             match server {
-                ExecutionServerConfig::Host { path_mappings, .. } => {
-                    validate_path_mappings(
-                        path_mappings,
-                        &format!("execution.servers[{index}].path-mappings"),
-                    )?;
-                }
+                ExecutionServerConfig::Host { .. } => {}
                 ExecutionServerConfig::Ssh {
                     name,
                     host,
                     port,
                     user,
                     target_platform,
-                    path_mappings,
                     auth,
                     known_hosts_file,
                     connection_idle_timeout_ms,
@@ -449,10 +408,6 @@ impl AppConfig {
                     validate_optional_non_empty(
                         known_hosts_file.as_deref(),
                         &format!("execution.servers[{index}].known-hosts-file"),
-                    )?;
-                    validate_path_mappings(
-                        path_mappings,
-                        &format!("execution.servers[{index}].path-mappings"),
                     )?;
                 }
             }
@@ -575,21 +530,6 @@ fn validate_ssh_auth(auth: &SshAuthConfig, location: &str) -> Result<(), ConfigE
             }
         }
     }
-}
-
-fn validate_path_mappings(
-    path_mappings: &[PathMappingRule],
-    location: &str,
-) -> Result<(), ConfigError> {
-    for (index, rule) in path_mappings.iter().enumerate() {
-        if rule.from.trim().is_empty() || rule.to.trim().is_empty() {
-            return Err(ConfigError::Validation(format!(
-                "{location}[{index}] entries require non-empty from/to"
-            )));
-        }
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]

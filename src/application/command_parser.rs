@@ -179,28 +179,25 @@ mod tests {
 
     #[test]
     fn detects_pipe_operator() {
-        let parsed =
-            parse_command_line("ls -la | grep foo").expect("should parse piped command");
+        let parsed = parse_command_line("ls -la | grep foo").expect("should parse piped command");
         assert!(parsed.contains_shell_operator);
         assert_eq!(parsed.program, "ls");
     }
 
     #[test]
     fn detects_semicolon_operator() {
-        let parsed =
-            parse_command_line("cd /tmp; ls").expect("should parse semicolon command");
+        let parsed = parse_command_line("cd /tmp; ls").expect("should parse semicolon command");
         assert!(parsed.contains_shell_operator);
         assert_eq!(parsed.program, "cd");
     }
 
     #[test]
     fn detects_redirection_operator() {
-        let output = parse_command_line("echo hello > output.txt")
-            .expect("should parse output redirection");
+        let output =
+            parse_command_line("echo hello > output.txt").expect("should parse output redirection");
         assert!(output.contains_shell_operator);
 
-        let input = parse_command_line("sort < input.txt")
-            .expect("should parse input redirection");
+        let input = parse_command_line("sort < input.txt").expect("should parse input redirection");
         assert!(input.contains_shell_operator);
     }
 
@@ -234,8 +231,7 @@ mod tests {
 
     #[test]
     fn newline_outside_quotes_detected_as_shell_operator() {
-        let parsed = parse_command_line("echo hello\necho world")
-            .expect("should parse");
+        let parsed = parse_command_line("echo hello\necho world").expect("should parse");
         assert!(parsed.contains_shell_operator);
     }
 }

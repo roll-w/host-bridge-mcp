@@ -14,127 +14,201 @@
  * limitations under the License.
  */
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+use clap::Parser;
+use std::ffi::OsString;
+
+#[derive(Debug, Clone, Parser, PartialEq, Eq)]
+#[command(
+    version,
+    about = "Run the host-bridge MCP server and its local operator interfaces",
+    long_about = None
+)]
 pub struct CliOptions {
+    /// Set the configuration file path.
+    #[arg(short, long = "config", value_name = "PATH", value_parser = parse_non_empty)]
     pub config_path: Option<String>,
-    pub show_help: bool,
-    pub show_version: bool,
+
+    /// Override the HTTP bind host.
+    #[arg(long, value_name = "HOST", value_parser = parse_non_empty)]
+    pub host: Option<String>,
+
+    /// Override the HTTP bind port.
+    #[arg(long, value_name = "PORT", value_parser = parse_port)]
+    pub port: Option<u16>,
+
+    /// Enable the operator TUI. The value defaults to true when omitted.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", default_value_t = true)]
+    pub tui: bool,
+
+    /// Open the web console at startup. The value defaults to true when omitted.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", default_value_t = true)]
+    pub web: bool,
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("{message}\n\n{usage}")]
-pub struct CliError {
-    pub message: String,
-    pub usage: String,
-}
-
-pub fn parse_args<I>(args: I) -> Result<CliOptions, CliError>
+pub fn parse_args<I, T>(args: I) -> Result<CliOptions, clap::Error>
 where
-    I: IntoIterator<Item=String>,
+    I: IntoIterator<Item=T>,
+    T: Into<OsString> + Clone,
 {
-    let mut iterator = args.into_iter();
-    let program_name = iterator
-        .next()
-        .unwrap_or_else(|| "host-bridge-mcp".to_string());
-    let usage = usage_text(&program_name);
+    CliOptions::try_parse_from(args)
+}
 
-    let mut config_path: Option<String> = None;
-    let mut show_help = false;
-    let mut show_version = false;
+fn parse_non_empty(value: &str) -> Result<String, String> {
+    if value.trim().is_empty() {
+        return Err("value must not be empty".to_string());
+    }
+    Ok(value.to_string())
+}
 
-    while let Some(argument) = iterator.next() {
-        match argument.as_str() {
-            "-c" | "--config" => {
-                let Some(value) = iterator.next() else {
-                    return Err(CliError {
-                        message: "missing value for --config".to_string(),
-                        usage,
-                    });
-                };
-                config_path = Some(value);
-            }
-            "-h" | "--help" => {
-                show_help = true;
-            }
-            "-V" | "--version" => {
-                show_version = true;
-            }
-            _ => {
-                if let Some(value) = argument.strip_prefix("--config=") {
-                    if value.trim().is_empty() {
-                        return Err(CliError {
-                            message: "--config requires a non-empty value".to_string(),
-                            usage,
-                        });
-                    }
-                    config_path = Some(value.to_string());
-                } else {
-                    return Err(CliError {
-                        message: format!("unknown argument: {argument}"),
-                        usage,
-                    });
-                }
-            }
-        }
+fn parse_port(value: &str) -> Result<u16, String> {
+    let port = value
+        .parse::<u16>()
+        .map_err(|_| "port must be an integer from 1 to 65535".to_string())?;
+    if port == 0 {
+        return Err("port must be greater than zero".to_string());
+    }
+    Ok(port)
+}
+
+pub fn resolve_bind_address(
+    configured: &str,
+    host_override: Option<&str>,
+    port_override: Option<u16>,
+) -> Result<String, String> {
+    if host_override.is_none() && port_override.is_none() {
+        return Ok(configured.to_string());
     }
 
-    Ok(CliOptions {
-        config_path,
-        show_help,
-        show_version,
-    })
+    let (configured_host, configured_port) = split_bind_address(configured)?;
+    let host = host_override.unwrap_or(configured_host.as_str());
+    let port = port_override.unwrap_or(configured_port);
+    format_bind_address(host, port)
 }
 
-pub fn help_text(program_name: &str) -> String {
-    format!(
-        "Usage:\n  {program_name} [OPTIONS]\n\nOptions:\n  -c, --config <PATH>   Set configuration file path\n  -h, --help            Show help\n  -V, --version         Show version"
-    )
+fn split_bind_address(configured: &str) -> Result<(String, u16), String> {
+    if let Some(end) = configured
+        .strip_prefix('[')
+        .and_then(|value| value.find(']'))
+    {
+        let host = configured[1..end + 1].to_string();
+        let port = configured
+            .get(end + 2..)
+            .and_then(|value| value.strip_prefix(':'))
+            .ok_or_else(|| format!("configured server.address '{configured}' has no port"))?
+            .parse::<u16>()
+            .map_err(|_| format!("configured server.address '{configured}' has an invalid port"))?;
+        if port == 0 {
+            return Err(format!(
+                "configured server.address '{configured}' has an invalid port"
+            ));
+        }
+        return Ok((host, port));
+    }
+
+    let (host, port) = configured
+        .rsplit_once(':')
+        .ok_or_else(|| format!("configured server.address '{configured}' has no port"))?;
+    if host.is_empty() {
+        return Err(format!(
+            "configured server.address '{configured}' has no host"
+        ));
+    }
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| format!("configured server.address '{configured}' has an invalid port"))?;
+    if port == 0 {
+        return Err(format!(
+            "configured server.address '{configured}' has an invalid port"
+        ));
+    }
+    Ok((host.to_string(), port))
 }
 
-pub fn version_text() -> String {
-    format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
-}
+fn format_bind_address(host: &str, port: u16) -> Result<String, String> {
+    if host.trim().is_empty() {
+        return Err("bind host must not be empty".to_string());
+    }
 
-fn usage_text(program_name: &str) -> String {
-    help_text(program_name)
+    if host.contains(':') && !host.starts_with('[') {
+        Ok(format!("[{host}]:{port}"))
+    } else {
+        Ok(format!("{host}:{port}"))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_config_argument() {
-        let outcome = parse_args(vec![
-            "host-bridge-mcp".to_string(),
-            "--config".to_string(),
-            "custom.yaml".to_string(),
-        ])
-            .expect("should parse");
+    fn args(values: &[&str]) -> Vec<String> {
+        std::iter::once("host-bridge-mcp".to_string())
+            .chain(values.iter().map(|value| (*value).to_string()))
+            .collect()
+    }
 
+    #[test]
+    fn defaults_enable_tui_and_web() {
+        let options = parse_args(args(&[])).expect("default CLI should parse");
+
+        assert!(options.tui);
+        assert!(options.web);
+        assert_eq!(options.config_path, None);
+        assert_eq!(options.host, None);
+        assert_eq!(options.port, None);
+    }
+
+    #[test]
+    fn boolean_flags_accept_bare_and_explicit_values() {
+        let options = parse_args(args(&["--tui", "false", "--web=false"]))
+            .expect("boolean flags should parse");
+
+        assert!(!options.tui);
+        assert!(!options.web);
+
+        let options =
+            parse_args(args(&["--tui", "--web"])).expect("bare boolean flags should parse");
+        assert!(options.tui);
+        assert!(options.web);
+    }
+
+    #[test]
+    fn host_and_port_overrides_parse() {
+        let options = parse_args(args(&["--host", "0.0.0.0", "--port=9000"]))
+            .expect("bind overrides should parse");
+
+        assert_eq!(options.host.as_deref(), Some("0.0.0.0"));
+        assert_eq!(options.port, Some(9000));
+    }
+
+    #[test]
+    fn config_path_keeps_the_existing_long_option() {
+        let options =
+            parse_args(args(&["--config", "custom.yaml"])).expect("config path should parse");
+
+        assert_eq!(options.config_path.as_deref(), Some("custom.yaml"));
+    }
+
+    #[test]
+    fn bind_address_override_preserves_the_other_component() {
         assert_eq!(
-            outcome,
-            CliOptions {
-                config_path: Some("custom.yaml".to_string()),
-                show_help: false,
-                show_version: false,
-            }
+            resolve_bind_address("127.0.0.1:8787", Some("0.0.0.0"), None).unwrap(),
+            "0.0.0.0:8787"
+        );
+        assert_eq!(
+            resolve_bind_address("127.0.0.1:8787", None, Some(9000)).unwrap(),
+            "127.0.0.1:9000"
+        );
+        assert_eq!(
+            resolve_bind_address("[::1]:8787", Some("::"), Some(9000)).unwrap(),
+            "[::]:9000"
         );
     }
 
     #[test]
-    fn parse_help_argument() {
-        let options = parse_args(vec!["host-bridge-mcp".to_string(), "--help".to_string()])
-            .expect("--help should parse");
-        assert!(options.show_help);
-        assert!(!options.show_version);
-    }
-
-    #[test]
-    fn parse_version_argument() {
-        let options = parse_args(vec!["host-bridge-mcp".to_string(), "--version".to_string()])
-            .expect("--version should parse");
-        assert!(options.show_version);
-        assert!(!options.show_help);
+    fn invalid_port_is_rejected() {
+        let error = parse_args(args(&["--port", "0"]))
+            .expect_err("zero port should be rejected")
+            .to_string();
+        assert!(error.contains("port must be greater than zero"));
     }
 }

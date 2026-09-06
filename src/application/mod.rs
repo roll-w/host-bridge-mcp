@@ -14,9 +14,12 @@
  * limitations under the License.
  */
 
+pub mod browser;
 pub mod command_parser;
 pub mod config_reload;
+pub mod config_store;
 pub mod data_dir;
+pub mod execution_history;
 pub mod execution_service;
 pub mod operator_console;
 pub mod shutdown_controller;

@@ -87,10 +87,8 @@ pub(super) fn handle_input(
                 }
                 KeyCode::Char(character) if character.eq_ignore_ascii_case(&'s') => {
                     if let Some(approval) = state.selected_approval(snapshot) {
-                        console.resolve_confirmation(
-                            approval.id,
-                            ApprovalDecision::ApproveForSession,
-                        );
+                        console
+                            .resolve_confirmation(approval.id, ApprovalDecision::ApproveForSession);
                     }
                     false
                 }

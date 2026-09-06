@@ -41,6 +41,7 @@ struct CompiledExecutionRule {
     command_pattern: String,
     args_prefix: Vec<String>,
     action: PolicyAction,
+    targets: Vec<String>,
     default_working_directory: Option<String>,
     order: usize,
 }
@@ -57,7 +58,12 @@ impl PolicyEngine {
         }
     }
 
-    pub fn evaluate(&self, command_token: &str, command_arguments: &[String]) -> PolicyResult {
+    pub fn evaluate(
+        &self,
+        target_name: &str,
+        command_token: &str,
+        command_arguments: &[String],
+    ) -> PolicyResult {
         let key = normalize_command(command_token);
         let normalized_arguments = command_arguments
             .iter()
@@ -67,17 +73,13 @@ impl PolicyEngine {
             .rules
             .iter()
             .filter(|rule| {
-                command_pattern_matches(&rule.command_pattern, &key)
+                (rule.targets.is_empty() || rule.targets.iter().any(|target| target == target_name))
+                    && command_pattern_matches(&rule.command_pattern, &key)
                     && prefix_match(&rule.args_prefix, &normalized_arguments)
             })
             .max_by_key(|rule| {
                 let (is_exact, literal_count) = command_pattern_specificity(&rule.command_pattern);
-                (
-                    is_exact,
-                    literal_count,
-                    rule.args_prefix.len(),
-                    rule.order,
-                )
+                (is_exact, literal_count, rule.args_prefix.len(), rule.order)
             });
 
         let action = matching_rule
@@ -110,6 +112,7 @@ fn compile_command_policies(commands: &[CommandPolicyConfig]) -> Vec<CompiledExe
             command_pattern: normalize_command(&command_policy.command),
             args_prefix: Vec::new(),
             action: command_policy.action,
+            targets: command_policy.targets.clone(),
             default_working_directory: command_policy.default_working_directory.clone(),
             order,
         });
@@ -137,6 +140,7 @@ fn compile_nested_rule(
             .map(|token| normalize_subcommand_token(token))
             .collect(),
         action: rule.action,
+        targets: command_policy.targets.clone(),
         default_working_directory: rule
             .default_working_directory
             .clone()
@@ -159,8 +163,7 @@ fn command_pattern_matches(pattern: &str, command: &str) -> bool {
         {
             pattern_index += 1;
             command_index += 1;
-        } else if pattern_index < pattern_tokens.len() && pattern_tokens[pattern_index] == '*'
-        {
+        } else if pattern_index < pattern_tokens.len() && pattern_tokens[pattern_index] == '*' {
             wildcard_index = Some(pattern_index);
             wildcard_match_index = command_index;
             pattern_index += 1;
@@ -182,7 +185,10 @@ fn command_pattern_matches(pattern: &str, command: &str) -> bool {
 
 fn command_pattern_specificity(pattern: &str) -> (bool, usize) {
     let is_exact = !pattern.contains('*');
-    let literal_count = pattern.chars().filter(|character| *character != '*').count();
+    let literal_count = pattern
+        .chars()
+        .filter(|character| *character != '*')
+        .count();
     (is_exact, literal_count)
 }
 
@@ -266,7 +272,7 @@ mod tests {
         });
         let engine = PolicyEngine::new(config);
 
-        let result = engine.evaluate("mvn", &[]);
+        let result = engine.evaluate("host", "mvn", &[]);
         assert_eq!(result.decision, PolicyDecision::RequireConfirmation);
     }
 
@@ -277,6 +283,7 @@ mod tests {
             commands: vec![CommandPolicyConfig {
                 command: "mvn".to_string(),
                 action: PolicyAction::Allow,
+                targets: Vec::new(),
                 default_working_directory: None,
                 rules: vec![CommandRuleConfig {
                     args_prefix: vec!["clean".to_string(), "install".to_string()],
@@ -288,7 +295,7 @@ mod tests {
         });
         let engine = PolicyEngine::new(config);
 
-        let result = engine.evaluate("mvn", &["clean".to_string(), "install".to_string()]);
+        let result = engine.evaluate("host", "mvn", &["clean".to_string(), "install".to_string()]);
         assert_eq!(result.decision, PolicyDecision::Deny);
     }
 
@@ -299,6 +306,7 @@ mod tests {
             commands: vec![CommandPolicyConfig {
                 command: "npm".to_string(),
                 action: PolicyAction::Confirm,
+                targets: Vec::new(),
                 default_working_directory: None,
                 rules: vec![
                     CommandRuleConfig {
@@ -317,7 +325,7 @@ mod tests {
         });
         let engine = PolicyEngine::new(config);
 
-        let result = engine.evaluate("npm", &["run".to_string(), "build".to_string()]);
+        let result = engine.evaluate("host", "npm", &["run".to_string(), "build".to_string()]);
         assert_eq!(result.decision, PolicyDecision::Deny);
     }
 
@@ -328,6 +336,7 @@ mod tests {
             commands: vec![CommandPolicyConfig {
                 command: "cargo".to_string(),
                 action: PolicyAction::Confirm,
+                targets: Vec::new(),
                 default_working_directory: None,
                 rules: vec![
                     CommandRuleConfig {
@@ -346,7 +355,7 @@ mod tests {
         });
 
         let engine = PolicyEngine::new(config);
-        let result = engine.evaluate("cargo", &["build".to_string()]);
+        let result = engine.evaluate("host", "cargo", &["build".to_string()]);
         assert_eq!(result.decision, PolicyDecision::Deny);
     }
 
@@ -357,6 +366,7 @@ mod tests {
             commands: vec![CommandPolicyConfig {
                 command: "npm".to_string(),
                 action: PolicyAction::Allow,
+                targets: Vec::new(),
                 default_working_directory: Some("/workspace/frontend".to_string()),
                 rules: vec![CommandRuleConfig {
                     args_prefix: vec!["publish".to_string()],
@@ -369,14 +379,14 @@ mod tests {
 
         let engine = PolicyEngine::new(config);
 
-        let install_result = engine.evaluate("npm", &["install".to_string()]);
+        let install_result = engine.evaluate("host", "npm", &["install".to_string()]);
         assert_eq!(install_result.decision, PolicyDecision::Allow);
         assert_eq!(
             install_result.default_working_directory,
             Some("/workspace/frontend".to_string())
         );
 
-        let publish_result = engine.evaluate("npm", &["publish".to_string()]);
+        let publish_result = engine.evaluate("host", "npm", &["publish".to_string()]);
         assert_eq!(publish_result.decision, PolicyDecision::Deny);
         assert_eq!(
             publish_result.default_working_directory,
@@ -391,6 +401,7 @@ mod tests {
             commands: vec![CommandPolicyConfig {
                 command: "*".to_string(),
                 action: PolicyAction::Allow,
+                targets: Vec::new(),
                 default_working_directory: None,
                 rules: Vec::new(),
             }],
@@ -399,11 +410,16 @@ mod tests {
         let engine = PolicyEngine::new(config);
 
         assert_eq!(
-            engine.evaluate("ls", &[]).decision,
+            engine.evaluate("host", "ls", &[]).decision,
             PolicyDecision::Allow
         );
         assert_eq!(
-            engine.evaluate("mkdir", &["-p".to_string(), "workspace".to_string()])
+            engine
+                .evaluate(
+                    "host",
+                    "mkdir",
+                    &["-p".to_string(), "workspace".to_string()],
+                )
                 .decision,
             PolicyDecision::Allow
         );
@@ -417,12 +433,14 @@ mod tests {
                 CommandPolicyConfig {
                     command: "rm".to_string(),
                     action: PolicyAction::Deny,
+                    targets: Vec::new(),
                     default_working_directory: None,
                     rules: Vec::new(),
                 },
                 CommandPolicyConfig {
                     command: "*".to_string(),
                     action: PolicyAction::Allow,
+                    targets: Vec::new(),
                     default_working_directory: None,
                     rules: Vec::new(),
                 },
@@ -432,12 +450,13 @@ mod tests {
         let engine = PolicyEngine::new(config);
 
         assert_eq!(
-            engine.evaluate("rm", &["-rf".to_string(), "workspace".to_string()])
+            engine
+                .evaluate("host", "rm", &["-rf".to_string(), "workspace".to_string()], )
                 .decision,
             PolicyDecision::Deny
         );
         assert_eq!(
-            engine.evaluate("ls", &[]).decision,
+            engine.evaluate("host", "ls", &[]).decision,
             PolicyDecision::Allow
         );
     }
@@ -449,6 +468,7 @@ mod tests {
             commands: vec![CommandPolicyConfig {
                 command: "mk*".to_string(),
                 action: PolicyAction::Allow,
+                targets: Vec::new(),
                 default_working_directory: None,
                 rules: Vec::new(),
             }],
@@ -457,15 +477,40 @@ mod tests {
         let engine = PolicyEngine::new(config);
 
         assert_eq!(
-            engine.evaluate("mkdir", &[]).decision,
+            engine.evaluate("host", "mkdir", &[]).decision,
             PolicyDecision::Allow
         );
         assert_eq!(
-            engine.evaluate("mktemp", &[]).decision,
+            engine.evaluate("host", "mktemp", &[]).decision,
             PolicyDecision::Allow
         );
         assert_eq!(
-            engine.evaluate("ls", &[]).decision,
+            engine.evaluate("host", "ls", &[]).decision,
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn command_policy_scope_only_applies_to_selected_target() {
+        let config = test_config(ExecutionConfig {
+            default_action: PolicyAction::Deny,
+            commands: vec![CommandPolicyConfig {
+                command: "cargo".to_string(),
+                action: PolicyAction::Allow,
+                targets: vec!["builder".to_string()],
+                default_working_directory: None,
+                rules: Vec::new(),
+            }],
+            ..ExecutionConfig::default()
+        });
+        let engine = PolicyEngine::new(config);
+
+        assert_eq!(
+            engine.evaluate("builder", "cargo", &[]).decision,
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            engine.evaluate("host", "cargo", &[]).decision,
             PolicyDecision::Deny
         );
     }

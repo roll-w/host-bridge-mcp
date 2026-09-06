@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-use super::{create_authenticated_session, SshError, SshSessionHandle};
+use super::{SshError, SshSessionHandle, create_authenticated_session};
 use crate::domain::execution_target::SshTarget;
 use russh::Disconnect;
 use std::collections::HashMap;

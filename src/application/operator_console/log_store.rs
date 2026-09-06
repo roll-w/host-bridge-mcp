@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-use crate::application::data_dir::{default_persisted_log_path, default_temporary_log_path};
+use crate::application::data_dir::DataDirectory;
 use crate::application::operator_console::{ConsoleLogEntry, ConsoleLogLevel};
 use crate::config::LoggingConfig;
 use std::collections::VecDeque;
@@ -24,31 +24,29 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+
+const RUNTIME_LOG_BUFFER_LIMIT: usize = 2_000;
 
 pub(super) struct LogStore {
-    buffer_limit: usize,
     buffered_logs: VecDeque<ConsoleLogEntry>,
     total_log_count: usize,
     storage: LogFileStorage,
 }
 
 pub(super) enum PreparedLogStore {
-    UpdatePolicy {
-        buffer_limit: usize,
-        delete_on_drop: bool,
-    },
-    Replace {
-        replacement: LogStore,
-        source_total_log_count: usize,
-    },
+    UpdatePolicy { retention_days: u64 },
 }
 
 pub(super) struct LogStoreReconfigureSnapshot {
-    buffer_limit: usize,
-    buffered_logs: VecDeque<ConsoleLogEntry>,
-    total_log_count: usize,
-    current_path: PathBuf,
-    delete_on_drop: bool,
+    retention_days: u64,
+}
+
+struct LogFileSegment {
+    path: PathBuf,
+    start_line: usize,
+    line_offsets: Vec<u64>,
+    next_offset: u64,
 }
 
 struct LogFileStorage {
@@ -56,17 +54,18 @@ struct LogFileStorage {
     writer: Option<File>,
     line_offsets: Vec<u64>,
     next_offset: u64,
-    delete_on_drop: bool,
+    active_start_line: usize,
+    archived_segments: Vec<LogFileSegment>,
+    retention_days: u64,
+    active_date: String,
 }
 
 impl LogStore {
-    pub(super) fn new(logging: LoggingConfig) -> io::Result<Self> {
-        let buffer_limit = logging.memory_buffer_lines;
-        let storage = LogFileStorage::new(logging)?;
+    pub(super) fn new(logging: LoggingConfig, data_directory: &DataDirectory) -> io::Result<Self> {
+        let storage = LogFileStorage::new(logging, data_directory)?;
 
         Ok(Self {
-            buffer_limit,
-            buffered_logs: VecDeque::with_capacity(buffer_limit),
+            buffered_logs: VecDeque::with_capacity(RUNTIME_LOG_BUFFER_LIMIT),
             total_log_count: storage.line_count(),
             storage,
         })
@@ -76,73 +75,45 @@ impl LogStore {
         self.total_log_count
     }
 
+    pub(super) fn buffer_limit(&self) -> usize {
+        RUNTIME_LOG_BUFFER_LIMIT
+    }
+
     pub(super) fn log_path(&self) -> &Path {
         &self.storage.path
     }
 
-    pub(super) fn append(&mut self, level: ConsoleLogLevel, message: String) {
-        self.push_entry(ConsoleLogEntry {
+    pub(super) fn append(&mut self, level: ConsoleLogLevel, message: String) -> ConsoleLogEntry {
+        let entry = ConsoleLogEntry {
             timestamp: super::current_console_timestamp(),
             level,
             message,
-        });
+        };
+        self.push_entry(entry.clone());
+        entry
     }
 
     pub(super) fn reconfigure_snapshot(&self) -> LogStoreReconfigureSnapshot {
         LogStoreReconfigureSnapshot {
-            buffer_limit: self.buffer_limit,
-            buffered_logs: self.buffered_logs.clone(),
-            total_log_count: self.total_log_count,
-            current_path: self.storage.path().to_path_buf(),
-            delete_on_drop: self.storage.delete_on_drop(),
+            retention_days: self.storage.retention_days,
         }
     }
 
     pub(super) fn apply_reconfigure(&mut self, prepared: PreparedLogStore) {
         match prepared {
-            PreparedLogStore::UpdatePolicy {
-                buffer_limit,
-                delete_on_drop,
-            } => {
-                self.buffer_limit = buffer_limit;
-                self.trim_buffer_to_limit();
-                self.storage.set_delete_on_drop(delete_on_drop);
-            }
-            PreparedLogStore::Replace {
-                mut replacement,
-                source_total_log_count,
-            } => {
-                if self.total_log_count > source_total_log_count {
-                    let pending_entries = self.read_range(
-                        source_total_log_count,
-                        self.total_log_count - source_total_log_count,
-                    );
-                    for entry in pending_entries {
-                        replacement.restore_entry(entry);
-                    }
-                }
-                *self = replacement;
+            PreparedLogStore::UpdatePolicy { retention_days } => {
+                self.storage.set_retention_days(retention_days);
             }
         }
     }
 
     fn push_entry(&mut self, entry: ConsoleLogEntry) {
-        if self.buffered_logs.len() >= self.buffer_limit {
+        if self.buffered_logs.len() >= RUNTIME_LOG_BUFFER_LIMIT {
             self.buffered_logs.pop_front();
         }
         self.buffered_logs.push_back(entry.clone());
-        self.storage.append(&entry);
+        self.storage.append(&entry, self.total_log_count);
         self.total_log_count += 1;
-    }
-
-    fn restore_entry(&mut self, entry: ConsoleLogEntry) {
-        self.push_entry(entry);
-    }
-
-    fn trim_buffer_to_limit(&mut self) {
-        while self.buffered_logs.len() > self.buffer_limit {
-            self.buffered_logs.pop_front();
-        }
     }
 
     pub(super) fn read_range(&mut self, start: usize, limit: usize) -> Vec<ConsoleLogEntry> {
@@ -176,57 +147,40 @@ impl LogStore {
 
 impl LogStoreReconfigureSnapshot {
     pub(super) fn prepare(self, logging: LoggingConfig) -> io::Result<Option<PreparedLogStore>> {
-        let next_path = resolve_log_path(&logging)?;
-        let next_delete_on_drop = !logging.persist_file;
-        let next_buffer_limit = logging.memory_buffer_lines;
-
-        if self.current_path == next_path {
-            if self.buffer_limit == next_buffer_limit && self.delete_on_drop == next_delete_on_drop
-            {
-                return Ok(None);
-            }
-
-            return Ok(Some(PreparedLogStore::UpdatePolicy {
-                buffer_limit: next_buffer_limit,
-                delete_on_drop: next_delete_on_drop,
-            }));
+        if self.retention_days == logging.retention_days {
+            return Ok(None);
         }
 
-        let mut replacement = LogStore::new(logging)?;
-        for entry in self.buffered_logs {
-            replacement.restore_entry(entry);
-        }
-
-        Ok(Some(PreparedLogStore::Replace {
-            replacement,
-            source_total_log_count: self.total_log_count,
+        Ok(Some(PreparedLogStore::UpdatePolicy {
+            retention_days: logging.retention_days,
         }))
     }
 }
 
 impl LogFileStorage {
-    fn new(logging: LoggingConfig) -> io::Result<Self> {
-        let path = resolve_log_path(&logging)?;
+    fn new(logging: LoggingConfig, data_directory: &DataDirectory) -> io::Result<Self> {
+        let path = data_directory.runtime_log_path()?;
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)?;
             }
         }
 
-        let append_mode = logging.persist_file;
-        if append_mode {
-            archive_existing_log_file(&path)?;
-        }
+        archive_existing_log_file(&path)?;
+        cleanup_archived_log_files(&path, logging.retention_days)?;
 
         let (line_offsets, next_offset) = (Vec::new(), 0);
-        let writer = open_private_write_file(&path, append_mode)?;
+        let writer = open_private_write_file(&path, false)?;
 
         Ok(Self {
             path,
             writer: Some(writer),
             line_offsets,
             next_offset,
-            delete_on_drop: !logging.persist_file,
+            active_start_line: 0,
+            archived_segments: Vec::new(),
+            retention_days: logging.retention_days,
+            active_date: current_log_date(),
         })
     }
 
@@ -234,20 +188,23 @@ impl LogFileStorage {
         self.line_offsets.len()
     }
 
-    fn path(&self) -> &Path {
-        &self.path
+    fn set_retention_days(&mut self, retention_days: u64) {
+        self.retention_days = retention_days;
+        if let Err(error) = cleanup_archived_log_files(&self.path, retention_days) {
+            tracing::warn!(
+                path = %self.path.display(),
+                error = %error,
+                "Failed to apply runtime log retention"
+            );
+        }
     }
 
-    fn delete_on_drop(&self) -> bool {
-        self.delete_on_drop
-    }
-
-    fn set_delete_on_drop(&mut self, delete_on_drop: bool) {
-        self.delete_on_drop = delete_on_drop;
-    }
-
-    fn append(&mut self, entry: &ConsoleLogEntry) {
+    fn append(&mut self, entry: &ConsoleLogEntry, global_line_index: usize) {
         let serialized = serialize_log_entry(entry);
+
+        if self.should_rotate() {
+            let _ = self.rotate(global_line_index);
+        }
 
         if let Some(writer) = self.writer.as_mut() {
             if writer.write_all(serialized.as_bytes()).is_ok() && writer.flush().is_ok() {
@@ -255,6 +212,39 @@ impl LogFileStorage {
                 self.next_offset += serialized.len() as u64;
             }
         }
+    }
+
+    fn should_rotate(&self) -> bool {
+        !self.line_offsets.is_empty() && self.active_date != current_log_date()
+    }
+
+    fn rotate(&mut self, next_line_index: usize) -> io::Result<()> {
+        let Some(mut writer) = self.writer.take() else {
+            return Ok(());
+        };
+        writer.flush()?;
+        drop(writer);
+
+        let archived_path = archived_log_path(&self.path)?;
+        fs::rename(&self.path, &archived_path)?;
+        self.archived_segments.push(LogFileSegment {
+            path: archived_path,
+            start_line: self.active_start_line,
+            line_offsets: std::mem::take(&mut self.line_offsets),
+            next_offset: self.next_offset,
+        });
+        self.next_offset = 0;
+        self.active_start_line = next_line_index;
+        self.writer = Some(open_private_write_file(&self.path, false)?);
+        self.active_date = current_log_date();
+
+        cleanup_archived_log_files(&self.path, self.retention_days)?;
+        self.archived_segments.retain(|segment| {
+            fs::symlink_metadata(&segment.path)
+                .map(|metadata| metadata.is_file())
+                .unwrap_or(false)
+        });
+        Ok(())
     }
 
     fn read_range(&mut self, start: usize, end: usize) -> Vec<ConsoleLogEntry> {
@@ -265,40 +255,18 @@ impl LogFileStorage {
         if let Some(writer) = self.writer.as_mut() {
             let _ = writer.flush();
         }
-        let mut reader = match File::open(&self.path) {
-            Ok(file) => file,
-            Err(_) => return Vec::new(),
-        };
 
         let mut entries = Vec::with_capacity(end - start);
-        for index in start..end {
-            let Some(offset) = self.line_offsets.get(index).copied() else {
-                break;
-            };
-            let next_offset = self
-                .line_offsets
-                .get(index + 1)
-                .copied()
-                .unwrap_or(self.next_offset);
-            let line_length = next_offset.saturating_sub(offset) as usize;
-            if line_length == 0 {
-                continue;
-            }
-
-            let mut buffer = vec![0_u8; line_length];
-            if reader.seek(SeekFrom::Start(offset)).is_err() {
-                break;
-            }
-            if reader.read_exact(&mut buffer).is_err() {
-                break;
-            }
-
-            let raw_line = String::from_utf8_lossy(&buffer);
-            if let Some(entry) = parse_log_line(raw_line.trim_end_matches(['\n', '\r'])) {
-                entries.push(entry);
-            }
+        for segment in &self.archived_segments {
+            read_segment_range(segment, start, end, &mut entries);
         }
-
+        let current_segment = LogFileSegment {
+            path: self.path.clone(),
+            start_line: self.active_start_line,
+            line_offsets: self.line_offsets.clone(),
+            next_offset: self.next_offset,
+        };
+        read_segment_range(&current_segment, start, end, &mut entries);
         entries
     }
 }
@@ -306,10 +274,132 @@ impl LogFileStorage {
 fn archive_existing_log_file(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_dir() => Ok(()),
-        Ok(_) => fs::rename(path, archived_log_path(path)?),
+        Ok(_) => match fs::rename(path, archived_log_path(path)?) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        },
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+fn read_segment_range(
+    segment: &LogFileSegment,
+    start: usize,
+    end: usize,
+    entries: &mut Vec<ConsoleLogEntry>,
+) {
+    let segment_start = segment.start_line;
+    let segment_end = segment_start + segment.line_offsets.len();
+    let range_start = start.max(segment_start);
+    let range_end = end.min(segment_end);
+    if range_start >= range_end {
+        return;
+    }
+
+    let Ok(mut reader) = File::open(&segment.path) else {
+        return;
+    };
+
+    for global_index in range_start..range_end {
+        let local_index = global_index - segment_start;
+        let Some(offset) = segment.line_offsets.get(local_index).copied() else {
+            break;
+        };
+        let next_offset = segment
+            .line_offsets
+            .get(local_index + 1)
+            .copied()
+            .unwrap_or(segment.next_offset);
+        let line_length = next_offset.saturating_sub(offset) as usize;
+        if line_length == 0 {
+            continue;
+        }
+
+        let mut buffer = vec![0_u8; line_length];
+        if reader.seek(SeekFrom::Start(offset)).is_err() {
+            break;
+        }
+        if reader.read_exact(&mut buffer).is_err() {
+            break;
+        }
+
+        let raw_line = String::from_utf8_lossy(&buffer);
+        if let Some(entry) = parse_log_line(raw_line.trim_end_matches(['\n', '\r'])) {
+            entries.push(entry);
+        }
+    }
+}
+
+fn cleanup_archived_log_files(path: &Path, retention_days: u64) -> io::Result<()> {
+    if retention_days == 0 {
+        return Ok(());
+    }
+
+    let cutoff = SystemTime::now()
+        .checked_sub(Duration::from_secs(
+            retention_days.saturating_mul(24 * 60 * 60),
+        ))
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        let candidate = entry.path();
+        if !is_archived_log_path(path, &candidate) {
+            continue;
+        }
+        let modified = entry
+            .metadata()?
+            .modified()
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        if modified < cutoff {
+            fs::remove_file(candidate)?;
+        }
+    }
+    Ok(())
+}
+
+fn is_archived_log_path(active_path: &Path, candidate: &Path) -> bool {
+    let Some(active_stem) = active_path
+        .file_stem()
+        .or_else(|| active_path.file_name())
+        .and_then(|value| value.to_str())
+    else {
+        return false;
+    };
+    let Some(candidate_name) = candidate.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let prefix = format!("{active_stem}.");
+    let Some(mut archived_name) = candidate_name.strip_prefix(&prefix) else {
+        return false;
+    };
+    if let Some(extension) = active_path.extension().and_then(|value| value.to_str()) {
+        let suffix = format!(".{extension}");
+        let Some(without_extension) = archived_name.strip_suffix(&suffix) else {
+            return false;
+        };
+        archived_name = without_extension;
+    }
+
+    let mut parts = archived_name.split('.');
+    let Some(date) = parts.next() else {
+        return false;
+    };
+    let Some(index) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && !date.is_empty()
+        && date
+        .chars()
+        .all(|character| character.is_ascii_digit() || character == '-')
+        && !index.is_empty()
+        && index.chars().all(|character| character.is_ascii_digit())
 }
 
 fn archived_log_path(path: &Path) -> io::Result<PathBuf> {
@@ -354,6 +444,10 @@ fn archive_date_label() -> String {
     sanitize_archive_date(&super::current_console_timestamp())
 }
 
+fn current_log_date() -> String {
+    archive_date_label()
+}
+
 fn sanitize_archive_date(timestamp: &str) -> String {
     timestamp
         .chars()
@@ -368,22 +462,7 @@ impl Drop for LogFileStorage {
             let _ = writer.flush();
             drop(writer);
         }
-        if self.delete_on_drop {
-            let _ = fs::remove_file(&self.path);
-        }
     }
-}
-
-fn resolve_log_path(logging: &LoggingConfig) -> io::Result<PathBuf> {
-    if let Some(path) = &logging.file_path {
-        return Ok(PathBuf::from(path));
-    }
-
-    if logging.persist_file {
-        return default_persisted_log_path();
-    }
-
-    default_temporary_log_path()
 }
 
 fn open_private_write_file(path: &Path, append_mode: bool) -> io::Result<File> {
@@ -504,5 +583,80 @@ mod tests {
             sanitize_archive_date("2026-03-15T09:13:41.123456Z"),
             "2026-03-15"
         );
+    }
+
+    #[test]
+    fn rotates_when_calendar_date_changes() {
+        let directory = std::env::temp_dir().join(format!(
+            "host-bridge-mcp-log-rotation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let data_directory =
+            DataDirectory::from_root(directory.clone()).expect("data directory should initialize");
+        let path = directory.join("logs/host-bridge.log");
+        let mut storage = LogFileStorage::new(LoggingConfig::default(), &data_directory)
+            .expect("log storage should initialize");
+        let first = ConsoleLogEntry {
+            timestamp: "2026-03-15T09:13:41.123456Z".to_string(),
+            level: ConsoleLogLevel::Info,
+            message: "first".to_string(),
+        };
+        let second = ConsoleLogEntry {
+            message: "second".to_string(),
+            ..first.clone()
+        };
+
+        storage.append(&first, 0);
+        storage.active_date = "2000-01-01".to_string();
+        storage.append(&second, 1);
+
+        let archives = fs::read_dir(path.parent().expect("log path should have a parent"))
+            .expect("log directory should be readable")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|candidate| is_archived_log_path(&path, candidate))
+            .collect::<Vec<_>>();
+        assert_eq!(archives.len(), 1);
+        assert!(
+            fs::read_to_string(&archives[0])
+                .expect("archived log should be readable")
+                .contains("first")
+        );
+        assert!(
+            fs::read_to_string(&path)
+                .expect("active log should be readable")
+                .contains("second")
+        );
+
+        drop(storage);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn zero_retention_keeps_archived_logs() {
+        let directory = std::env::temp_dir().join(format!(
+            "host-bridge-mcp-log-time-rotation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let data_directory =
+            DataDirectory::from_root(directory.clone()).expect("data directory should initialize");
+        let mut storage = LogFileStorage::new(LoggingConfig { retention_days: 0 }, &data_directory)
+            .expect("log storage should initialize");
+        let entry = ConsoleLogEntry {
+            timestamp: "2026-03-15T09:13:41.123456Z".to_string(),
+            level: ConsoleLogLevel::Info,
+            message: "line".to_string(),
+        };
+
+        storage.append(&entry, 0);
+        storage.active_date = "2000-01-01".to_string();
+        storage.append(&entry, 1);
+
+        assert_eq!(storage.archived_segments.len(), 1);
+        let archived_path = storage.archived_segments[0].path.clone();
+
+        drop(storage);
+        assert!(archived_path.exists());
+        let _ = fs::remove_dir_all(directory);
     }
 }

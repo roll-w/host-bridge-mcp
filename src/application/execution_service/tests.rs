@@ -16,8 +16,8 @@
 
 use super::*;
 use crate::config::{
-    CommandPolicyConfig, CommandRuleConfig, ExecutionConfig, ExecutionServerConfig,
-    PolicyAction, SshAuthConfig, SshAuthType, TargetPlatform,
+    CommandPolicyConfig, CommandRuleConfig, ExecutionConfig, ExecutionServerConfig, PolicyAction,
+    SshAuthConfig, SshAuthType, TargetPlatform,
 };
 use crate::domain::execution_target::SshAuthTarget;
 
@@ -54,6 +54,7 @@ async fn prepare_command_marks_confirmation_when_policy_requires_it() {
             command: "cargo".to_string(),
             default_working_directory: None,
             action: PolicyAction::Confirm,
+            targets: Vec::new(),
             rules: vec![CommandRuleConfig {
                 args_prefix: vec!["build".to_string()],
                 action: PolicyAction::Confirm,
@@ -93,12 +94,14 @@ async fn prepare_command_applies_wildcard_policy_and_exact_deny() {
             CommandPolicyConfig {
                 command: "rm".to_string(),
                 action: PolicyAction::Deny,
+                targets: Vec::new(),
                 default_working_directory: None,
                 rules: Vec::new(),
             },
             CommandPolicyConfig {
                 command: "*".to_string(),
                 action: PolicyAction::Allow,
+                targets: Vec::new(),
                 default_working_directory: None,
                 rules: Vec::new(),
             },
@@ -139,6 +142,7 @@ async fn prepare_command_does_not_allow_shell_operator_to_override_policy_deny()
         commands: vec![CommandPolicyConfig {
             command: "rm".to_string(),
             action: PolicyAction::Deny,
+            targets: Vec::new(),
             default_working_directory: None,
             rules: Vec::new(),
         }],
@@ -274,12 +278,18 @@ fn execution_record_preserves_merged_output_order() {
 fn execution_output_file_is_named_from_execution_id() {
     let execution_id =
         Uuid::parse_str("123e4567-e89b-12d3-a456-426614174000").expect("uuid should parse");
-    let path = execution_output_path(execution_id).expect("path should resolve");
+    let root = std::env::temp_dir().join(format!("host-bridge-mcp-output-path-{}", Uuid::new_v4()));
+    let data_directory =
+        DataDirectory::from_root(root.clone()).expect("data directory should initialize");
+    let path = data_directory
+        .execution_output_path(execution_id)
+        .expect("path should resolve");
 
     assert_eq!(
         path.file_name().and_then(|value| value.to_str()),
         Some("123e4567-e89b-12d3-a456-426614174000.log")
     );
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

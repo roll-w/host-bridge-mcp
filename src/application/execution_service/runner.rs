@@ -18,7 +18,7 @@ use super::{
     ExecutionEvent, ExecutionRecord, ExecutionState, HostRunExecution, RunExecution,
     RunExecutionBackend, SshRunExecution, TERMINATION_GRACE_PERIOD,
 };
-use crate::domain::platform::spawn::{apply_spawn_plan, SpawnPlanner};
+use crate::domain::platform::spawn::{SpawnPlanner, apply_spawn_plan};
 use crate::domain::ssh::SshClient;
 use std::io as std_io;
 use std::process::Stdio;
@@ -26,7 +26,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::task::JoinHandle;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
 pub(super) async fn run_execution(
@@ -359,6 +359,18 @@ where
 
 fn emit_event(execution_id: Uuid, record: &ExecutionRecord, event: ExecutionEvent) {
     log_execution_event(execution_id, &event);
+    if let ExecutionEvent::Exit {
+        code,
+        success,
+        timed_out,
+    } = &event
+    {
+        record.set_completion(super::ExecutionCompletion {
+            code: *code,
+            success: *success,
+            timed_out: *timed_out,
+        });
+    }
     if let ExecutionEvent::Output { text } = &event {
         if let Err(error) = record.append_output(text) {
             tracing::error!(
@@ -381,7 +393,7 @@ fn log_execution_event(execution_id: Uuid, event: &ExecutionEvent) {
         }
         ExecutionEvent::Output { text } => {
             let line = text.trim_end_matches(['\n', '\r']);
-            tracing::info!("[{execution_id}] output | {line}");
+            tracing::info!(target: "host_bridge::command_output", "[{execution_id}] output | {line}");
         }
         ExecutionEvent::Exit {
             code,

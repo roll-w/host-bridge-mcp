@@ -25,6 +25,29 @@ fn default_config_is_valid() {
 }
 
 #[test]
+fn allow_zero_log_retention_days() {
+    let config = AppConfig {
+        logging: LoggingConfig { retention_days: 0 },
+        ..AppConfig::default()
+    };
+
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn reject_empty_data_directory() {
+    let config = AppConfig {
+        data_dir: Some("   ".to_string()),
+        ..AppConfig::default()
+    };
+
+    let error = config
+        .validate()
+        .expect_err("empty data directory should be invalid");
+    assert!(error.to_string().contains("data-dir"));
+}
+
+#[test]
 fn load_wildcard_command_policy() {
     let path = write_temp_config(
         r#"server:
@@ -51,6 +74,7 @@ fn reject_command_policy_with_empty_command() {
             commands: vec![CommandPolicyConfig {
                 command: "   ".to_string(),
                 action: PolicyAction::Allow,
+                targets: Vec::new(),
                 default_working_directory: None,
                 rules: Vec::new(),
             }],
@@ -70,6 +94,7 @@ fn reject_nested_command_rule_without_args_prefix() {
             commands: vec![CommandPolicyConfig {
                 command: "cargo".to_string(),
                 action: PolicyAction::Allow,
+                targets: Vec::new(),
                 default_working_directory: None,
                 rules: vec![CommandRuleConfig {
                     args_prefix: Vec::new(),
@@ -97,6 +122,7 @@ fn reject_empty_nested_command_rule_token() {
             commands: vec![CommandPolicyConfig {
                 command: "cargo".to_string(),
                 action: PolicyAction::Allow,
+                targets: Vec::new(),
                 default_working_directory: None,
                 rules: vec![CommandRuleConfig {
                     args_prefix: vec!["build".to_string(), "   ".to_string()],
@@ -114,6 +140,30 @@ fn reject_empty_nested_command_rule_token() {
         error
             .to_string()
             .contains("execution.commands[0].rules[0].args-prefix[1]")
+    );
+}
+
+#[test]
+fn reject_command_policy_with_unknown_target() {
+    let config = AppConfig {
+        execution: ExecutionConfig {
+            commands: vec![CommandPolicyConfig {
+                command: "cargo".to_string(),
+                action: PolicyAction::Allow,
+                targets: vec!["missing".to_string()],
+                default_working_directory: None,
+                rules: Vec::new(),
+            }],
+            ..ExecutionConfig::default()
+        },
+        ..AppConfig::default()
+    };
+
+    let error = config.validate().expect_err("config should be invalid");
+    assert!(
+        error
+            .to_string()
+            .contains("execution.commands[0].targets references unknown target 'missing'")
     );
 }
 
@@ -138,7 +188,7 @@ fn resolved_temp_config(path: &PathBuf) -> ResolvedConfigPath {
 fn default_config_uses_single_server() {
     let config = AppConfig::default();
 
-    assert_eq!(config.server.bind_address, "127.0.0.1:8787");
+    assert_eq!(config.server.bind_address, "127.0.0.1:8810");
     assert_eq!(config.server.access, AccessConfig::default());
     assert_eq!(config.execution.default_server, "host");
     assert!(config.execution.servers.is_empty());

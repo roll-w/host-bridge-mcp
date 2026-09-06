@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -24,15 +24,17 @@ const DEFAULT_EXECUTION_SERVER: &str = "host";
 const DEFAULT_SSH_PORT: u16 = 22;
 const DEFAULT_SSH_CONNECTION_IDLE_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct AppConfig {
+    pub data_dir: Option<String>,
     pub server: ServerConfig,
     pub execution: ExecutionConfig,
     pub logging: LoggingConfig,
+    pub history: HistoryConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ServerConfig {
     #[serde(rename = "address")]
@@ -40,21 +42,26 @@ pub struct ServerConfig {
     pub access: AccessConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct AccessConfig {
     pub api_key_env: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct LoggingConfig {
-    pub memory_buffer_lines: usize,
-    pub file_path: Option<String>,
-    pub persist_file: bool,
+    pub retention_days: u64,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct HistoryConfig {
+    pub retention_days: u64,
+    pub max_records: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ExecutionConfig {
     pub default_action: PolicyAction,
@@ -69,7 +76,7 @@ pub struct ExecutionConfig {
     pub max_timeout_ms: u64,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(
     tag = "transport",
     rename_all_fields = "kebab-case",
@@ -99,7 +106,7 @@ pub enum ExecutionServerConfig {
     },
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct SshAuthConfig {
     #[serde(rename = "type")]
@@ -107,7 +114,7 @@ pub struct SshAuthConfig {
     pub r#ref: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum SshAuthType {
     #[default]
@@ -128,17 +135,19 @@ impl SshAuthType {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct CommandPolicyConfig {
     pub command: String,
     pub action: PolicyAction,
+    #[serde(default)]
+    pub targets: Vec<String>,
     pub default_working_directory: Option<String>,
     #[serde(default)]
     pub rules: Vec<CommandRuleConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct CommandRuleConfig {
     #[serde(default)]
@@ -147,7 +156,7 @@ pub struct CommandRuleConfig {
     pub default_working_directory: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum PolicyAction {
     Allow,
@@ -156,7 +165,7 @@ pub enum PolicyAction {
     Deny,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum TargetPlatform {
     #[default]
@@ -193,9 +202,11 @@ pub struct ResolvedConfigPath {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            data_dir: None,
             server: ServerConfig::default(),
             execution: ExecutionConfig::default(),
             logging: LoggingConfig::default(),
+            history: HistoryConfig::default(),
         }
     }
 }
@@ -203,7 +214,7 @@ impl Default for AppConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            bind_address: "127.0.0.1:8787".to_string(),
+            bind_address: "127.0.0.1:8810".to_string(),
             access: AccessConfig::default(),
         }
     }
@@ -217,10 +228,15 @@ impl Default for AccessConfig {
 
 impl Default for LoggingConfig {
     fn default() -> Self {
+        Self { retention_days: 30 }
+    }
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
         Self {
-            memory_buffer_lines: 2_000,
-            file_path: None,
-            persist_file: false,
+            retention_days: 30,
+            max_records: 1_000,
         }
     }
 }
@@ -286,8 +302,12 @@ impl AppConfig {
             path: resolved.path.clone(),
             source,
         })?;
-        let config = serde_saphyr::from_str::<Self>(&raw).map_err(|source| ConfigError::Parse {
-            path: resolved.path.clone(),
+        Self::parse_raw(&resolved.path, &raw)
+    }
+
+    pub fn parse_raw(path: &str, raw: &str) -> Result<Self, ConfigError> {
+        let config = serde_saphyr::from_str::<Self>(raw).map_err(|source| ConfigError::Parse {
+            path: path.to_string(),
             source,
         })?;
         config.validate()?;
@@ -295,6 +315,8 @@ impl AppConfig {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        validate_optional_non_empty(self.data_dir.as_deref(), "data-dir")?;
+
         if self.server.bind_address.trim().is_empty() {
             return Err(ConfigError::Validation(
                 "server.address cannot be empty".to_string(),
@@ -422,13 +444,37 @@ impl AppConfig {
             )));
         }
 
-        if self.logging.memory_buffer_lines == 0 {
+        for (index, command) in self.execution.commands.iter().enumerate() {
+            let mut policy_targets = HashSet::new();
+            for (target_index, target) in command.targets.iter().enumerate() {
+                validate_non_empty(
+                    target,
+                    &format!("execution.commands[{index}].targets[{target_index}]"),
+                )?;
+                if !policy_targets.insert(target) {
+                    return Err(ConfigError::Validation(format!(
+                        "execution.commands[{index}].targets duplicates target '{target}'"
+                    )));
+                }
+                if target != DEFAULT_EXECUTION_SERVER && !server_names.contains(target) {
+                    return Err(ConfigError::Validation(format!(
+                        "execution.commands[{index}].targets references unknown target '{target}'"
+                    )));
+                }
+            }
+        }
+
+        if self.history.retention_days == 0 {
             return Err(ConfigError::Validation(
-                "logging.memory-buffer-lines must be greater than zero".to_string(),
+                "history.retention-days must be greater than zero".to_string(),
             ));
         }
 
-        validate_working_directory(self.logging.file_path.as_deref(), "logging.file-path")?;
+        if self.history.max_records == 0 {
+            return Err(ConfigError::Validation(
+                "history.max-records must be greater than zero".to_string(),
+            ));
+        }
 
         Ok(())
     }

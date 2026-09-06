@@ -21,83 +21,120 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-const APP_DIR_NAME: &str = ".host-bridge-mcp";
+const APP_DIR_NAME: &str = ".host-bridge";
 const EXECUTIONS_DIR_NAME: &str = "executions";
+const EXECUTION_HISTORY_FILE_NAME: &str = "history.json";
 const LOGS_DIR_NAME: &str = "logs";
-const DEFAULT_LOG_FILE_NAME: &str = "host-bridge-mcp.log";
+const PASSWORDS_DIR_NAME: &str = "passwords";
+const DEFAULT_LOG_FILE_NAME: &str = "host-bridge.log";
 const TEMP_LOG_FILE_PREFIX: &str = "host-bridge-mcp-";
+const SSH_PASSWORD_FILE_PREFIX: &str = "ssh-password-";
 
-pub(crate) fn execution_output_path(execution_id: Uuid) -> io::Result<PathBuf> {
-    let executions_dir = resolve_data_subdir(EXECUTIONS_DIR_NAME)?;
-    Ok(executions_dir.join(format!("{execution_id}.log")))
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DataDirectory {
+    root: PathBuf,
 }
 
-pub(crate) fn default_persisted_log_path() -> io::Result<PathBuf> {
-    let logs_dir = resolve_data_subdir(LOGS_DIR_NAME)?;
-    Ok(persisted_log_path(&logs_dir))
+impl DataDirectory {
+    pub(crate) fn new(configured_path: Option<&str>) -> io::Result<Self> {
+        let root = configured_path
+            .map(resolve_configured_path)
+            .unwrap_or_else(default_data_dir);
+        ensure_directory(&root)?;
+        Ok(Self { root })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_root(root: PathBuf) -> io::Result<Self> {
+        ensure_directory(&root)?;
+        Ok(Self { root })
+    }
+
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn execution_output_path(&self, execution_id: Uuid) -> io::Result<PathBuf> {
+        Ok(self
+            .subdir(EXECUTIONS_DIR_NAME)?
+            .join(format!("{execution_id}.log")))
+    }
+
+    pub(crate) fn execution_history_path(&self) -> io::Result<PathBuf> {
+        Ok(self
+            .subdir(EXECUTIONS_DIR_NAME)?
+            .join(EXECUTION_HISTORY_FILE_NAME))
+    }
+
+    pub(crate) fn runtime_log_path(&self) -> io::Result<PathBuf> {
+        Ok(self.subdir(LOGS_DIR_NAME)?.join(DEFAULT_LOG_FILE_NAME))
+    }
+
+    pub(crate) fn temporary_log_path(&self) -> io::Result<PathBuf> {
+        Ok(self
+            .subdir(LOGS_DIR_NAME)?
+            .join(format!("{TEMP_LOG_FILE_PREFIX}{}.log", Uuid::new_v4())))
+    }
+
+    pub(crate) fn ssh_password_file_path(&self, server_name: &str) -> io::Result<PathBuf> {
+        Ok(self.subdir(PASSWORDS_DIR_NAME)?.join(format!(
+            "{SSH_PASSWORD_FILE_PREFIX}{}.txt",
+            encode_file_name_component(server_name)
+        )))
+    }
+
+    fn subdir(&self, name: &str) -> io::Result<PathBuf> {
+        let path = self.root.join(name);
+        ensure_directory(&path)?;
+        Ok(path)
+    }
 }
 
-pub(crate) fn default_temporary_log_path() -> io::Result<PathBuf> {
-    let logs_dir = resolve_data_subdir(LOGS_DIR_NAME)?;
-    Ok(temporary_log_path(&logs_dir, Uuid::new_v4()))
+fn default_data_dir() -> PathBuf {
+    resolve_home_dir()
+        .map(|home| home.join(APP_DIR_NAME))
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(APP_DIR_NAME)
+        })
 }
 
-fn resolve_data_subdir(name: &str) -> io::Result<PathBuf> {
-    let candidates = resolve_base_data_dir_candidates()?;
-    resolve_data_subdir_from_candidates(&candidates, name)
+fn resolve_configured_path(value: &str) -> PathBuf {
+    let value = value.trim();
+    let path = if value == "~" {
+        resolve_home_dir().unwrap_or_else(|| PathBuf::from(value))
+    } else if let Some(relative) = value.strip_prefix("~/") {
+        resolve_home_dir()
+            .map(|home| home.join(relative))
+            .unwrap_or_else(|| PathBuf::from(value))
+    } else {
+        PathBuf::from(value)
+    };
+
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
 }
 
-fn resolve_data_subdir_from_candidates(candidates: &[PathBuf], name: &str) -> io::Result<PathBuf> {
-    let mut failures = Vec::new();
-
-    for base_dir in candidates {
-        match ensure_data_subdir(base_dir, name) {
-            Ok(path) => return Ok(path),
-            Err(error) => failures.push(format!("{}: {error}", base_dir.display())),
+fn encode_file_name_component(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("-{byte:02x}"));
         }
     }
-
-    Err(io::Error::new(
-        io::ErrorKind::PermissionDenied,
-        format!(
-            "failed to initialize host-bridge data directory candidates: {}",
-            failures.join("; ")
-        ),
-    ))
-}
-
-fn ensure_data_subdir(base_dir: &Path, name: &str) -> io::Result<PathBuf> {
-    ensure_directory(&base_dir)?;
-
-    let subdir = base_dir.join(name);
-    ensure_directory(&subdir)?;
-
-    Ok(subdir)
-}
-
-fn persisted_log_path(data_dir: &Path) -> PathBuf {
-    data_dir.join(DEFAULT_LOG_FILE_NAME)
-}
-
-fn temporary_log_path(data_dir: &Path, file_id: Uuid) -> PathBuf {
-    data_dir.join(format!("{TEMP_LOG_FILE_PREFIX}{file_id}.log"))
-}
-
-fn resolve_base_data_dir_candidates() -> io::Result<Vec<PathBuf>> {
-    let mut candidates = Vec::new();
-
-    if let Some(home_dir) = resolve_home_dir() {
-        push_unique_path(&mut candidates, home_dir.join(APP_DIR_NAME));
+    if encoded.is_empty() {
+        "target".to_string()
+    } else {
+        encoded
     }
-
-    if let Ok(executable_path) = std::env::current_exe() {
-        if let Some(parent) = executable_path.parent() {
-            push_unique_path(&mut candidates, parent.join(APP_DIR_NAME));
-        }
-    }
-
-    push_unique_path(&mut candidates, std::env::current_dir()?.join(APP_DIR_NAME));
-    Ok(candidates)
 }
 
 #[cfg(not(windows))]
@@ -166,12 +203,6 @@ fn ensure_directory(path: &Path) -> io::Result<()> {
     builder.create(path)
 }
 
-fn push_unique_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
-    if paths.iter().all(|existing| existing != &candidate) {
-        paths.push(candidate);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,48 +229,52 @@ mod tests {
 
     #[test]
     fn default_log_file_name_is_stable() {
-        assert_eq!(DEFAULT_LOG_FILE_NAME, "host-bridge-mcp.log");
+        assert_eq!(DEFAULT_LOG_FILE_NAME, "host-bridge.log");
     }
 
     #[test]
-    fn persisted_log_path_uses_logs_subdir() {
-        let logs_dir = PathBuf::from("/tmp/.host-bridge-mcp/logs");
+    fn runtime_log_path_uses_logs_subdir() {
+        let root = unique_temp_path("runtime-log");
+        let directory = DataDirectory { root: root.clone() };
 
         assert_eq!(
-            persisted_log_path(&logs_dir),
-            PathBuf::from("/tmp/.host-bridge-mcp/logs/host-bridge-mcp.log")
+            directory.runtime_log_path().expect("runtime log path"),
+            root.join("logs/host-bridge.log")
         );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn temporary_log_path_uses_logs_subdir_with_unique_name() {
-        let logs_dir = PathBuf::from("/tmp/.host-bridge-mcp/logs");
-        let file_id =
-            Uuid::parse_str("123e4567-e89b-12d3-a456-426614174000").expect("uuid should parse");
+        let root = unique_temp_path("temporary-log");
+        let directory = DataDirectory { root: root.clone() };
+        let path = directory.temporary_log_path().expect("temporary log path");
 
-        assert_eq!(
-            temporary_log_path(&logs_dir, file_id),
-            PathBuf::from(
-                "/tmp/.host-bridge-mcp/logs/host-bridge-mcp-123e4567-e89b-12d3-a456-426614174000.log"
-            )
-        );
+        let logs_dir = root.join("logs");
+        assert_eq!(path.parent(), Some(logs_dir.as_path()));
+        let file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("temporary log path should have a file name");
+        assert!(file_name.starts_with(TEMP_LOG_FILE_PREFIX));
+        assert!(file_name.ends_with(".log"));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn data_subdir_falls_back_to_next_candidate_after_failure() {
-        let blocked_path = unique_temp_path("blocked");
-        let valid_base = unique_temp_path("valid");
-        fs::write(&blocked_path, "blocked").expect("blocked path should be created as file");
+    fn configured_data_directory_uses_exact_root() {
+        let root = unique_temp_path("configured");
+        let directory = DataDirectory::from_root(root.clone())
+            .expect("configured data directory should initialize");
 
-        let resolved = resolve_data_subdir_from_candidates(
-            &[blocked_path.clone(), valid_base.clone()],
-            EXECUTIONS_DIR_NAME,
-        )
-            .expect("fallback candidate should succeed");
+        assert_eq!(directory.root(), root.as_path());
+        assert_eq!(
+            directory.execution_history_path().expect("history path"),
+            root.join("executions/history.json")
+        );
 
-        assert_eq!(resolved, valid_base.join(EXECUTIONS_DIR_NAME));
-
-        let _ = fs::remove_file(blocked_path);
-        let _ = fs::remove_dir_all(valid_base);
+        let _ = fs::remove_dir_all(root);
     }
 }

@@ -20,11 +20,13 @@ mod config;
 mod domain;
 mod transport;
 
-use application::config_reload::{spawn_config_reloader, ConfigReloadParticipant};
+use application::browser;
+use application::config_reload::{ConfigReloadParticipant, spawn_config_reloader};
+use application::data_dir::DataDirectory;
 use application::execution_service::ExecutionService;
 use application::operator_console::{ConsoleLogLevel, OperatorConsole};
 use application::shutdown_controller::ShutdownController;
-use cli::{help_text, parse_args, version_text};
+use cli::{parse_args, resolve_bind_address};
 use config::AppConfig;
 use domain::platform::signal::wait_for_termination_signal;
 use std::fmt;
@@ -34,8 +36,9 @@ use std::sync::Arc;
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::field::Visit;
 use tracing_subscriber::layer::{Context, SubscriberExt};
-use tracing_subscriber::{fmt as tracing_fmt, util::SubscriberInitExt, EnvFilter, Layer};
-use transport::mcp_streamable_http::{router, RequestAuthController};
+use tracing_subscriber::{EnvFilter, Layer, fmt as tracing_fmt, util::SubscriberInitExt};
+use transport::auth::RequestAuthController;
+use transport::http::{WebSessionController, router};
 use transport::tui;
 
 #[tokio::main(flavor = "multi_thread")]
@@ -43,36 +46,53 @@ async fn main() -> ExitCode {
     let cli_options = match parse_args(std::env::args()) {
         Ok(options) => options,
         Err(error) => {
-            eprintln!("{error}");
-            return ExitCode::from(2);
+            let exit_code = error.exit_code();
+            if error.use_stderr() {
+                eprint!("{error}");
+            } else {
+                print!("{error}");
+            }
+            return ExitCode::from(exit_code as u8);
         }
     };
-
-    if cli_options.show_help {
-        let program_name = std::env::args()
-            .next()
-            .unwrap_or_else(|| "host-bridge-mcp".to_string());
-        println!("{}", help_text(&program_name));
-        return ExitCode::SUCCESS;
-    }
-
-    if cli_options.show_version {
-        println!("{}", version_text());
-        return ExitCode::SUCCESS;
-    }
 
     let config_path = AppConfig::resolve_config_path(cli_options.config_path.as_deref());
     let load_result = AppConfig::load_from_resolved_path(&config_path);
 
-    let config = match load_result {
-        Ok(config) => Arc::new(config),
+    let mut loaded_config = match load_result {
+        Ok(config) => config,
         Err(error) => {
             eprintln!("Failed to load config: {error}");
             return ExitCode::FAILURE;
         }
     };
 
-    let operator_console = match OperatorConsole::new(config.logging.clone()) {
+    match resolve_bind_address(
+        &loaded_config.server.bind_address,
+        cli_options.host.as_deref(),
+        cli_options.port,
+    ) {
+        Ok(bind_address) => loaded_config.server.bind_address = bind_address,
+        Err(error) => {
+            eprintln!("Invalid bind address override: {error}");
+            return ExitCode::from(2);
+        }
+    }
+
+    let config = Arc::new(loaded_config);
+
+    let data_directory = match DataDirectory::new(config.data_dir.as_deref()) {
+        Ok(data_directory) => data_directory,
+        Err(error) => {
+            eprintln!("Failed to initialize application data directory: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let operator_console = match OperatorConsole::with_data_directory(
+        config.logging.clone(),
+        data_directory.clone(),
+    ) {
         Ok(console) => console,
         Err(error) => {
             eprintln!("Failed to initialize log storage: {error}");
@@ -81,7 +101,11 @@ async fn main() -> ExitCode {
     };
 
     let shutdown_controller = ShutdownController::default();
-    let tui_active = tui::start(operator_console.clone(), shutdown_controller.clone());
+    let tui_active = tui::start(
+        operator_console.clone(),
+        shutdown_controller.clone(),
+        cli_options.tui,
+    );
     init_logging(operator_console.clone(), !tui_active);
 
     if tui_active {
@@ -101,11 +125,24 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let execution_service = ExecutionService::new(config.clone());
+    let execution_service =
+        match ExecutionService::try_new_with_data_directory(config.clone(), data_directory.clone())
+        {
+            Ok(service) => service,
+            Err(error) => {
+                tracing::error!(error = %error, "Failed to initialize execution service");
+                return ExitCode::FAILURE;
+            }
+        };
+    let web_session = WebSessionController::new();
     let app = router(
         execution_service.clone(),
         operator_console.clone(),
         auth_controller.clone(),
+        config_path.clone(),
+        config.clone(),
+        web_session.clone(),
+        data_directory,
     );
     let reload_participants: Vec<Box<dyn ConfigReloadParticipant>> = vec![
         Box::new(operator_console.clone()),
@@ -127,6 +164,15 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    if cli_options.web {
+        let web_url = web_session.create_bootstrap_url(bind_address);
+        if let Err(error) = browser::open(&web_url) {
+            tracing::warn!(error = %error, "Failed to open the web console in a browser");
+        } else {
+            tracing::info!("Web console opened in the default browser");
+        }
+    }
 
     tracing::info!(
         bind_address = %bind_address,
@@ -190,7 +236,12 @@ where
 
         let mut visitor = EventFieldVisitor::default();
         event.record(&mut visitor);
-        self.operator_console.push_log(level, visitor.finish());
+        if event.metadata().target() == "host_bridge::command_output" {
+            self.operator_console
+                .push_command_output_log(level, visitor.finish());
+        } else {
+            self.operator_console.push_log(level, visitor.finish());
+        }
     }
 }
 

@@ -14,36 +14,29 @@
  * limitations under the License.
  */
 
-use crate::application::execution_service::{ExecutionError, ExecutionEvent};
-use crate::transport::mcp_streamable_http::HttpState;
+use super::HttpState;
+use super::api_handlers::{execution_error_to_api, parse_execution_id};
+use crate::application::execution_service::ExecutionEvent;
 use axum::extract::{Path, State};
-use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
-use axum::{http::StatusCode, Json};
-use serde_json::{json, Value};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use std::convert::Infallible;
 use std::time::Duration;
-use tokio_stream::once;
-use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
-use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
-use uuid::Uuid;
+use tokio_stream::once;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
-pub(super) async fn health() -> Json<Value> {
-    Json(json!({ "status": "ok" }))
-}
-
-pub(super) async fn stream_execution(
+pub(crate) async fn stream_execution(
     Path(execution_id): Path<String>,
     State(state): State<HttpState>,
-) -> Result<impl IntoResponse, StatusCode> {
-    let execution_id = Uuid::parse_str(&execution_id).map_err(|_| StatusCode::BAD_REQUEST)?;
-
+) -> Result<impl IntoResponse, crate::transport::api::ApiError> {
+    let execution_id = parse_execution_id(&execution_id)?;
     let subscription = state
         .execution_service
         .subscribe(execution_id)
         .await
-        .map_err(|error| execution_error_to_status(&error))?;
+        .map_err(execution_error_to_api)?;
 
     let initial_event =
         Event::default()
@@ -52,7 +45,6 @@ pub(super) async fn stream_execution(
                 state: subscription.current_state,
                 message: Some("Subscribed to execution stream".to_string()),
             }));
-
     let initial_stream = once(Ok::<Event, Infallible>(initial_event));
     let updates = BroadcastStream::new(subscription.receiver).filter_map(|event| match event {
         Ok(event) => Some(Ok::<Event, Infallible>(to_sse_event(&event))),
@@ -61,19 +53,11 @@ pub(super) async fn stream_execution(
         }
     });
 
-    let stream = initial_stream.chain(updates);
-    Ok(Sse::new(stream).keep_alive(
+    Ok(Sse::new(initial_stream.chain(updates)).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
             .text("keep-alive"),
     ))
-}
-
-fn execution_error_to_status(error: &ExecutionError) -> StatusCode {
-    match error {
-        ExecutionError::NotFound(_) => StatusCode::NOT_FOUND,
-        _ => StatusCode::BAD_REQUEST,
-    }
 }
 
 fn to_sse_event(event: &ExecutionEvent) -> Event {
@@ -83,13 +67,9 @@ fn to_sse_event(event: &ExecutionEvent) -> Event {
 }
 
 fn lagged_event(skipped: u64) -> Event {
-    Event::default().event("lagged").data(
-        json!({
-            "type": "lagged",
-            "skipped": skipped,
-        })
-            .to_string(),
-    )
+    Event::default()
+        .event("lagged")
+        .data(serde_json::json!({ "type": "lagged", "skipped": skipped }).to_string())
 }
 
 fn event_name(event: &ExecutionEvent) -> &'static str {
@@ -103,7 +83,7 @@ fn event_name(event: &ExecutionEvent) -> &'static str {
 
 fn serialize_event(event: &ExecutionEvent) -> String {
     serde_json::to_string(event).unwrap_or_else(|error| {
-        json!({
+        serde_json::json!({
             "type": "error",
             "message": format!("failed to serialize event: {error}")
         })

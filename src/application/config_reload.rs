@@ -18,7 +18,7 @@ use crate::application::execution_service::{ExecutionRuntimeConfig, ExecutionSer
 use crate::application::operator_console::{OperatorConsole, PreparedLoggingReconfigure};
 use crate::application::shutdown_controller::ShutdownController;
 use crate::config::{AppConfig, LoggingConfig, ResolvedConfigPath};
-use crate::transport::mcp_streamable_http::{RequestAuthController, RequestAuthState};
+use crate::transport::auth::{RequestAuthController, RequestAuthState};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::hash_map::DefaultHasher;
 use std::ffi::OsStr;
@@ -75,6 +75,7 @@ struct PreparedConsoleReload {
 
 struct ConfigReloadState {
     running_bind_address: String,
+    running_data_dir: Option<String>,
     applied_logging: LoggingConfig,
     last_applied_fingerprint: ConfigFileFingerprint,
     last_failed_fingerprint: Option<ConfigFileFingerprint>,
@@ -237,6 +238,7 @@ impl ConfigReloadContext {
 
 impl ConfigReloadState {
     fn new(config_path: &ResolvedConfigPath, initial_config: AppConfig) -> Self {
+        let running_data_dir = initial_config.data_dir.clone();
         let last_applied_fingerprint = match ConfigFileFingerprint::capture(&config_path.path) {
             Ok(fingerprint) => fingerprint,
             Err(error) => {
@@ -251,6 +253,7 @@ impl ConfigReloadState {
 
         Self {
             running_bind_address: initial_config.server.bind_address,
+            running_data_dir,
             applied_logging: initial_config.logging,
             last_applied_fingerprint,
             last_failed_fingerprint: None,
@@ -310,7 +313,19 @@ impl ConfigReloadState {
                 configured_address = %prepared.config.server.bind_address,
                 "Config reloaded, but server.address changes require a restart"
             );
-        } else {
+        }
+
+        if prepared.config.data_dir != self.running_data_dir {
+            tracing::warn!(
+                active_data_dir = ?self.running_data_dir,
+                configured_data_dir = ?prepared.config.data_dir,
+                "Config reloaded, but data-dir changes require a restart"
+            );
+        }
+
+        if prepared.config.server.bind_address == self.running_bind_address
+            && prepared.config.data_dir == self.running_data_dir
+        {
             tracing::info!(path = %config_path.path, "Config file reloaded");
         }
     }
@@ -455,7 +470,7 @@ pub(crate) enum ReloadPrepareError {
     #[error(transparent)]
     Config(#[from] crate::config::ConfigError),
     #[error(transparent)]
-    Auth(#[from] crate::transport::mcp_streamable_http::TransportAuthError),
+    Auth(#[from] crate::transport::auth::TransportAuthError),
     #[error(transparent)]
     Logging(#[from] std::io::Error),
 }
@@ -631,7 +646,7 @@ mod tests {
             r#"server:
   address: 127.0.0.1:8787
 logging:
-  memory-buffer-lines: 10
+  retention-days: 30
 execution:
   default-action: allow
 "#,
@@ -668,7 +683,7 @@ execution:
             r#"server:
   address: 127.0.0.1:9999
 logging:
-  memory-buffer-lines: 10
+  retention-days: 30
 execution:
   default-action: deny
 "#,
@@ -677,9 +692,7 @@ execution:
 
         state.reload_if_needed(&resolved_path, &reload_context);
 
-        let launch_result = service
-            .launch_prepared_command(initial_prepare)
-            .await;
+        let launch_result = service.launch_prepared_command(initial_prepare).await;
         assert!(matches!(
             launch_result,
             Err(ExecutionError::ConfigurationChanged)
@@ -723,7 +736,7 @@ execution:
             r#"server:
   address: 127.0.0.1:8787
 logging:
-  memory-buffer-lines: 10
+  retention-days: 30
 execution:
   default-action: allow
 "#,
@@ -775,7 +788,7 @@ execution:
             r#"server:
   address: 127.0.0.1:8787
 logging:
-  memory-buffer-lines: 10
+  retention-days: 30
 execution:
   default-action: allow
 "#,
@@ -788,7 +801,7 @@ execution:
         let failing_contents = r#"server:
   address: 127.0.0.1:8787
 logging:
-  memory-buffer-lines: 20
+  retention-days: 20
 execution:
   default-action: deny
 "#;
@@ -808,7 +821,7 @@ execution:
             r#"server:
   address: 127.0.0.1:8787
 logging:
-  memory-buffer-lines: 10
+  retention-days: 30
 execution:
   default-action: allow
 "#,
@@ -883,32 +896,14 @@ execution:
     }
 
     #[test]
-    fn logging_reconfiguration_swaps_log_path() {
-        let initial_path =
-            std::env::temp_dir().join(format!("host-bridge-log-a-{}.log", uuid::Uuid::new_v4()));
-        let next_path =
-            std::env::temp_dir().join(format!("host-bridge-log-b-{}.log", uuid::Uuid::new_v4()));
-        let console = OperatorConsole::new(LoggingConfig {
-            memory_buffer_lines: 2,
-            file_path: Some(initial_path.display().to_string()),
-            persist_file: true,
-        })
-            .expect("console should initialize");
+    fn logging_reconfiguration_updates_retention_policy() {
+        let console =
+            OperatorConsole::new(LoggingConfig::default()).expect("console should initialize");
 
         console
-            .reconfigure_logging(LoggingConfig {
-                memory_buffer_lines: 2,
-                file_path: Some(next_path.display().to_string()),
-                persist_file: true,
-            })
+            .reconfigure_logging(LoggingConfig { retention_days: 0 })
             .expect("logging should reconfigure");
 
-        assert_eq!(
-            console.snapshot().log_file_path,
-            next_path.display().to_string()
-        );
-
-        let _ = fs::remove_file(initial_path);
-        let _ = fs::remove_file(next_path);
+        assert_eq!(console.snapshot().interactive, false);
     }
 }

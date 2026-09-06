@@ -180,7 +180,7 @@ fn take_last_chars(text: &str, count: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{OutputRenderOptions, CHAR_TRUNCATION_MARKER};
+    use super::{CHAR_TRUNCATION_MARKER, OutputRenderOptions};
 
     #[test]
     fn keeps_output_unchanged_without_limits() {

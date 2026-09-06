@@ -22,14 +22,23 @@ mod terminal;
 use self::input::handle_input;
 use self::render::render;
 use self::state::TuiState;
-use self::terminal::{setup_terminal, TerminalGuard};
+use self::terminal::{TerminalGuard, setup_terminal};
 use crate::application::operator_console::OperatorConsole;
 use crate::application::shutdown_controller::ShutdownController;
 use crossterm::event;
 use std::io::{self, IsTerminal, Write};
 use std::time::Duration;
 
-pub fn start(console: OperatorConsole, shutdown_controller: ShutdownController) -> bool {
+pub fn start(
+    console: OperatorConsole,
+    shutdown_controller: ShutdownController,
+    enabled: bool,
+) -> bool {
+    if !enabled {
+        console.set_interactive(false);
+        return false;
+    }
+
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
     console.set_interactive(interactive);
     if !interactive {
@@ -90,9 +99,25 @@ fn run(console: OperatorConsole, shutdown_controller: ShutdownController) -> io:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::data_dir::DataDirectory;
     use crate::application::operator_console::ConsoleSnapshot;
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
+    use std::fs;
+
+    fn test_console() -> OperatorConsole {
+        let root =
+            std::env::temp_dir().join(format!("host-bridge-mcp-tui-{}", uuid::Uuid::new_v4()));
+        let data_directory =
+            DataDirectory::from_root(root.clone()).expect("test data directory should initialize");
+        let console = OperatorConsole::with_data_directory(
+            crate::config::LoggingConfig::default(),
+            data_directory,
+        )
+            .expect("test operator console should initialize");
+        let _ = fs::remove_dir_all(root);
+        console
+    }
 
     fn snapshot(total_log_count: usize) -> ConsoleSnapshot {
         ConsoleSnapshot {
@@ -132,7 +157,7 @@ mod tests {
 
     #[test]
     fn uppercase_q_requests_shutdown() {
-        let console = OperatorConsole::default();
+        let console = test_console();
         let shutdown_controller = ShutdownController::default();
         let snapshot = snapshot(0);
         let mut state = TuiState::default();
@@ -164,7 +189,7 @@ mod tests {
 
     #[test]
     fn right_and_left_keys_scroll_logs_horizontally() {
-        let console = OperatorConsole::default();
+        let console = test_console();
         let shutdown_controller = ShutdownController::default();
         let snapshot = snapshot(1);
         let mut state = TuiState::default();

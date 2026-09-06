@@ -15,7 +15,10 @@
  */
 
 use crate::application::command_parser::{CommandParseError, parse_command_line};
-use crate::application::data_dir::execution_output_path;
+use crate::application::data_dir::DataDirectory;
+use crate::application::execution_history::{
+    ExecutionHistoryError, ExecutionHistoryPage, ExecutionHistoryStore,
+};
 use crate::config::AppConfig;
 use crate::domain::execution_target::{
     ExecutionEnvironmentSummary, ExecutionTarget, ExecutionTargetRegistry, ExecutionTransport,
@@ -58,12 +61,22 @@ pub enum ExecutionError {
     InvalidTimeout,
     #[error("failed to initialize execution output store: {0}")]
     OutputStore(String),
+    #[error("failed to update execution history: {0}")]
+    HistoryStore(String),
     #[error("execution '{0}' not found")]
     NotFound(Uuid),
     #[error("invalid working directory: {0}")]
     InvalidWorkingDirectory(String),
     #[error("execution configuration changed before the command could start")]
     ConfigurationChanged,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ExecutionServiceInitError {
+    #[error("failed to initialize application data directory: {0}")]
+    DataDirectory(String),
+    #[error("failed to initialize execution history: {0}")]
+    History(#[from] ExecutionHistoryError),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -106,7 +119,7 @@ pub struct ExecutionLaunch {
     pub state: LaunchState,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionState {
     Running,
@@ -141,6 +154,7 @@ pub struct ExecutionSubscription {
 
 #[derive(Debug, Clone)]
 pub struct PreparedExecution {
+    execution_id: Uuid,
     runtime: Arc<ExecutionRuntimeConfig>,
     run: RunExecution,
     confirmation_request: Option<ConfirmationRequest>,
@@ -152,6 +166,8 @@ pub struct ExecutionService {
     spawn_planner: SpawnPlanner,
     ssh_client: Arc<SshClient>,
     records: Arc<RwLock<HashMap<Uuid, Arc<ExecutionRecord>>>>,
+    history: Arc<ExecutionHistoryStore>,
+    data_directory: DataDirectory,
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +176,7 @@ pub(crate) struct ExecutionRuntimeConfig {
     targets: ExecutionTargetRegistry,
     default_timeout_ms: u64,
     max_timeout_ms: u64,
+    history_config: crate::config::HistoryConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -195,7 +212,15 @@ struct SshRunExecution {
 struct ExecutionRecord {
     sender: broadcast::Sender<ExecutionEvent>,
     state: Mutex<ExecutionState>,
+    completion: StdMutex<Option<ExecutionCompletion>>,
     output_store: StdMutex<RawOutputStore>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ExecutionCompletion {
+    pub(super) code: i32,
+    pub(super) success: bool,
+    pub(super) timed_out: bool,
 }
 
 struct RawOutputStore {
@@ -204,14 +229,19 @@ struct RawOutputStore {
 }
 
 impl PreparedExecution {
+    pub fn execution_id(&self) -> Uuid {
+        self.execution_id
+    }
+
     pub fn confirmation_request(&self) -> Option<&ConfirmationRequest> {
         self.confirmation_request.as_ref()
     }
 }
 
 impl ExecutionRecord {
-    fn new(execution_id: Uuid) -> Result<Self, ExecutionError> {
-        let path = execution_output_path(execution_id)
+    fn new(execution_id: Uuid, data_directory: &DataDirectory) -> Result<Self, ExecutionError> {
+        let path = data_directory
+            .execution_output_path(execution_id)
             .map_err(|error| ExecutionError::OutputStore(error.to_string()))?;
         Self::with_output_path(path)
     }
@@ -221,6 +251,7 @@ impl ExecutionRecord {
         Ok(Self {
             sender,
             state: Mutex::new(ExecutionState::Running),
+            completion: StdMutex::new(None),
             output_store: StdMutex::new(RawOutputStore::new(path)?),
         })
     }
@@ -235,6 +266,20 @@ impl ExecutionRecord {
 
     async fn set_state(&self, state: ExecutionState) {
         *self.state.lock().await = state;
+    }
+
+    fn set_completion(&self, completion: ExecutionCompletion) {
+        *self
+            .completion
+            .lock()
+            .expect("execution completion lock poisoned") = Some(completion);
+    }
+
+    fn completion(&self) -> Option<ExecutionCompletion> {
+        self.completion
+            .lock()
+            .expect("execution completion lock poisoned")
+            .clone()
     }
 
     fn send(&self, event: ExecutionEvent) {
@@ -298,7 +343,9 @@ impl RawOutputStore {
     }
 
     fn read_all(&mut self) -> std_io::Result<String> {
-        self.close()?;
+        if let Some(file) = self.file.as_mut() {
+            file.flush()?;
+        }
         fs::read_to_string(&self.path)
     }
 
@@ -318,15 +365,35 @@ impl Drop for RawOutputStore {
 }
 
 impl ExecutionService {
+    #[cfg(test)]
     pub fn new(config: Arc<AppConfig>) -> Self {
-        let runtime = Self::prepare_runtime(&config);
+        Self::try_new(config).expect("execution service should initialize")
+    }
 
-        Self {
+    pub fn try_new(config: Arc<AppConfig>) -> Result<Self, ExecutionServiceInitError> {
+        let data_directory = DataDirectory::new(config.data_dir.as_deref())
+            .map_err(|error| ExecutionServiceInitError::DataDirectory(error.to_string()))?;
+        Self::try_new_with_data_directory(config, data_directory)
+    }
+
+    pub fn try_new_with_data_directory(
+        config: Arc<AppConfig>,
+        data_directory: DataDirectory,
+    ) -> Result<Self, ExecutionServiceInitError> {
+        let runtime = Self::prepare_runtime(&config);
+        let history = Arc::new(ExecutionHistoryStore::new(
+            config.history.clone(),
+            data_directory.clone(),
+        )?);
+
+        Ok(Self {
             runtime: Arc::new(StdRwLock::new(runtime)),
             spawn_planner: SpawnPlanner::current(),
             ssh_client: Arc::new(SshClient::new()),
             records: Arc::new(RwLock::new(HashMap::new())),
-        }
+            history,
+            data_directory,
+        })
     }
 
     pub(crate) fn prepare_runtime(config: &AppConfig) -> Arc<ExecutionRuntimeConfig> {
@@ -334,6 +401,10 @@ impl ExecutionService {
     }
 
     pub(crate) fn apply_runtime(&self, runtime: Arc<ExecutionRuntimeConfig>) {
+        if let Err(error) = self.history.set_config(runtime.history_config.clone()) {
+            tracing::error!(error = %error, "Failed to apply execution history configuration");
+            return;
+        }
         *self
             .runtime
             .write()
@@ -352,15 +423,43 @@ impl ExecutionService {
         self.runtime_snapshot().targets.environments()
     }
 
+    pub fn list_history(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<ExecutionHistoryPage, ExecutionError> {
+        self.history
+            .list(offset, limit)
+            .map_err(|error| ExecutionError::HistoryStore(error.to_string()))
+    }
+
+    pub fn delete_history(&self, execution_id: Uuid) -> Result<bool, ExecutionError> {
+        self.history
+            .delete(execution_id)
+            .map_err(|error| ExecutionError::HistoryStore(error.to_string()))
+    }
+
+    pub fn get_history(
+        &self,
+        execution_id: Uuid,
+    ) -> Result<Option<crate::application::execution_history::ExecutionHistoryEntry>, ExecutionError>
+    {
+        self.history
+            .get(execution_id)
+            .map_err(|error| ExecutionError::HistoryStore(error.to_string()))
+    }
+
     pub async fn prepare_command(
         &self,
         input: ExecuteCommandInput,
     ) -> Result<PreparedExecution, ExecutionError> {
         let runtime = self.runtime_snapshot();
+        let execution_id = Uuid::new_v4();
         let parsed = parse_command_line(&input.command)?;
+        let target = runtime.resolve_target(input.server.as_deref())?.clone();
         let policy = runtime
             .policy_engine
-            .evaluate(&parsed.program, &parsed.args);
+            .evaluate(&target.name, &parsed.program, &parsed.args);
 
         if policy.decision == PolicyDecision::Deny {
             tracing::warn!(command = %input.command, "Policy denied command");
@@ -377,7 +476,6 @@ impl ExecutionService {
             );
         }
 
-        let target = runtime.resolve_target(input.server.as_deref())?.clone();
         let timeout_ms = runtime.resolve_timeout(input.timeout_ms)?;
         let executable = parsed.program.clone();
         let args = parsed.args.clone();
@@ -422,20 +520,20 @@ impl ExecutionService {
             }
         };
 
-        let confirmation_request =
-            requires_confirmation.then(|| ConfirmationRequest {
-                server: target.name.clone(),
-                platform: target.target_platform.as_name().to_string(),
-                command_line: input.command.clone(),
-                executable: executable.clone(),
-                args: args.clone(),
-                working_directory: preview_working_directory.clone(),
-                timeout_ms,
-                env: input.env.clone(),
-                contains_shell_operator: parsed.contains_shell_operator,
-            });
+        let confirmation_request = requires_confirmation.then(|| ConfirmationRequest {
+            server: target.name.clone(),
+            platform: target.target_platform.as_name().to_string(),
+            command_line: input.command.clone(),
+            executable: executable.clone(),
+            args: args.clone(),
+            working_directory: preview_working_directory.clone(),
+            timeout_ms,
+            env: input.env.clone(),
+            contains_shell_operator: parsed.contains_shell_operator,
+        });
 
         Ok(PreparedExecution {
+            execution_id,
             runtime,
             run: RunExecution {
                 command_line: input.command,
@@ -459,11 +557,18 @@ impl ExecutionService {
             return Err(ExecutionError::ConfigurationChanged);
         }
 
-        let execution_id = Uuid::new_v4();
+        let execution_id = prepared.execution_id;
         let command_line = prepared.run.command_line.clone();
-        let record = Arc::new(ExecutionRecord::new(execution_id)?);
+        let record = Arc::new(ExecutionRecord::new(execution_id, &self.data_directory)?);
         let receiver = record.subscribe();
 
+        self.history
+            .record_started(
+                execution_id,
+                command_line.clone(),
+                prepared.run.server_name.clone(),
+            )
+            .map_err(|error| ExecutionError::HistoryStore(error.to_string()))?;
         self.records
             .write()
             .await
@@ -505,15 +610,23 @@ impl ExecutionService {
     }
 
     pub async fn read_output(&self, execution_id: Uuid) -> Result<String, ExecutionError> {
-        let record = self
-            .records
-            .read()
-            .await
-            .get(&execution_id)
-            .cloned()
-            .ok_or(ExecutionError::NotFound(execution_id))?;
-
-        record.read_output()
+        let record = self.records.read().await.get(&execution_id).cloned();
+        match record {
+            Some(record) => record.read_output(),
+            None => {
+                let path = self
+                    .data_directory
+                    .execution_output_path(execution_id)
+                    .map_err(|error| ExecutionError::OutputStore(error.to_string()))?;
+                fs::read_to_string(path).map_err(|error| {
+                    if error.kind() == std_io::ErrorKind::NotFound {
+                        ExecutionError::NotFound(execution_id)
+                    } else {
+                        ExecutionError::OutputStore(error.to_string())
+                    }
+                })
+            }
+        }
     }
 
     async fn spawn_execution(
@@ -523,10 +636,31 @@ impl ExecutionService {
         run: RunExecution,
     ) {
         let records = self.records.clone();
+        let history = self.history.clone();
         let spawn_planner = self.spawn_planner.clone();
         let ssh_client = self.ssh_client.clone();
         tokio::spawn(async move {
-            run_execution(execution_id, record, run, spawn_planner, ssh_client).await;
+            run_execution(execution_id, record.clone(), run, spawn_planner, ssh_client).await;
+            let completion = record.completion();
+            let state = record.get_state().await;
+            let (exit_code, success, timed_out) = completion
+                .map(|completion| {
+                    (
+                        Some(completion.code),
+                        Some(completion.success),
+                        Some(completion.timed_out),
+                    )
+                })
+                .unwrap_or((None, None, None));
+            if let Err(error) =
+                history.record_finished(execution_id, state, exit_code, success, timed_out)
+            {
+                tracing::error!(
+                    execution_id = %execution_id,
+                    error = %error,
+                    "Failed to persist execution history"
+                );
+            }
             tokio::time::sleep(EXECUTION_RECORD_RETENTION).await;
             records.write().await.remove(&execution_id);
         });
@@ -607,6 +741,7 @@ impl ExecutionRuntimeConfig {
             targets: ExecutionTargetRegistry::from_config(&config.execution),
             default_timeout_ms: config.execution.default_timeout_ms,
             max_timeout_ms: config.execution.max_timeout_ms,
+            history_config: config.history.clone(),
         }
     }
 

@@ -12,9 +12,14 @@
 #
 # YAML note: quote a standalone wildcard, for example `command: "*"`.
 
+# Application data is stored here by default. This directory contains
+# execution history, command output, runtime logs, and generated password
+# files. Leave it unset to use ~/.host-bridge.
+# data-dir: ~/.host-bridge
+
 server:
   # HTTP bind address. Keep this on loopback unless the network is trusted.
-  address: 127.0.0.1:8787
+  address: "127.0.0.1:8810"
 
   # Optional bearer-token authentication for /mcp and execution streams.
   # The value is an environment variable name, not the secret itself.
@@ -22,15 +27,16 @@ server:
   #   api-key-env: HOST_BRIDGE_API_KEY
 
 logging:
-  # Number of recent log lines kept in memory for fast TUI access.
-  memory-buffer-lines: 2000
+  # Runtime logs rotate automatically when the calendar date changes.
+  # Set to 0 to keep archived logs indefinitely.
+  retention-days: 30
 
-  # Keep the current log file after shutdown.
-  persist-file: false
+history:
+  # Completed execution records older than this many days are removed.
+  retention-days: 30
 
-  # Optional explicit backing log file. If omitted, logs live under the
-  # host-bridge data directory.
-  # file-path: /absolute/path/to/host-bridge-mcp.log
+  # Keep at most this many completed execution records.
+  max-records: 1000
 
 execution:
   # Fallback for commands without a matching command policy.
@@ -68,6 +74,8 @@ execution:
   #     action: confirm
   #   - command: cargo
   #     action: allow
+  #     # Optional target scope. Omit or leave empty to apply to every target.
+  #     targets: [host, build-linux]
   #     rules:
   #       - args-prefix:
   #           - publish

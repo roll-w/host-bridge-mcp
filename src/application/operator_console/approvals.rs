@@ -71,6 +71,7 @@ impl SessionApprovalKey {
 
 pub(super) struct PendingApproval {
     pub(super) id: Uuid,
+    pub(super) execution_id: Uuid,
     pub(super) request: ConfirmationRequest,
     pub(super) created_at: String,
     session_approval_key: Option<SessionApprovalKey>,
@@ -86,12 +87,14 @@ pub(super) struct PendingApprovalGuard {
 impl PendingApproval {
     pub(super) fn new(
         id: Uuid,
+        execution_id: Uuid,
         request: ConfirmationRequest,
         responder: oneshot::Sender<bool>,
         session_approval_key: Option<SessionApprovalKey>,
     ) -> Self {
         Self {
             id,
+            execution_id,
             request,
             created_at: super::current_console_timestamp(),
             session_approval_key,

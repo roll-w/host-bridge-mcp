@@ -14,5 +14,8 @@
  * limitations under the License.
  */
 
+pub mod api;
+pub(crate) mod auth;
+pub mod http;
 pub mod mcp_streamable_http;
 pub mod tui;

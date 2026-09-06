@@ -21,33 +21,39 @@ mod sanitize;
 use self::approvals::{PendingApproval, PendingApprovalGuard, SessionApprovalKey};
 use self::log_store::{LogStore, PreparedLogStore};
 use self::sanitize::sanitize_console_text;
+use crate::application::data_dir::DataDirectory;
 use crate::application::execution_service::ConfirmationRequest;
 use crate::config::LoggingConfig;
-use std::collections::HashSet;
+use serde::Serialize;
+use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::sync::{Arc, Mutex};
-use tokio::sync::oneshot;
+use tokio::sync::{broadcast, oneshot};
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::{FormatTime, SystemTime as TracingSystemTime};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ConsoleLogLevel {
     Info,
     Warn,
     Error,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ConsoleLogEntry {
     pub timestamp: String,
     pub level: ConsoleLogLevel,
     pub message: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PendingApprovalView {
     pub id: Uuid,
+    pub execution_id: Uuid,
     pub request: ConfirmationRequest,
     pub created_at: String,
 }
@@ -59,10 +65,13 @@ pub enum ApprovalDecision {
     Reject,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ConsoleSnapshot {
     pub interactive: bool,
+    #[serde(skip_serializing)]
     pub total_log_count: usize,
+    #[serde(skip_serializing)]
     pub log_file_path: String,
     pub pending_approvals: Vec<PendingApprovalView>,
 }
@@ -78,6 +87,13 @@ fn current_console_timestamp() -> String {
 
     output.truncate(output.trim_end().len());
     output
+}
+
+fn push_runtime_log(state: &mut ConsoleState, entry: ConsoleLogEntry) {
+    if state.runtime_logs.len() >= state.log_store.buffer_limit() {
+        state.runtime_logs.pop_front();
+    }
+    state.runtime_logs.push_back(entry);
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -100,16 +116,29 @@ pub(crate) struct PreparedLoggingReconfigure {
 struct ConsoleState {
     interactive: bool,
     log_store: LogStore,
+    runtime_logs: VecDeque<ConsoleLogEntry>,
+    runtime_log_sender: broadcast::Sender<ConsoleLogEntry>,
     pending_approvals: Vec<PendingApproval>,
     session_approval_grants: HashSet<SessionApprovalKey>,
 }
 
 impl OperatorConsole {
     pub fn new(logging: LoggingConfig) -> io::Result<Self> {
+        let data_directory = DataDirectory::new(None)?;
+        Self::with_data_directory(logging, data_directory)
+    }
+
+    pub fn with_data_directory(
+        logging: LoggingConfig,
+        data_directory: DataDirectory,
+    ) -> io::Result<Self> {
+        let (runtime_log_sender, _) = broadcast::channel(1_024);
         Ok(Self {
             state: Arc::new(Mutex::new(ConsoleState {
                 interactive: false,
-                log_store: LogStore::new(logging)?,
+                log_store: LogStore::new(logging, &data_directory)?,
+                runtime_logs: VecDeque::new(),
+                runtime_log_sender,
                 pending_approvals: Vec::new(),
                 session_approval_grants: HashSet::new(),
             })),
@@ -123,23 +152,40 @@ impl OperatorConsole {
             .interactive = interactive;
     }
 
-    pub fn is_interactive(&self) -> bool {
-        self.state
-            .lock()
-            .expect("console lock poisoned")
-            .interactive
+    pub fn push_log(&self, level: ConsoleLogLevel, message: impl Into<String>) {
+        self.push_log_inner(level, message.into(), true);
     }
 
-    pub fn push_log(&self, level: ConsoleLogLevel, message: impl Into<String>) {
-        let raw_message = sanitize_console_text(&message.into());
+    pub fn push_command_output_log(&self, level: ConsoleLogLevel, message: impl Into<String>) {
+        self.push_log_inner(level, message.into(), false);
+    }
+
+    fn push_log_inner(&self, level: ConsoleLogLevel, message: String, runtime_log: bool) {
+        let raw_message = sanitize_console_text(&message);
         let mut state = self.state.lock().expect("console lock poisoned");
         for line in raw_message.lines() {
-            state.log_store.append(level, line.to_string());
+            let entry = state.log_store.append(level, line.to_string());
+            if runtime_log {
+                push_runtime_log(&mut state, entry.clone());
+                let _ = state.runtime_log_sender.send(entry);
+            }
         }
 
         if raw_message.ends_with('\n') {
-            state.log_store.append(level, String::new());
+            let entry = state.log_store.append(level, String::new());
+            if runtime_log {
+                push_runtime_log(&mut state, entry.clone());
+                let _ = state.runtime_log_sender.send(entry);
+            }
         }
+    }
+
+    pub fn subscribe_runtime_logs(&self) -> broadcast::Receiver<ConsoleLogEntry> {
+        self.state
+            .lock()
+            .expect("console lock poisoned")
+            .runtime_log_sender
+            .subscribe()
     }
 
     pub fn snapshot(&self) -> ConsoleSnapshot {
@@ -153,6 +199,7 @@ impl OperatorConsole {
                 .iter()
                 .map(|approval| PendingApprovalView {
                     id: approval.id,
+                    execution_id: approval.execution_id,
                     request: approval.request.clone(),
                     created_at: approval.created_at.clone(),
                 })
@@ -166,6 +213,17 @@ impl OperatorConsole {
             .expect("console lock poisoned")
             .log_store
             .read_range(start, limit)
+    }
+
+    pub fn read_runtime_logs(&self, start: usize, limit: usize) -> Vec<ConsoleLogEntry> {
+        let state = self.state.lock().expect("console lock poisoned");
+        state
+            .runtime_logs
+            .iter()
+            .skip(start)
+            .take(limit)
+            .cloned()
+            .collect()
     }
 
     pub(crate) fn clear_session_approvals(&self) {
@@ -201,15 +259,16 @@ impl OperatorConsole {
     }
 
     pub(crate) fn apply_logging_reconfigure(&self, prepared: PreparedLoggingReconfigure) {
-        self.state
-            .lock()
-            .expect("console lock poisoned")
-            .log_store
-            .apply_reconfigure(prepared.prepared);
+        let mut state = self.state.lock().expect("console lock poisoned");
+        state.log_store.apply_reconfigure(prepared.prepared);
+        while state.runtime_logs.len() > state.log_store.buffer_limit() {
+            state.runtime_logs.pop_front();
+        }
     }
 
     pub async fn request_confirmation(
         &self,
+        execution_id: Uuid,
         request: ConfirmationRequest,
         session_id: Option<String>,
     ) -> Result<bool, ConsoleApprovalError> {
@@ -233,14 +292,13 @@ impl OperatorConsole {
             }
 
             let approval_id = Uuid::new_v4();
-            state
-                .pending_approvals
-                .push(PendingApproval::new(
-                    approval_id,
-                    request,
-                    sender,
-                    session_approval_key,
-                ));
+            state.pending_approvals.push(PendingApproval::new(
+                approval_id,
+                execution_id,
+                request,
+                sender,
+                session_approval_key,
+            ));
 
             (approval_id, receiver)
         };
@@ -385,18 +443,16 @@ mod tests {
     }
 
     fn sample_logging() -> LoggingConfig {
-        LoggingConfig {
-            memory_buffer_lines: 2,
-            file_path: None,
-            persist_file: false,
-        }
+        LoggingConfig::default()
     }
 
     #[tokio::test]
     async fn request_confirmation_requires_interactive_console() {
         let console = OperatorConsole::new(sample_logging()).expect("console should initialize");
 
-        let result = console.request_confirmation(sample_request(), None).await;
+        let result = console
+            .request_confirmation(Uuid::new_v4(), sample_request(), None)
+            .await;
         assert!(matches!(result, Err(ConsoleApprovalError::Unavailable)));
     }
 
@@ -406,10 +462,11 @@ mod tests {
         console.set_interactive(true);
 
         let waiter_console = console.clone();
-        let wait_task =
-            tokio::spawn(
-                async move { waiter_console.request_confirmation(sample_request(), None).await },
-            );
+        let wait_task = tokio::spawn(async move {
+            waiter_console
+                .request_confirmation(Uuid::new_v4(), sample_request(), None)
+                .await
+        });
 
         tokio::task::yield_now().await;
         let approval_id = console.snapshot().pending_approvals[0].id;
@@ -430,16 +487,17 @@ mod tests {
         let waiter_console = console.clone();
         let wait_task = tokio::spawn(async move {
             waiter_console
-                .request_confirmation(sample_shell_request(), Some("session-a".to_string()))
+                .request_confirmation(
+                    Uuid::new_v4(),
+                    sample_shell_request(),
+                    Some("session-a".to_string()),
+                )
                 .await
         });
 
         tokio::task::yield_now().await;
         let approval_id = console.snapshot().pending_approvals[0].id;
-        assert!(console.resolve_confirmation(
-            approval_id,
-            ApprovalDecision::ApproveForSession
-        ));
+        assert!(console.resolve_confirmation(approval_id, ApprovalDecision::ApproveForSession));
 
         let approved = timeout(Duration::from_secs(1), wait_task)
             .await
@@ -449,7 +507,11 @@ mod tests {
         assert!(approved);
 
         let reused = console
-            .request_confirmation(sample_shell_request(), Some("session-a".to_string()))
+            .request_confirmation(
+                Uuid::new_v4(),
+                sample_shell_request(),
+                Some("session-a".to_string()),
+            )
             .await
             .expect("same-session approval should be reused");
         assert!(reused);
@@ -458,7 +520,11 @@ mod tests {
         let mut changed_timeout_request = sample_shell_request();
         changed_timeout_request.timeout_ms += 1_000;
         let timeout_reused = console
-            .request_confirmation(changed_timeout_request, Some("session-a".to_string()))
+            .request_confirmation(
+                Uuid::new_v4(),
+                changed_timeout_request,
+                Some("session-a".to_string()),
+            )
             .await
             .expect("timeout changes should not invalidate same-session approval");
         assert!(timeout_reused);
@@ -471,16 +537,17 @@ mod tests {
         let changed_request_console = console.clone();
         let changed_request_waiter = tokio::spawn(async move {
             changed_request_console
-                .request_confirmation(changed_request, Some("session-a".to_string()))
+                .request_confirmation(
+                    Uuid::new_v4(),
+                    changed_request,
+                    Some("session-a".to_string()),
+                )
                 .await
         });
 
         tokio::task::yield_now().await;
         let changed_approval_id = console.snapshot().pending_approvals[0].id;
-        assert!(console.resolve_confirmation(
-            changed_approval_id,
-            ApprovalDecision::Reject
-        ));
+        assert!(console.resolve_confirmation(changed_approval_id, ApprovalDecision::Reject));
 
         let changed_result = timeout(Duration::from_secs(1), changed_request_waiter)
             .await
@@ -492,16 +559,17 @@ mod tests {
         let other_session_console = console.clone();
         let other_session_waiter = tokio::spawn(async move {
             other_session_console
-                .request_confirmation(sample_shell_request(), Some("session-b".to_string()))
+                .request_confirmation(
+                    Uuid::new_v4(),
+                    sample_shell_request(),
+                    Some("session-b".to_string()),
+                )
                 .await
         });
 
         tokio::task::yield_now().await;
         let other_approval_id = console.snapshot().pending_approvals[0].id;
-        assert!(console.resolve_confirmation(
-            other_approval_id,
-            ApprovalDecision::Reject
-        ));
+        assert!(console.resolve_confirmation(other_approval_id, ApprovalDecision::Reject));
 
         let rejected = timeout(Duration::from_secs(1), other_session_waiter)
             .await
@@ -519,16 +587,13 @@ mod tests {
         let waiter_console = console.clone();
         let wait_task = tokio::spawn(async move {
             waiter_console
-                .request_confirmation(sample_request(), None)
+                .request_confirmation(Uuid::new_v4(), sample_request(), None)
                 .await
         });
 
         tokio::task::yield_now().await;
         let approval_id = console.snapshot().pending_approvals[0].id;
-        assert!(console.resolve_confirmation(
-            approval_id,
-            ApprovalDecision::ApproveForSession
-        ));
+        assert!(console.resolve_confirmation(approval_id, ApprovalDecision::ApproveForSession));
 
         let approved = timeout(Duration::from_secs(1), wait_task)
             .await
@@ -540,17 +605,14 @@ mod tests {
         let waiter_console = console.clone();
         let second_waiter = tokio::spawn(async move {
             waiter_console
-                .request_confirmation(sample_request(), None)
+                .request_confirmation(Uuid::new_v4(), sample_request(), None)
                 .await
         });
 
         tokio::task::yield_now().await;
         assert_eq!(console.snapshot().pending_approvals.len(), 1);
         let second_approval_id = console.snapshot().pending_approvals[0].id;
-        assert!(console.resolve_confirmation(
-            second_approval_id,
-            ApprovalDecision::Reject
-        ));
+        assert!(console.resolve_confirmation(second_approval_id, ApprovalDecision::Reject));
 
         let rejected = timeout(Duration::from_secs(1), second_waiter)
             .await
@@ -591,21 +653,22 @@ mod tests {
     }
 
     #[test]
-    fn removes_temporary_log_file_on_drop() {
-        let log_path =
-            std::env::temp_dir().join(format!("host-bridge-mcp-test-{}.log", Uuid::new_v4()));
+    fn writes_runtime_log_to_data_directory() {
+        let data_root =
+            std::env::temp_dir().join(format!("host-bridge-mcp-test-{}", Uuid::new_v4()));
+        let data_directory =
+            DataDirectory::from_root(data_root.clone()).expect("data directory should initialize");
+        let log_path = data_root.join("logs/host-bridge.log");
         {
-            let console = OperatorConsole::new(LoggingConfig {
-                memory_buffer_lines: 2,
-                file_path: Some(log_path.display().to_string()),
-                persist_file: false,
-            })
-                .expect("console should initialize");
+            let console =
+                OperatorConsole::with_data_directory(LoggingConfig::default(), data_directory)
+                    .expect("console should initialize");
             console.push_log(ConsoleLogLevel::Info, "line-1");
             assert!(log_path.exists());
         }
 
-        assert!(!log_path.exists());
+        assert!(log_path.exists());
+        let _ = fs::remove_dir_all(data_root);
     }
 
     #[test]
@@ -613,17 +676,18 @@ mod tests {
         let log_dir =
             std::env::temp_dir().join(format!("host-bridge-mcp-persist-{}", Uuid::new_v4()));
         fs::create_dir_all(&log_dir).expect("log directory should be created");
-        let log_path = log_dir.join("session.log");
+        let data_directory =
+            DataDirectory::from_root(log_dir.clone()).expect("data directory should initialize");
+        let log_path = log_dir.join("logs/host-bridge.log");
+        fs::create_dir_all(log_path.parent().expect("log parent should exist"))
+            .expect("log directory should be created");
         let seed_line = "2026-03-09T16:16:21.751592Z  INFO line-0\n";
         fs::write(&log_path, seed_line).expect("seed log file should be written");
 
         {
-            let console = OperatorConsole::new(LoggingConfig {
-                memory_buffer_lines: 2,
-                file_path: Some(log_path.display().to_string()),
-                persist_file: true,
-            })
-                .expect("console should initialize");
+            let console =
+                OperatorConsole::with_data_directory(LoggingConfig::default(), data_directory)
+                    .expect("console should initialize");
 
             assert!(console.read_logs(0, 1).is_empty());
 
@@ -638,15 +702,18 @@ mod tests {
         assert!(!contents.contains(seed_line));
         assert!(contents.contains(" WARN line-1\n"));
 
-        let archived_logs: Vec<_> = fs::read_dir(&log_dir)
-            .expect("log directory should remain readable")
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("session.") && name != "session.log")
-            })
-            .collect();
+        let archived_logs: Vec<_> =
+            fs::read_dir(log_path.parent().expect("log path should have a parent"))
+                .expect("log directory should remain readable")
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name.starts_with("host-bridge.") && name != "host-bridge.log"
+                        })
+                })
+                .collect();
         assert_eq!(archived_logs.len(), 1);
 
         let archived_name = archived_logs[0]
@@ -666,56 +733,29 @@ mod tests {
 
     #[test]
     fn reconfigure_logging_preserves_buffered_entries() {
-        let initial_path =
-            std::env::temp_dir().join(format!("host-bridge-mcp-log-a-{}.log", Uuid::new_v4()));
-        let next_path =
-            std::env::temp_dir().join(format!("host-bridge-mcp-log-b-{}.log", Uuid::new_v4()));
-        let console = OperatorConsole::new(LoggingConfig {
-            memory_buffer_lines: 4,
-            file_path: Some(initial_path.display().to_string()),
-            persist_file: true,
-        })
-            .expect("console should initialize");
+        let console =
+            OperatorConsole::new(LoggingConfig::default()).expect("console should initialize");
         console.push_log(ConsoleLogLevel::Info, "line-1");
         console.push_log(ConsoleLogLevel::Warn, "line-2");
 
         console
-            .reconfigure_logging(LoggingConfig {
-                memory_buffer_lines: 4,
-                file_path: Some(next_path.display().to_string()),
-                persist_file: true,
-            })
+            .reconfigure_logging(LoggingConfig { retention_days: 0 })
             .expect("logging should reconfigure");
 
         let entries = console.read_logs(0, 2);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].message, "line-1");
         assert_eq!(entries[1].message, "line-2");
-
-        let _ = fs::remove_file(initial_path);
-        let _ = fs::remove_file(next_path);
     }
 
     #[test]
     fn prepared_logging_reconfigure_keeps_logs_written_before_commit() {
-        let initial_path =
-            std::env::temp_dir().join(format!("host-bridge-mcp-log-a-{}.log", Uuid::new_v4()));
-        let next_path =
-            std::env::temp_dir().join(format!("host-bridge-mcp-log-b-{}.log", Uuid::new_v4()));
-        let console = OperatorConsole::new(LoggingConfig {
-            memory_buffer_lines: 4,
-            file_path: Some(initial_path.display().to_string()),
-            persist_file: true,
-        })
-            .expect("console should initialize");
+        let console =
+            OperatorConsole::new(LoggingConfig::default()).expect("console should initialize");
         console.push_log(ConsoleLogLevel::Info, "line-1");
 
         let prepared = console
-            .prepare_logging_reconfigure(LoggingConfig {
-                memory_buffer_lines: 4,
-                file_path: Some(next_path.display().to_string()),
-                persist_file: true,
-            })
+            .prepare_logging_reconfigure(LoggingConfig { retention_days: 0 })
             .expect("logging reconfigure should prepare")
             .expect("logging reconfigure should be needed");
         console.push_log(ConsoleLogLevel::Warn, "line-2");
@@ -725,8 +765,5 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].message, "line-1");
         assert_eq!(entries[1].message, "line-2");
-
-        let _ = fs::remove_file(initial_path);
-        let _ = fs::remove_file(next_path);
     }
 }

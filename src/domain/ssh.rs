@@ -18,10 +18,10 @@ use crate::domain::execution_target::{SshAuthTarget, SshTarget};
 use crate::domain::platform::runtime::RuntimePlatform;
 use russh::ChannelMsg;
 use russh::client;
-use russh::keys::{Algorithm,
-                  HashAlg,
-                  PrivateKeyWithHashAlg, PublicKey,
-                  agent::client::{AgentClient, AgentStream}, check_known_hosts_path, load_secret_key,
+use russh::keys::{
+    Algorithm, HashAlg, PrivateKeyWithHashAlg, PublicKey,
+    agent::client::{AgentClient, AgentStream},
+    check_known_hosts_path, load_secret_key,
 };
 use std::collections::HashMap;
 use std::fs;

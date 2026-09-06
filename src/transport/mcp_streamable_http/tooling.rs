@@ -57,7 +57,7 @@ pub(super) async fn execute_command_tool(
 
         let approved = match server
             .operator_console
-            .request_confirmation(request.clone(), session_id)
+            .request_confirmation(prepared.execution_id(), request.clone(), session_id)
             .await
         {
             Ok(approved) => approved,

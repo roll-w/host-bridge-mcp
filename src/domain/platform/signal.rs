@@ -18,7 +18,7 @@ use std::io;
 
 #[cfg(unix)]
 pub async fn wait_for_termination_signal() -> io::Result<&'static str> {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
 
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigterm = signal(SignalKind::terminate())?;

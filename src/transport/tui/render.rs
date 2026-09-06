@@ -360,6 +360,8 @@ mod tests {
     fn approval_detail_lines_format_created_at_as_timestamp() {
         let approval = PendingApprovalView {
             id: Uuid::parse_str("123e4567-e89b-12d3-a456-426614174000").expect("uuid should parse"),
+            execution_id: Uuid::parse_str("123e4567-e89b-12d3-a456-426614174001")
+                .expect("execution uuid should parse"),
             request: ConfirmationRequest {
                 server: "host".to_string(),
                 platform: "linux".to_string(),

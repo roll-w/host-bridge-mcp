@@ -70,9 +70,21 @@ impl RequestAuthController {
             .expect("request auth lock poisoned")
             .clone()
     }
+
+    pub(crate) fn authenticate_headers(&self, headers: &HeaderMap) -> bool {
+        let state = self.snapshot();
+        state
+            .auth
+            .as_ref()
+            .is_some_and(|auth| authenticate_request(headers, auth).is_authorized)
+    }
+
+    pub(crate) fn is_configured(&self) -> bool {
+        self.snapshot().auth.is_some()
+    }
 }
 
-pub(super) fn resolve_request_auth(
+pub(crate) fn resolve_request_auth(
     access: &AccessConfig,
 ) -> Result<RequestAuthState, TransportAuthError> {
     let Some(env_name) = access.api_key_env.as_deref() else {
@@ -93,7 +105,7 @@ pub(super) fn resolve_request_auth(
     })
 }
 
-pub(super) async fn require_request_auth(
+pub(crate) async fn require_request_auth(
     State(controller): State<RequestAuthController>,
     request: Request,
     next: Next,

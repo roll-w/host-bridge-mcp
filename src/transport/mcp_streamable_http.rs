@@ -14,43 +14,31 @@
  * limitations under the License.
  */
 
-mod auth;
 mod output;
-mod streaming;
 mod tooling;
 
-use self::auth::require_request_auth;
-use self::streaming::{health, stream_execution};
 use self::tooling::execute_command_tool;
 use crate::application::execution_service::ExecutionService;
 use crate::application::operator_console::OperatorConsole;
+use crate::transport::auth::{RequestAuthController, require_request_auth};
 use axum::Router;
 use axum::middleware;
-use axum::routing::get;
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{
     CallToolResult, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
     SetLevelRequestParams,
 };
 use rmcp::service::{RequestContext, RoleServer};
-use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService,
-                                              session::local::LocalSessionManager,
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
 use rmcp::{ErrorData as McpError, ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 
-pub use self::auth::RequestAuthController;
-pub(crate) use self::auth::{RequestAuthState, TransportAuthError};
-
 const MCP_SERVER_NAME: &str = env!("CARGO_PKG_NAME");
 const MCP_SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-#[derive(Clone)]
-pub struct HttpState {
-    execution_service: ExecutionService,
-}
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -100,6 +88,7 @@ struct ExecuteCommandToolArgs {
 struct HostBridgeMcpServer {
     execution_service: ExecutionService,
     operator_console: OperatorConsole,
+    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
 }
 
@@ -289,15 +278,11 @@ mod tests {
     }
 }
 
-pub fn router(
+pub(crate) fn router(
     execution_service: ExecutionService,
     operator_console: OperatorConsole,
     auth_controller: RequestAuthController,
-) -> Router {
-    let stream_state = HttpState {
-        execution_service: execution_service.clone(),
-    };
-
+) -> Router<crate::transport::http::HttpState> {
     let mcp_execution_service = execution_service.clone();
     let mcp_operator_console = operator_console.clone();
     let mut mcp_config = StreamableHttpServerConfig::default();
@@ -315,16 +300,12 @@ pub fn router(
             mcp_config,
         );
 
-    let protected_routes = Router::new()
-        .route("/executions/{execution_id}/stream", get(stream_execution))
+    let protected_routes = Router::<crate::transport::http::HttpState>::new()
         .nest_service("/mcp", mcp_service)
         .route_layer(middleware::from_fn_with_state(
             auth_controller,
             require_request_auth,
         ));
 
-    Router::new()
-        .route("/health", get(health))
-        .merge(protected_routes)
-        .with_state(stream_state)
+    Router::<crate::transport::http::HttpState>::new().merge(protected_routes)
 }

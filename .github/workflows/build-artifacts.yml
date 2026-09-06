@@ -111,6 +111,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Setup frontend
+        uses: ./.github/actions/setup-web
+
       - name: Read version and commit
         id: meta
         shell: bash

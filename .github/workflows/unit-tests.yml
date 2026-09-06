@@ -31,6 +31,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Setup frontend
+        uses: ./.github/actions/setup-web
+
       - name: Setup Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:

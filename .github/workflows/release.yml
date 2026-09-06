@@ -180,6 +180,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Setup frontend
+        uses: ./.github/actions/setup-web
+
       - name: Set artifact name
         shell: bash
         run: |

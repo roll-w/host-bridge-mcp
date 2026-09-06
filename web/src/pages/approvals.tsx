@@ -22,6 +22,7 @@ import type {ApprovalDecision, PendingApproval} from "@/types";
 import {ApprovalRows} from "@/components/approval";
 import {EmptyState, ErrorState, InlineError, PageHeading, SectionHeading,} from "@/components/layout";
 import {Button} from "@/components/ui/button";
+import {useNotifications} from "@/components/notification";
 
 export function ApprovalsPage({
                                   t,
@@ -38,6 +39,7 @@ export function ApprovalsPage({
     const [interactive, setInteractive] = useState(false);
     const [selected, setSelected] = useState<PendingApproval | null>(null);
     const [error, setError] = useState<string | null>(null);
+    const {notify} = useNotifications();
 
     const load = () =>
         apiRequest<{ items: PendingApproval[]; interactive: boolean }>("/approvals")
@@ -68,10 +70,19 @@ export function ApprovalsPage({
             );
             const item = items.find((value) => value.id === id);
             if (item) onResolved?.(item, decision);
+            notify({
+                message:
+                    decision === "reject"
+                        ? t("approvalRejectedNotification")
+                        : t("approvalApprovedNotification"),
+                tone: decision === "reject" ? "info" : "success",
+            });
             setSelected(null);
             await load();
         } catch (reason) {
-            setError(reason instanceof Error ? reason.message : t("loadFailed"));
+            const message = reason instanceof Error ? reason.message : t("loadFailed");
+            setError(message);
+            notify({message, tone: "error"});
         }
     };
 

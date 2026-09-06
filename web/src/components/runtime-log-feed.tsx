@@ -161,7 +161,7 @@ export function LogLine({
       </span>
             <span
                 className={cn(
-                    "min-w-0 whitespace-pre-wrap break-words leading-5 text-foreground/80",
+                    "min-w-0 whitespace-pre-wrap wrap-break-word leading-5 text-foreground/80",
                 )}
             >
         {entry.message}
@@ -201,10 +201,10 @@ export function RuntimeLogWindow({
         </span>
             </CardHeader>
             <CardContent className="px-0 py-0">
-                <ScrollArea className="h-[calc(100vh-22rem)] min-h-[420px] max-h-[620px] font-mono text-xs">
+                <ScrollArea className="h-[calc(100vh-22rem)] min-h-105 max-h-155 font-mono text-xs">
                     <div className="p-3">
                         {entries.length === 0 ? (
-                            <div className="grid min-h-[360px] place-items-center text-muted-foreground">
+                            <div className="grid min-h-90 place-items-center text-muted-foreground">
                                 {t("noLogs")}
                             </div>
                         ) : (

@@ -18,14 +18,14 @@ mod approvals;
 mod log_store;
 mod sanitize;
 
-use self::approvals::{PendingApproval, PendingApprovalGuard, SessionApprovalKey};
+use self::approvals::{PendingApproval, PendingApprovalGuard};
 use self::log_store::{LogStore, PreparedLogStore};
 use self::sanitize::sanitize_console_text;
 use crate::application::data_dir::DataDirectory;
 use crate::application::execution_service::ConfirmationRequest;
 use crate::config::LoggingConfig;
 use serde::Serialize;
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::io;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, oneshot};
@@ -61,7 +61,6 @@ pub struct PendingApprovalView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalDecision {
     ApproveOnce,
-    ApproveForSession,
     Reject,
 }
 
@@ -119,7 +118,6 @@ struct ConsoleState {
     runtime_logs: VecDeque<ConsoleLogEntry>,
     runtime_log_sender: broadcast::Sender<ConsoleLogEntry>,
     pending_approvals: Vec<PendingApproval>,
-    session_approval_grants: HashSet<SessionApprovalKey>,
 }
 
 impl OperatorConsole {
@@ -140,7 +138,6 @@ impl OperatorConsole {
                 runtime_logs: VecDeque::new(),
                 runtime_log_sender,
                 pending_approvals: Vec::new(),
-                session_approval_grants: HashSet::new(),
             })),
         })
     }
@@ -226,14 +223,6 @@ impl OperatorConsole {
             .collect()
     }
 
-    pub(crate) fn clear_session_approvals(&self) {
-        self.state
-            .lock()
-            .expect("console lock poisoned")
-            .session_approval_grants
-            .clear();
-    }
-
     #[cfg(test)]
     pub fn reconfigure_logging(&self, logging: LoggingConfig) -> io::Result<()> {
         let prepared = self.prepare_logging_reconfigure(logging)?;
@@ -270,22 +259,11 @@ impl OperatorConsole {
         &self,
         execution_id: Uuid,
         request: ConfirmationRequest,
-        session_id: Option<String>,
     ) -> Result<bool, ConsoleApprovalError> {
-        let session_approval_key = session_id
-            .as_deref()
-            .map(|session_id| SessionApprovalKey::new(session_id, &request));
         let request_preview = request.command_line.clone();
         let (sender, receiver) = oneshot::channel();
         let (approval_id, receiver) = {
             let mut state = self.state.lock().expect("console lock poisoned");
-
-            if session_approval_key
-                .as_ref()
-                .is_some_and(|key| state.session_approval_grants.contains(key))
-            {
-                return Ok(true);
-            }
 
             if !state.interactive {
                 return Err(ConsoleApprovalError::Unavailable);
@@ -297,7 +275,6 @@ impl OperatorConsole {
                 execution_id,
                 request,
                 sender,
-                session_approval_key,
             ));
 
             (approval_id, receiver)
@@ -328,27 +305,12 @@ impl OperatorConsole {
                 return false;
             };
             let approval = state.pending_approvals.remove(index);
-            let effective_decision = if decision == ApprovalDecision::ApproveForSession
-                && approval.session_approval_key().is_none()
-            {
-                ApprovalDecision::ApproveOnce
-            } else {
-                decision
-            };
-
-            if effective_decision == ApprovalDecision::ApproveForSession {
-                if let Some(key) = approval.session_approval_key() {
-                    state.session_approval_grants.insert(key.clone());
-                }
-            }
-
-            (approval, effective_decision)
+            (approval, decision)
         };
 
         let approved = decision != ApprovalDecision::Reject;
         let decision_label = match decision {
             ApprovalDecision::ApproveOnce => "approved",
-            ApprovalDecision::ApproveForSession => "approved for session",
             ApprovalDecision::Reject => "rejected",
         };
         self.push_log(
@@ -368,7 +330,6 @@ impl OperatorConsole {
         let pending_approvals = {
             let mut state = self.state.lock().expect("console lock poisoned");
             state.interactive = false;
-            state.session_approval_grants.clear();
             state.pending_approvals.drain(..).collect::<Vec<_>>()
         };
 
@@ -429,19 +390,6 @@ mod tests {
         }
     }
 
-    fn sample_shell_request() -> ConfirmationRequest {
-        let mut request = sample_request();
-        request.command_line = "cargo build && cargo test".to_string();
-        request.args = vec![
-            "build".to_string(),
-            "&&".to_string(),
-            "cargo".to_string(),
-            "test".to_string(),
-        ];
-        request.contains_shell_operator = true;
-        request
-    }
-
     fn sample_logging() -> LoggingConfig {
         LoggingConfig::default()
     }
@@ -451,7 +399,7 @@ mod tests {
         let console = OperatorConsole::new(sample_logging()).expect("console should initialize");
 
         let result = console
-            .request_confirmation(Uuid::new_v4(), sample_request(), None)
+            .request_confirmation(Uuid::new_v4(), sample_request())
             .await;
         assert!(matches!(result, Err(ConsoleApprovalError::Unavailable)));
     }
@@ -464,7 +412,7 @@ mod tests {
         let waiter_console = console.clone();
         let wait_task = tokio::spawn(async move {
             waiter_console
-                .request_confirmation(Uuid::new_v4(), sample_request(), None)
+                .request_confirmation(Uuid::new_v4(), sample_request())
                 .await
         });
 
@@ -480,120 +428,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_approval_reuses_same_execution_scope_only_for_same_session() {
+    async fn approval_is_not_reused_after_approve_once() {
         let console = OperatorConsole::new(sample_logging()).expect("console should initialize");
         console.set_interactive(true);
 
         let waiter_console = console.clone();
         let wait_task = tokio::spawn(async move {
             waiter_console
-                .request_confirmation(
-                    Uuid::new_v4(),
-                    sample_shell_request(),
-                    Some("session-a".to_string()),
-                )
+                .request_confirmation(Uuid::new_v4(), sample_request())
                 .await
         });
 
         tokio::task::yield_now().await;
         let approval_id = console.snapshot().pending_approvals[0].id;
-        assert!(console.resolve_confirmation(approval_id, ApprovalDecision::ApproveForSession));
-
-        let approved = timeout(Duration::from_secs(1), wait_task)
-            .await
-            .expect("wait task should complete before timeout")
-            .expect("wait task should not panic")
-            .expect("approval should be delivered");
-        assert!(approved);
-
-        let reused = console
-            .request_confirmation(
-                Uuid::new_v4(),
-                sample_shell_request(),
-                Some("session-a".to_string()),
-            )
-            .await
-            .expect("same-session approval should be reused");
-        assert!(reused);
-        assert!(console.snapshot().pending_approvals.is_empty());
-
-        let mut changed_timeout_request = sample_shell_request();
-        changed_timeout_request.timeout_ms += 1_000;
-        let timeout_reused = console
-            .request_confirmation(
-                Uuid::new_v4(),
-                changed_timeout_request,
-                Some("session-a".to_string()),
-            )
-            .await
-            .expect("timeout changes should not invalidate same-session approval");
-        assert!(timeout_reused);
-        assert!(console.snapshot().pending_approvals.is_empty());
-
-        let mut changed_request = sample_shell_request();
-        changed_request
-            .env
-            .insert("RUST_LOG".to_string(), "debug".to_string());
-        let changed_request_console = console.clone();
-        let changed_request_waiter = tokio::spawn(async move {
-            changed_request_console
-                .request_confirmation(
-                    Uuid::new_v4(),
-                    changed_request,
-                    Some("session-a".to_string()),
-                )
-                .await
-        });
-
-        tokio::task::yield_now().await;
-        let changed_approval_id = console.snapshot().pending_approvals[0].id;
-        assert!(console.resolve_confirmation(changed_approval_id, ApprovalDecision::Reject));
-
-        let changed_result = timeout(Duration::from_secs(1), changed_request_waiter)
-            .await
-            .expect("changed request should complete before timeout")
-            .expect("changed request task should not panic")
-            .expect("changed request rejection should be delivered");
-        assert!(!changed_result);
-
-        let other_session_console = console.clone();
-        let other_session_waiter = tokio::spawn(async move {
-            other_session_console
-                .request_confirmation(
-                    Uuid::new_v4(),
-                    sample_shell_request(),
-                    Some("session-b".to_string()),
-                )
-                .await
-        });
-
-        tokio::task::yield_now().await;
-        let other_approval_id = console.snapshot().pending_approvals[0].id;
-        assert!(console.resolve_confirmation(other_approval_id, ApprovalDecision::Reject));
-
-        let rejected = timeout(Duration::from_secs(1), other_session_waiter)
-            .await
-            .expect("other session should complete before timeout")
-            .expect("other session task should not panic")
-            .expect("rejection should be delivered");
-        assert!(!rejected);
-    }
-
-    #[tokio::test]
-    async fn session_approval_without_session_id_is_one_time_only() {
-        let console = OperatorConsole::new(sample_logging()).expect("console should initialize");
-        console.set_interactive(true);
-
-        let waiter_console = console.clone();
-        let wait_task = tokio::spawn(async move {
-            waiter_console
-                .request_confirmation(Uuid::new_v4(), sample_request(), None)
-                .await
-        });
-
-        tokio::task::yield_now().await;
-        let approval_id = console.snapshot().pending_approvals[0].id;
-        assert!(console.resolve_confirmation(approval_id, ApprovalDecision::ApproveForSession));
+        assert!(console.resolve_confirmation(approval_id, ApprovalDecision::ApproveOnce));
 
         let approved = timeout(Duration::from_secs(1), wait_task)
             .await
@@ -605,7 +453,7 @@ mod tests {
         let waiter_console = console.clone();
         let second_waiter = tokio::spawn(async move {
             waiter_console
-                .request_confirmation(Uuid::new_v4(), sample_request(), None)
+                .request_confirmation(Uuid::new_v4(), sample_request())
                 .await
         });
 

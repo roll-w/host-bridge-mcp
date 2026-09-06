@@ -36,13 +36,13 @@ pub struct CliOptions {
     #[arg(long, value_name = "PORT", value_parser = parse_port)]
     pub port: Option<u16>,
 
-    /// Enable the operator TUI. The value defaults to true when omitted.
-    #[arg(long, num_args = 0..=1, default_missing_value = "true", default_value_t = true)]
-    pub tui: bool,
+    /// Enable the operator TUI. A bare option enables it; otherwise the config value is used.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    pub tui: Option<bool>,
 
-    /// Open the web console at startup. The value defaults to true when omitted.
-    #[arg(long, num_args = 0..=1, default_missing_value = "true", default_value_t = true)]
-    pub web: bool,
+    /// Open the web console at startup. A bare option enables it; otherwise the config value is used.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    pub web: Option<bool>,
 }
 
 pub fn parse_args<I, T>(args: I) -> Result<CliOptions, clap::Error>
@@ -147,11 +147,11 @@ mod tests {
     }
 
     #[test]
-    fn defaults_enable_tui_and_web() {
+    fn omitted_interface_options_use_the_config_values() {
         let options = parse_args(args(&[])).expect("default CLI should parse");
 
-        assert!(options.tui);
-        assert!(options.web);
+        assert_eq!(options.tui, None);
+        assert_eq!(options.web, None);
         assert_eq!(options.config_path, None);
         assert_eq!(options.host, None);
         assert_eq!(options.port, None);
@@ -162,13 +162,13 @@ mod tests {
         let options = parse_args(args(&["--tui", "false", "--web=false"]))
             .expect("boolean flags should parse");
 
-        assert!(!options.tui);
-        assert!(!options.web);
+        assert_eq!(options.tui, Some(false));
+        assert_eq!(options.web, Some(false));
 
         let options =
             parse_args(args(&["--tui", "--web"])).expect("bare boolean flags should parse");
-        assert!(options.tui);
-        assert!(options.web);
+        assert_eq!(options.tui, Some(true));
+        assert_eq!(options.web, Some(true));
     }
 
     #[test]

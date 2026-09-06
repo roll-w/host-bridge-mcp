@@ -21,7 +21,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
 fn default_config_is_valid() {
-    assert!(AppConfig::default().validate().is_ok());
+    let config = AppConfig::default();
+
+    assert!(config.tui);
+    assert!(config.web);
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn load_startup_interface_settings() {
+    let path = write_temp_config("tui: false\nweb: false\n");
+
+    let config = AppConfig::load_from_resolved_path(&resolved_temp_config(&path))
+        .expect("startup interface settings should load");
+
+    assert!(!config.tui);
+    assert!(!config.web);
+    let _ = fs::remove_file(path);
 }
 
 #[test]

@@ -33,6 +33,7 @@ export function WorkspacePage({
     const [runningExecutionIds, setRunningExecutionIds] = useState<string[]>([]);
     const [historyRefreshToken, setHistoryRefreshToken] = useState(0);
     const protectedExecutionIds = useRef(new Map<string, number>());
+    const trackedRunningIds = useRef(new Set<string>());
 
     useEffect(() => {
         let active = true;
@@ -49,6 +50,14 @@ export function WorkspacePage({
                     .filter((record) => record.state === "running")
                     .map((record) => record.executionId);
                 const runningSet = new Set(runningIds);
+                const finishedIds = [...trackedRunningIds.current].filter(
+                    (executionId) => !runningSet.has(executionId),
+                );
+
+                if (finishedIds.length > 0) {
+                    setHistoryRefreshToken((value) => value + 1);
+                }
+                trackedRunningIds.current = runningSet;
 
                 for (const [executionId, expiresAt] of protectedExecutionIds.current) {
                     if (expiresAt <= now || runningSet.has(executionId)) {

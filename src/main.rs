@@ -79,6 +79,13 @@ async fn main() -> ExitCode {
         }
     }
 
+    if let Some(tui) = cli_options.tui {
+        loaded_config.tui = tui;
+    }
+    if let Some(web) = cli_options.web {
+        loaded_config.web = web;
+    }
+
     let config = Arc::new(loaded_config);
 
     let data_directory = match DataDirectory::new(config.data_dir.as_deref()) {
@@ -104,7 +111,7 @@ async fn main() -> ExitCode {
     let tui_active = tui::start(
         operator_console.clone(),
         shutdown_controller.clone(),
-        cli_options.tui,
+        config.tui,
     );
     init_logging(operator_console.clone(), !tui_active);
 
@@ -165,7 +172,7 @@ async fn main() -> ExitCode {
         }
     };
 
-    if cli_options.web {
+    if config.web {
         let web_url = web_session.create_bootstrap_url(bind_address);
         if let Err(error) = browser::open(&web_url) {
             tracing::warn!(error = %error, "Failed to open the web console in a browser");

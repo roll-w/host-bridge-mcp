@@ -19,6 +19,8 @@ import {apiRequest} from "@/api";
 import {AppShell} from "@/components/app-shell";
 import {LoginScreen} from "@/components/login-screen";
 import {LoadingState} from "@/components/layout";
+import {NotificationProvider} from "@/components/notification";
+import {NotificationMonitor} from "@/components/notification-monitor";
 import {TooltipProvider} from "@/components/ui/tooltip";
 import {useLocale, useMessages} from "@/i18n";
 import {ConfigurationPage} from "@/pages/configuration";
@@ -98,26 +100,29 @@ export default function App() {
             <ConfigurationPage t={t}/>
         );
     return (
-        <TooltipProvider>
-            <AppShell
-                page={page}
-                onPageChange={setPage}
-                onLogout={async () => {
-                    await apiRequest("/session/logout", {method: "POST"}).catch(
-                        () => undefined,
-                    );
-                    setBootstrapExpired(false);
-                    setSession(apiKeyConfigured ? "login" : "ready");
-                }}
-                apiKeyConfigured={apiKeyConfigured}
-                locale={locale}
-                setLocale={setLocale}
-                t={t}
-            >
-                <div key={page} className="animate-in fade-in-0 duration-200">
-                    {content}
-                </div>
-            </AppShell>
-        </TooltipProvider>
+        <NotificationProvider dismissLabel={t("dismiss")}>
+            <NotificationMonitor t={t}/>
+            <TooltipProvider>
+                <AppShell
+                    page={page}
+                    onPageChange={setPage}
+                    onLogout={async () => {
+                        await apiRequest("/session/logout", {method: "POST"}).catch(
+                            () => undefined,
+                        );
+                        setBootstrapExpired(false);
+                        setSession(apiKeyConfigured ? "login" : "ready");
+                    }}
+                    apiKeyConfigured={apiKeyConfigured}
+                    locale={locale}
+                    setLocale={setLocale}
+                    t={t}
+                >
+                    <div key={page} className="animate-in fade-in-0 duration-200">
+                        {content}
+                    </div>
+                </AppShell>
+            </TooltipProvider>
+        </NotificationProvider>
     );
 }

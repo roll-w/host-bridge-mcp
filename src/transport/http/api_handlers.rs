@@ -57,7 +57,6 @@ pub(super) struct ApprovalDecisionRequest {
 #[serde(rename_all = "kebab-case")]
 enum ApprovalDecisionValue {
     ApproveOnce,
-    ApproveForSession,
     Reject,
 }
 
@@ -192,7 +191,6 @@ pub(crate) async fn resolve_approval(
     let request = parse_json(payload)?;
     let decision = match request.decision {
         ApprovalDecisionValue::ApproveOnce => ApprovalDecision::ApproveOnce,
-        ApprovalDecisionValue::ApproveForSession => ApprovalDecision::ApproveForSession,
         ApprovalDecisionValue::Reject => ApprovalDecision::Reject,
     };
     if !state

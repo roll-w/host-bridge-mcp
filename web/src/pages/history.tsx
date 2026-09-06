@@ -21,7 +21,15 @@ import {type Locale, type MessageKey} from "@/i18n";
 import {formatTime, stateLabel} from "@/utils";
 import type {HistoryPage as HistoryPageData, HistoryRecord} from "@/types";
 import {ConfirmDialog} from "@/components/confirm-dialog";
-import {EmptyState, ErrorState, InlineError, PageHeading, SectionHeading, StatusPill,} from "@/components/layout";
+import {
+    EmptyState,
+    ErrorState,
+    Expandable,
+    InlineError,
+    PageHeading,
+    SectionHeading,
+    StatusPill,
+} from "@/components/layout";
 import {Button} from "@/components/ui/button";
 import {Card} from "@/components/ui/card";
 import {Table, TableBody, TableCell, TableHead, TableHeader, TableRow,} from "@/components/ui/table";
@@ -200,12 +208,18 @@ export function HistoryPage({
                         </span>
                                             </TableCell>
                                         </TableRow>
-                                        {selected?.executionId === record.executionId && (
-                                            <TableRow className="border-0 hover:bg-transparent">
-                                                <TableCell colSpan={5} className="p-0">
+                                        <TableRow className="border-0 hover:bg-transparent">
+                                            <TableCell colSpan={5} className="p-0">
+                                                <Expandable
+                                                    open={selected?.executionId === record.executionId}
+                                                >
                                                     <ExecutionDetail
                                                         record={record}
-                                                        output={output}
+                                                        output={
+                                                            selected?.executionId === record.executionId
+                                                                ? output
+                                                                : null
+                                                        }
                                                         t={t}
                                                         locale={locale}
                                                         onClose={() => {
@@ -213,9 +227,9 @@ export function HistoryPage({
                                                             setOutput(null);
                                                         }}
                                                     />
-                                                </TableCell>
-                                            </TableRow>
-                                        )}
+                                                </Expandable>
+                                            </TableCell>
+                                        </TableRow>
                                     </Fragment>
                                 ))}
                             </TableBody>
@@ -284,7 +298,7 @@ function ExecutionDetail({
 }) {
     return (
         <div
-            className="border-l-2 border-primary/40 bg-muted/20 px-4 py-5 animate-in fade-in-0 slide-in-from-top-2 duration-200 sm:px-6">
+            className="border-l-2 border-primary/40 bg-muted/20 px-4 py-5 sm:px-6">
             <div className="flex flex-row items-start justify-between gap-4">
                 <div className="min-w-0 space-y-1">
                     <h3 className="font-heading text-sm font-semibold">

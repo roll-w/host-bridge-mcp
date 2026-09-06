@@ -35,10 +35,17 @@ use rmcp::transport::streamable_http_server::{
 use rmcp::{ErrorData as McpError, ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::Deserialize;
 use serde_json::json;
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 const MCP_SERVER_NAME: &str = env!("CARGO_PKG_NAME");
 const MCP_SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+const MCP_SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
+    ProtocolVersion::V_2025_03_26,
+    ProtocolVersion::V_2025_06_18,
+    ProtocolVersion::V_2025_11_25,
+    ProtocolVersion::V_2026_07_28,
+];
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -134,11 +141,15 @@ impl ServerHandler for HostBridgeMcpServer {
                 .build(),
         )
             .with_server_info(server_implementation())
-            .with_protocol_version(ProtocolVersion::LATEST)
+            .with_protocol_version(ProtocolVersion::V_2026_07_28)
             .with_instructions(
                 "Host bridge MCP server exposing execute_command for host processes and get_execution_environment for platform discovery."
                     .to_string(),
             )
+    }
+
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(MCP_SUPPORTED_PROTOCOL_VERSIONS)
     }
 
     async fn set_level(
@@ -158,13 +169,15 @@ fn server_implementation() -> Implementation {
 #[cfg(test)]
 mod tests {
     use super::HostBridgeMcpServer;
-    use super::{ExecuteCommandToolArgs, server_implementation};
+    use super::{ExecuteCommandToolArgs, MCP_SUPPORTED_PROTOCOL_VERSIONS, server_implementation};
     use crate::application::execution_service::ExecutionService;
     use crate::application::operator_console::OperatorConsole;
     use crate::config::{
         AppConfig, ExecutionConfig, ExecutionServerConfig, SshAuthConfig, SshAuthType,
         TargetPlatform,
     };
+    use rmcp::ServerHandler;
+    use rmcp::model::ProtocolVersion;
     use rmcp::schemars;
     use serde_json::json;
     use std::collections::HashMap;
@@ -222,6 +235,24 @@ mod tests {
 
         assert_eq!(implementation.name, env!("CARGO_PKG_NAME"));
         assert_eq!(implementation.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn server_info_advertises_latest_and_legacy_mcp_versions() {
+        let server = HostBridgeMcpServer::new(
+            ExecutionService::new(Arc::new(AppConfig::default())),
+            OperatorConsole::default(),
+        );
+
+        assert_eq!(
+            server.get_info().protocol_version,
+            ProtocolVersion::V_2026_07_28
+        );
+        assert_eq!(
+            server.supported_protocol_versions().as_ref(),
+            MCP_SUPPORTED_PROTOCOL_VERSIONS
+        );
+        assert!(!MCP_SUPPORTED_PROTOCOL_VERSIONS.contains(&ProtocolVersion::V_2024_11_05));
     }
 
     #[tokio::test]
@@ -286,8 +317,9 @@ pub(crate) fn router(
     let mcp_execution_service = execution_service.clone();
     let mcp_operator_console = operator_console.clone();
     let mut mcp_config = StreamableHttpServerConfig::default();
-    mcp_config.stateful_mode = true;
+    mcp_config.legacy_session_mode = true;
     mcp_config.json_response = false;
+    mcp_config.stateless_protocol_metadata_required = true;
     let mcp_service: StreamableHttpService<HostBridgeMcpServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || {

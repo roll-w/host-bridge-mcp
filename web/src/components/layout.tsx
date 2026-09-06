@@ -209,6 +209,31 @@ export function SectionHeading({
     );
 }
 
+export function Expandable({
+                               open,
+                               children,
+                               className,
+                           }: {
+    open: boolean;
+    children: ReactNode;
+    className?: string;
+}) {
+    return (
+        <div
+            aria-hidden={!open}
+            className={cn(
+                "grid overflow-hidden transition-[grid-template-rows,opacity,visibility,margin] duration-200 ease-out",
+                open
+                    ? "visible grid-rows-[1fr] opacity-100"
+                    : "invisible pointer-events-none grid-rows-[0fr] opacity-0",
+                className,
+            )}
+        >
+            <div className="min-h-0 overflow-hidden">{children}</div>
+        </div>
+    );
+}
+
 export function ConfigGroup({
                                 title,
                                 description,

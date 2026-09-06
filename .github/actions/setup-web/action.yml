@@ -1,0 +1,17 @@
+name: Setup web
+description: Prepare the frontend toolchain and install dependencies.
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 22.x
+        cache: npm
+        cache-dependency-path: web/package-lock.json
+
+    - name: Install frontend dependencies
+      shell: bash
+      working-directory: web
+      run: npm ci

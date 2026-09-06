@@ -35,8 +35,7 @@ export interface PendingApproval {
     createdAt: string;
 }
 
-export type ApprovalDecision =
-    "approve-once" | "approve-for-session" | "reject";
+export type ApprovalDecision = "approve-once" | "reject";
 
 export interface ConsoleSnapshot {
     interactive: boolean;
@@ -83,6 +82,8 @@ export interface HistoryPage {
 
 export interface AppConfig {
     "data-dir": string | null;
+    tui: boolean;
+    web: boolean;
     server: { address: string; access: { "api-key-env": string | null } };
     logging: { "retention-days": number };
     execution: {
@@ -145,6 +146,8 @@ export interface ConfigSnapshot {
 
 export interface VisualConfigPatch {
     dataDir: string;
+    tui: boolean;
+    web: boolean;
     serverAddress: string;
     apiKeyEnv: string;
     logRetentionDays: number;

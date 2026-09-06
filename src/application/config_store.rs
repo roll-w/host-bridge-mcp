@@ -17,7 +17,7 @@
 use crate::config::{
     AppConfig, CommandPolicyConfig, ConfigError, ExecutionServerConfig, ResolvedConfigPath,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
@@ -44,6 +44,8 @@ pub enum ConfigStoreError {
 #[serde(rename_all = "camelCase")]
 pub struct VisualConfigPatch {
     pub data_dir: Option<String>,
+    pub tui: Option<bool>,
+    pub web: Option<bool>,
     pub server_address: Option<String>,
     pub api_key_env: Option<String>,
     pub log_retention_days: Option<u64>,
@@ -180,6 +182,8 @@ fn apply_visual_patch(raw: &str, patch: &VisualConfigPatch) -> Result<String, Co
                 .as_ref()
                 .map(|value| yaml_optional_string(value)),
         ),
+        ("tui", patch.tui.map(|value| value.to_string())),
+        ("web", patch.web.map(|value| value.to_string())),
         (
             "server.address",
             patch
@@ -253,23 +257,25 @@ fn apply_visual_patch(raw: &str, patch: &VisualConfigPatch) -> Result<String, Co
     }
 
     if let Some(commands) = patch.commands.as_ref() {
-        let value = serde_json::to_string(commands)
-            .map_err(|error| ConfigStoreError::Serialize(error.to_string()))?;
-        replace_or_insert_yaml_value(&mut lines, "execution.commands", &value);
+        let value = serialize_yaml_value(commands)?;
+        replace_or_insert_yaml_block(&mut lines, "execution.commands", &value);
     }
 
     if let Some(servers) = patch.servers.as_ref() {
-        let value = serde_json::to_string(servers)
-            .map_err(|error| ConfigStoreError::Serialize(error.to_string()))?;
-        replace_or_insert_yaml_value(&mut lines, "execution.servers", &value);
+        let value = serialize_yaml_value(servers)?;
+        replace_or_insert_yaml_block(&mut lines, "execution.servers", &value);
     }
 
     Ok(lines.concat())
 }
 
-fn replace_or_insert_yaml_value(lines: &mut Vec<String>, path: &str, value: &str) {
-    if !replace_yaml_scalar(lines, path, value) {
-        let _ = insert_yaml_scalar(lines, path, value);
+fn serialize_yaml_value<T: Serialize>(value: &T) -> Result<String, ConfigStoreError> {
+    serde_saphyr::to_string(value).map_err(|error| ConfigStoreError::Serialize(error.to_string()))
+}
+
+fn replace_or_insert_yaml_block(lines: &mut Vec<String>, path: &str, value: &str) {
+    if !replace_yaml_block(lines, path, value) {
+        let _ = insert_yaml_block(lines, path, value);
     }
 }
 
@@ -295,6 +301,49 @@ fn replace_yaml_scalar(lines: &mut [String], path: &str, value: &str) -> bool {
     true
 }
 
+fn replace_yaml_block(lines: &mut Vec<String>, path: &str, value: &str) -> bool {
+    let wanted = path.split('.').collect::<Vec<_>>();
+    let Some((line_index, indent, colon_index)) = find_yaml_mapping(lines, &wanted) else {
+        return false;
+    };
+
+    let block_end = mapping_block_end(lines, line_index, indent);
+    let newline = line_ending(lines);
+    let value = value.trim_end_matches(['\r', '\n']);
+    let mut replacement = Vec::new();
+
+    if value.trim() == "[]" {
+        let mut line = lines[line_index].clone();
+        replace_scalar_value(&mut line, colon_index, "[]");
+        replacement.push(line);
+    } else {
+        replacement.push(yaml_mapping_header(
+            &lines[line_index],
+            colon_index,
+            newline,
+        ));
+        let value_indent = " ".repeat(indent + 2);
+        replacement.extend(
+            value
+                .lines()
+                .map(|line| format!("{value_indent}{line}{newline}")),
+        );
+    }
+
+    lines.splice(line_index..block_end, replacement);
+    true
+}
+
+fn yaml_mapping_header(line: &str, colon_index: usize, newline: &str) -> String {
+    let content = line.trim_end_matches(['\r', '\n']);
+    let prefix = &content[..=colon_index];
+    let Some(comment_index) = find_inline_comment(content, colon_index + 1) else {
+        return format!("{prefix}{newline}");
+    };
+
+    format!("{prefix} {}{newline}", &content[comment_index..])
+}
+
 fn insert_yaml_scalar(lines: &mut Vec<String>, path: &str, value: &str) -> bool {
     let wanted = path.split('.').collect::<Vec<_>>();
     if wanted.is_empty() {
@@ -307,6 +356,56 @@ fn insert_yaml_scalar(lines: &mut Vec<String>, path: &str, value: &str) -> bool 
     }
 
     insert_yaml_line(lines, parent_path, wanted[wanted.len() - 1], Some(value))
+}
+
+fn insert_yaml_block(lines: &mut Vec<String>, path: &str, value: &str) -> bool {
+    let wanted = path.split('.').collect::<Vec<_>>();
+    if wanted.is_empty() {
+        return false;
+    }
+
+    let parent_path = &wanted[..wanted.len() - 1];
+    if !ensure_yaml_mapping(lines, parent_path) {
+        return false;
+    }
+
+    let newline = line_ending(lines);
+    let (parent_indent, insertion_index) = if parent_path.is_empty() {
+        if lines.len() == 1 && lines[0].is_empty() {
+            lines.clear();
+        }
+        (0, lines.len())
+    } else {
+        let Some((parent_index, parent_indent, _)) = find_yaml_mapping(lines, parent_path) else {
+            return false;
+        };
+        (
+            child_indent(lines, parent_index, parent_indent),
+            mapping_block_end(lines, parent_index, parent_indent),
+        )
+    };
+
+    if insertion_index > 0 && !has_line_ending(&lines[insertion_index - 1]) {
+        lines[insertion_index - 1].push_str(newline);
+    }
+
+    let value = value.trim_end_matches(['\r', '\n']);
+    let key = wanted[wanted.len() - 1];
+    let replacement = if value.trim() == "[]" {
+        vec![format!("{}{key}: []{newline}", " ".repeat(parent_indent))]
+    } else {
+        let mut replacement = vec![format!("{}{key}:{newline}", " ".repeat(parent_indent))];
+        let value_indent = " ".repeat(parent_indent + 2);
+        replacement.extend(
+            value
+                .lines()
+                .map(|line| format!("{value_indent}{line}{newline}")),
+        );
+        replacement
+    };
+
+    lines.splice(insertion_index..insertion_index, replacement);
+    true
 }
 
 fn ensure_yaml_mapping(lines: &mut Vec<String>, path: &[&str]) -> bool {
@@ -535,6 +634,8 @@ mod tests {
             raw,
             &VisualConfigPatch {
                 data_dir: Some("/tmp/host-bridge-data".to_string()),
+                tui: Some(false),
+                web: Some(false),
                 api_key_env: Some("HOST_BRIDGE_API_KEY".to_string()),
                 log_retention_days: Some(14),
                 default_working_directory: Some("/workspace".to_string()),
@@ -552,6 +653,8 @@ mod tests {
             Some("HOST_BRIDGE_API_KEY")
         );
         assert_eq!(config.data_dir.as_deref(), Some("/tmp/host-bridge-data"));
+        assert!(!config.tui);
+        assert!(!config.web);
         assert_eq!(config.logging.retention_days, 14);
         assert_eq!(
             config.execution.default_working_directory.as_deref(),
@@ -591,6 +694,40 @@ mod tests {
         assert_eq!(config.execution.commands[0].command, "cargo");
         assert_eq!(config.execution.servers.len(), 1);
         assert_eq!(config.execution.servers[0].name(), "builder");
+    }
+
+    #[test]
+    fn visual_patch_replaces_existing_collections_with_yaml_blocks() {
+        let raw = "server:\n  address: 127.0.0.1:8787\nexecution:\n  default-action: confirm\n  default-server: host\n  target-platform: auto\n  default-timeout-ms: 1800000\n  max-timeout-ms: 7200000\n  commands:\n    - command: old\n      action: confirm\n      targets: []\n      default-working-directory: null\n      rules: []\n  servers:\n    - transport: host\n      name: old\n      target-platform: auto\n";
+        let patched = apply_visual_patch(
+            raw,
+            &VisualConfigPatch {
+                commands: Some(vec![CommandPolicyConfig {
+                    command: "cargo".to_string(),
+                    action: crate::config::PolicyAction::Allow,
+                    targets: Vec::new(),
+                    default_working_directory: None,
+                    rules: vec![],
+                }]),
+                servers: Some(vec![ExecutionServerConfig::Host {
+                    name: "builder".to_string(),
+                    target_platform: crate::config::TargetPlatform::Linux,
+                }]),
+                ..VisualConfigPatch::default()
+            },
+        )
+            .expect("visual collections should serialize");
+
+        let config = crate::config::AppConfig::parse_raw("test.yaml", &patched)
+            .expect("replaced visual collections should remain valid configuration");
+        assert_eq!(config.execution.commands[0].command, "cargo");
+        assert_eq!(config.execution.servers[0].name(), "builder");
+        assert!(patched.contains("  commands:\n    - command: cargo\n"));
+        assert!(patched.contains("  servers:\n    - transport: host\n"));
+        assert!(!patched.contains("command: old"));
+        assert!(!patched.contains("name: old"));
+        assert!(!patched.contains("commands: [{"));
+        assert!(!patched.contains("servers: [{"));
     }
 
     #[test]

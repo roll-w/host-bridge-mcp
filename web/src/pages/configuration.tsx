@@ -32,7 +32,7 @@ import type {
     VisualConfigPatch,
 } from "@/types";
 import {ConfigGroup, InlineError, PageHeading, StatusPill,} from "@/components/layout";
-import {Field, NumberField, SelectField} from "@/components/form";
+import {Field, NumberField, SelectField, ToggleField} from "@/components/form";
 import {ConfirmDialog} from "@/components/confirm-dialog";
 import {Button} from "@/components/ui/button";
 import {Label} from "@/components/ui/label";
@@ -129,6 +129,8 @@ export function ConfigurationPage({t}: { t: (key: MessageKey) => string }) {
         setError(null);
         const patch: VisualConfigPatch = {
             dataDir: draft["data-dir"] ?? "",
+            tui: draft.tui,
+            web: draft.web,
             serverAddress: draft.server.address,
             apiKeyEnv: draft.server.access["api-key-env"] ?? "",
             logRetentionDays: draft.logging["retention-days"],
@@ -456,6 +458,33 @@ function GeneralConfig({
                         }
                         mono
                         description={t("apiKeyEnvHint")}
+                    />
+                </div>
+            </ConfigGroup>
+            <ConfigGroup
+                title={t("interfaceSection")}
+                description={t("interfaceSectionHint")}
+            >
+                <div className="grid gap-x-6 gap-y-5 sm:grid-cols-2">
+                    <ToggleField
+                        label={t("tuiEnabled")}
+                        value={draft.tui}
+                        onChange={(value) =>
+                            updateDraft((next) => {
+                                next.tui = value;
+                            })
+                        }
+                        description={t("restartRequiredHint")}
+                    />
+                    <ToggleField
+                        label={t("webEnabled")}
+                        value={draft.web}
+                        onChange={(value) =>
+                            updateDraft((next) => {
+                                next.web = value;
+                            })
+                        }
+                        description={t("webEnabledHint")}
                     />
                 </div>
             </ConfigGroup>

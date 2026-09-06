@@ -28,6 +28,8 @@ const DEFAULT_SSH_CONNECTION_IDLE_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct AppConfig {
     pub data_dir: Option<String>,
+    pub tui: bool,
+    pub web: bool,
     pub server: ServerConfig,
     pub execution: ExecutionConfig,
     pub logging: LoggingConfig,
@@ -203,6 +205,8 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             data_dir: None,
+            tui: true,
+            web: true,
             server: ServerConfig::default(),
             execution: ExecutionConfig::default(),
             logging: LoggingConfig::default(),

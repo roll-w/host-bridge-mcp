@@ -17,6 +17,12 @@
 # files. Leave it unset to use ~/.host-bridge.
 # data-dir: ~/.host-bridge
 
+# Start the interactive TUI for local approvals.
+tui: true
+
+# Open the web console in the default browser at startup.
+web: true
+
 server:
   # HTTP bind address. Keep this on loopback unless the network is trusted.
   address: "127.0.0.1:8810"

@@ -18,7 +18,7 @@ import {ChevronDown, Clock3, FolderOpen, ShieldAlert, Terminal, X,} from "lucide
 import {type Locale, type MessageKey} from "@/i18n";
 import {formatTime} from "@/utils";
 import type {ApprovalDecision, PendingApproval} from "@/types";
-import {Detail} from "@/components/layout";
+import {Detail, Expandable} from "@/components/layout";
 import {Button} from "@/components/ui/button";
 import {cn} from "@/lib/utils";
 
@@ -120,13 +120,6 @@ function ApprovalRow({
                             {t("approveOnce")}
                         </Button>
                         <Button
-                            variant="outline"
-                            size="sm"
-                            onClick={() => onDecision(item.id, "approve-for-session")}
-                        >
-                            {t("approveForSession")}
-                        </Button>
-                        <Button
                             variant="destructive"
                             size="sm"
                             onClick={() => onDecision(item.id, "reject")}
@@ -159,13 +152,6 @@ function ApprovalRow({
                         {t("approveOnce")}
                     </Button>
                     <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => onDecision(item.id, "approve-for-session")}
-                    >
-                        {t("approveForSession")}
-                    </Button>
-                    <Button
                         variant="destructive"
                         size="sm"
                         onClick={() => onDecision(item.id, "reject")}
@@ -174,14 +160,16 @@ function ApprovalRow({
                     </Button>
                 </div>
             )}
-            {expanded && onDecision && (
-                <ApprovalDetail
-                    item={item}
-                    t={t}
-                    locale={locale}
-                    onClose={() => onOpen?.(item)}
-                    onDecision={onDecision}
-                />
+            {onDecision && (
+                <Expandable open={expanded} className={expanded ? "mt-5" : "mt-0"}>
+                    <ApprovalDetail
+                        item={item}
+                        t={t}
+                        locale={locale}
+                        onClose={() => onOpen?.(item)}
+                        onDecision={onDecision}
+                    />
+                </Expandable>
             )}
         </div>
     );
@@ -202,7 +190,7 @@ export function ApprovalDetail({
 }) {
     const environmentEntries = Object.entries(item.request.env);
     return (
-        <div className="mt-5 border-t border-border/70 pt-5 animate-in fade-in-0 duration-150">
+        <div className="border-t border-border/70 pt-5">
             <div className="flex items-start justify-between gap-4">
                 <div className="space-y-1">
                     <h3 className="font-heading text-sm font-semibold">
@@ -300,12 +288,6 @@ export function ApprovalDetail({
                     onClick={() => onDecision(item.id, "approve-once")}
                 >
                     {t("approveOnce")}
-                </Button>
-                <Button
-                    variant="outline"
-                    onClick={() => onDecision(item.id, "approve-for-session")}
-                >
-                    {t("approveForSession")}
                 </Button>
                 <Button
                     variant="destructive"

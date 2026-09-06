@@ -103,7 +103,7 @@ fn render_status_bar(frame: &mut Frame, area: Rect, snapshot: &ConsoleSnapshot) 
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::raw(
-            "  |  Up/Down select  Left/Right x-scroll  a approve once  s approve same request for session  r reject  Wheel/PgUp/PgDn logs  Home/End head-tail  q shutdown",
+            "  |  Up/Down select  Left/Right x-scroll  a approve once  r reject  Wheel/PgUp/PgDn logs  Home/End head-tail  q shutdown",
         ),
     ]);
     frame.render_widget(Paragraph::new(text).style(style), area);

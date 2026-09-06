@@ -76,6 +76,8 @@ struct PreparedConsoleReload {
 struct ConfigReloadState {
     running_bind_address: String,
     running_data_dir: Option<String>,
+    running_tui: bool,
+    running_web: bool,
     applied_logging: LoggingConfig,
     last_applied_fingerprint: ConfigFileFingerprint,
     last_failed_fingerprint: Option<ConfigFileFingerprint>,
@@ -254,6 +256,8 @@ impl ConfigReloadState {
         Self {
             running_bind_address: initial_config.server.bind_address,
             running_data_dir,
+            running_tui: initial_config.tui,
+            running_web: initial_config.web,
             applied_logging: initial_config.logging,
             last_applied_fingerprint,
             last_failed_fingerprint: None,
@@ -323,8 +327,26 @@ impl ConfigReloadState {
             );
         }
 
+        if prepared.config.tui != self.running_tui {
+            tracing::warn!(
+                active_tui = self.running_tui,
+                configured_tui = prepared.config.tui,
+                "Config reloaded, but tui changes require a restart"
+            );
+        }
+
+        if prepared.config.web != self.running_web {
+            tracing::warn!(
+                active_web = self.running_web,
+                configured_web = prepared.config.web,
+                "Config reloaded, but web changes require a restart"
+            );
+        }
+
         if prepared.config.server.bind_address == self.running_bind_address
             && prepared.config.data_dir == self.running_data_dir
+            && prepared.config.tui == self.running_tui
+            && prepared.config.web == self.running_web
         {
             tracing::info!(path = %config_path.path, "Config file reloaded");
         }
@@ -425,7 +447,6 @@ impl PreparedConfigReloadAction for PreparedConsoleReload {
             operator_console,
             logging_reconfigure,
         } = *self;
-        operator_console.clear_session_approvals();
         if let Some(logging_reconfigure) = logging_reconfigure {
             operator_console.apply_logging_reconfigure(logging_reconfigure);
         }

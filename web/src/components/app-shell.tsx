@@ -15,10 +15,11 @@
  */
 
 import {type ComponentType, type ReactNode, useState} from "react";
-import {Activity, ClipboardCheck, Languages, LogOut, Menu, ScrollText, Settings2,} from "lucide-react";
+import {Activity, Bell, ClipboardCheck, Languages, LogOut, Menu, ScrollText, Settings2,} from "lucide-react";
 import {type Locale, type MessageKey} from "@/i18n";
 import type {Page} from "@/types";
 import {Button} from "@/components/ui/button";
+import {useNotifications} from "@/components/notification";
 import {Select, SelectContent, SelectItem, SelectTrigger, SelectValue,} from "@/components/ui/select";
 import {Sheet, SheetContent, SheetHeader, SheetTitle,} from "@/components/ui/sheet";
 import {cn} from "@/lib/utils";
@@ -105,6 +106,7 @@ export function AppShell({
     children: ReactNode;
 }) {
     const [mobileNavigationOpen, setMobileNavigationOpen] = useState(false);
+    const {systemPermission, enableSystemNotifications} = useNotifications();
     const pageTitle = t(
         nav.find((item) => item.key === page)?.label ?? "overview",
     );
@@ -155,6 +157,17 @@ export function AppShell({
                             </div>
                         </div>
                         <div className="flex shrink-0 items-center gap-2">
+                            {systemPermission === "default" && (
+                                <Button
+                                    variant="ghost"
+                                    size="icon-sm"
+                                    onClick={() => void enableSystemNotifications()}
+                                    aria-label={t("enableNotifications")}
+                                    title={t("enableNotifications")}
+                                >
+                                    <Bell className="size-3.5"/>
+                                </Button>
+                            )}
                             <Select
                                 value={locale}
                                 onValueChange={(value) => setLocale(value as Locale)}

@@ -77,7 +77,7 @@ pub struct ConsoleSnapshot {
 }
 
 fn current_console_timestamp() -> String {
-    let timer = TracingSystemTime::default();
+    let timer = TracingSystemTime;
     let mut output = String::new();
     let mut writer = Writer::new(&mut output);
 
@@ -434,9 +434,7 @@ mod tests {
             ..sample_request()
         };
 
-        let result = console
-            .request_confirmation(Uuid::new_v4(), request)
-            .await;
+        let result = console.request_confirmation(Uuid::new_v4(), request).await;
         assert!(matches!(result, Err(ConsoleApprovalError::TimedOut)));
         assert!(console.snapshot().pending_approvals.is_empty());
     }
@@ -517,7 +515,7 @@ mod tests {
             .await
             .expect("wait task should complete before timeout")
             .expect("wait task should not panic");
-        assert_eq!(approved.expect("approval should be delivered"), true);
+        assert!(approved.expect("approval should be delivered"));
     }
 
     #[tokio::test]

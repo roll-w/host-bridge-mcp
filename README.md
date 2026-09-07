@@ -231,7 +231,8 @@ For `transport: ssh`:
 | `target-platform`            | —        | `windows`, `linux`, or `macos`; `auto` is not allowed for SSH.      |
 | `auth.type`                  | `agent`  | `agent`, `identity-file`, `password-env`, or `password-file`.       |
 | `auth.ref`                   | unset    | Required for the three non-agent auth types; omit for `agent`.      |
-| `known-hosts-file`           | unset    | Optional SSH known-hosts file.                                      |
+| `verify-host-key`            | `true`   | Verify the SSH server key against known hosts. Set `false` only when another trusted mechanism performs verification. |
+| `known-hosts-file`           | unset    | Optional known-hosts file; when unset, the user's default SSH known-hosts file is used. |
 | `connection-idle-timeout-ms` | `300000` | Idle SSH connection timeout; must be greater than zero.             |
 
 Working-directory and command paths are interpreted by the selected target.
@@ -265,6 +266,9 @@ runtime logs.
 
 Runs one command line on the selected execution target. Optional parameters select the target, working directory,
 environment, timeout, and output limits. Commands that require approval wait for a decision in the TUI or web console.
+Execution output and exit status are returned in the completed tool response. The server does not advertise the
+deprecated MCP Logging capability or send `notifications/message`; live output remains available in the web console.
+
 The MCP `timeoutMs` argument overrides the configured default for that request; if omitted,
 `execution.default-timeout-ms` is used. A request that is not approved before the timeout is rejected.
 

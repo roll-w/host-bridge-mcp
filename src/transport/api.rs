@@ -116,5 +116,5 @@ pub fn success_value(data: Value) -> Value {
         },
         data,
     })
-        .unwrap_or_else(|_| Value::Null)
+    .unwrap_or(Value::Null)
 }

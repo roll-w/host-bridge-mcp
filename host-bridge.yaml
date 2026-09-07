@@ -100,6 +100,7 @@ execution:
   #       type: agent
   #
   #     # Recommended: keep strict SSH host-key verification enabled.
+  #     verify-host-key: true
   #     known-hosts-file: /home/builder/.ssh/known_hosts
   #     connection-idle-timeout-ms: 300000
   #

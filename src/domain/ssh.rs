@@ -21,13 +21,14 @@ use russh::client;
 use russh::keys::{
     Algorithm, HashAlg, PrivateKeyWithHashAlg, PublicKey,
     agent::client::{AgentClient, AgentStream},
-    check_known_hosts_path, load_secret_key,
+    check_known_hosts, check_known_hosts_path, load_secret_key,
 };
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
+use tokio::time::{Instant, timeout_at};
 
 mod command;
 mod connection_pool;
@@ -37,6 +38,7 @@ use self::connection_pool::SshConnectionManager;
 
 const SSH_COMMAND_QUEUE_CAPACITY: usize = 64;
 const SSH_OUTPUT_QUEUE_CAPACITY: usize = 256;
+const SSH_MAX_CONCURRENT_COMMANDS: usize = 16;
 const KEEPALIVE_FAILURE_THRESHOLD: usize = 3;
 
 type DynamicAgentClient = AgentClient<Box<dyn AgentStream + Send + Unpin + 'static>>;
@@ -52,6 +54,7 @@ struct SshWorkerClient {
 }
 
 struct WorkerCommand {
+    deadline: Instant,
     target: SshTarget,
     platform: RuntimePlatform,
     request: SshCommandRequest,
@@ -65,6 +68,7 @@ enum WorkerEvent {
 
 #[derive(Debug, Clone)]
 pub struct SshCommandRequest {
+    pub shell_command: Option<String>,
     pub executable: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
@@ -124,6 +128,7 @@ pub(super) struct SshClientHandler {
     host: String,
     port: u16,
     known_hosts_file: Option<String>,
+    verify_host_key: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,37 +165,42 @@ impl SshClient {
     where
         F: Fn(String) + Send + Sync + 'static,
     {
+        let deadline = Instant::now() + Duration::from_millis(request.timeout_ms);
+        let timeout_ms = request.timeout_ms;
         let error_host = target.host.clone();
         let error_port = target.port;
         let (event_tx, mut event_rx) = mpsc::channel(SSH_OUTPUT_QUEUE_CAPACITY);
-        self.command_tx
-            .send(WorkerCommand {
-                target,
-                platform,
-                request,
-                event_tx,
-            })
-            .await
-            .map_err(|_| {
-                SshError::Connect(
-                    error_host.clone(),
-                    error_port,
-                    "ssh worker is not running".to_string(),
-                )
-            })?;
-
-        while let Some(event) = event_rx.recv().await {
-            match event {
-                WorkerEvent::Output(text) => on_output(text),
-                WorkerEvent::Finished(result) => return result,
+        timeout_at(deadline, async {
+            self.command_tx
+                .send(WorkerCommand {
+                    deadline,
+                    target,
+                    platform,
+                    request,
+                    event_tx,
+                })
+                .await
+                .map_err(|_| {
+                    SshError::Connect(
+                        error_host.clone(),
+                        error_port,
+                        "ssh worker is not running".to_string(),
+                    )
+                })?;
+            while let Some(event) = event_rx.recv().await {
+                match event {
+                    WorkerEvent::Output(text) => on_output(text),
+                    WorkerEvent::Finished(result) => return result,
+                }
             }
-        }
-
-        Err(SshError::Connect(
-            error_host,
-            error_port,
-            "ssh worker stopped before returning a result".to_string(),
-        ))
+            Err(SshError::Connect(
+                error_host,
+                error_port,
+                "ssh worker stopped before returning a result".to_string(),
+            ))
+        })
+        .await
+        .map_err(|_| SshError::Timeout(timeout_ms))?
     }
 }
 
@@ -203,17 +213,30 @@ impl SshWorkerClient {
 
     async fn run(mut command_rx: mpsc::Receiver<WorkerCommand>) {
         let worker = Arc::new(Self::new());
-        while let Some(command) = command_rx.recv().await {
+        let permits = Arc::new(Semaphore::new(SSH_MAX_CONCURRENT_COMMANDS));
+        loop {
+            let permit = permits
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("ssh concurrency semaphore is never closed");
+            let Some(command) = command_rx.recv().await else {
+                break;
+            };
+            if command.event_tx.is_closed() || Instant::now() >= command.deadline {
+                continue;
+            }
             let worker = worker.clone();
             tokio::task::spawn_local(async move {
-                let result = worker
-                    .execute_command(
-                        command.target,
-                        command.platform,
-                        command.request,
-                        command.event_tx.clone(),
-                    )
-                    .await;
+                let _permit = permit;
+                let timeout_ms = command.request.timeout_ms;
+                let result = tokio::select! {
+                    biased;
+                    _ = command.event_tx.closed() => return,
+                    result = timeout_at(command.deadline, worker.execute_command(
+                        command.target, command.platform, command.request, command.event_tx.clone(),
+                    )) => result.unwrap_or(Err(SshError::Timeout(timeout_ms))),
+                };
                 let _ = command.event_tx.send(WorkerEvent::Finished(result)).await;
             });
         }
@@ -246,19 +269,22 @@ impl SshWorkerClient {
                 request.clone(),
                 event_tx.clone(),
             )
-                .await
+            .await
             {
-                Ok(result) => return Ok(result),
+                Ok(result) => {
+                    connection.mark_reusable();
+                    return Ok(result);
+                }
                 Err(error)
-                if should_retry_with_fresh_session(
-                    reused_connection,
-                    allow_fresh_retry,
-                    error.stage,
-                ) =>
-                    {
-                        allow_fresh_retry = false;
-                        force_fresh_session = true;
-                    }
+                    if should_retry_with_fresh_session(
+                        reused_connection,
+                        allow_fresh_retry,
+                        error.stage,
+                    ) =>
+                {
+                    allow_fresh_retry = false;
+                    force_fresh_session = true;
+                }
                 Err(error) => return Err(error.error),
             }
         }
@@ -311,74 +337,59 @@ async fn execute_command_with_connection(
         }
     })?;
 
-    let wait_result = tokio::time::timeout(Duration::from_millis(request.timeout_ms), async {
-        let mut code = None;
-        let mut request_confirmed = false;
+    let mut code = None;
+    let mut request_confirmed = false;
 
-        loop {
-            let Some(message) = channel.wait().await else {
-                break;
-            };
+    loop {
+        let Some(message) = channel.wait().await else {
+            break;
+        };
 
-            match message {
-                ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
-                    request_confirmed = true;
-                    let _ = event_tx
-                        .send(WorkerEvent::Output(
-                            String::from_utf8_lossy(data.as_ref()).into_owned(),
-                        ))
-                        .await;
-                }
-                ChannelMsg::Success => {
-                    request_confirmed = true;
-                }
-                ChannelMsg::Failure => {
-                    return Err(CommandAttemptError {
-                        error: SshError::CommandStart(
-                            user.clone(),
-                            host.clone(),
-                            port,
-                            "remote server rejected exec request".to_string(),
-                        ),
-                        stage: if request_confirmed {
-                            CommandAttemptStage::Runtime
-                        } else {
-                            CommandAttemptStage::ConnectionSetup
-                        },
-                    });
-                }
-                ChannelMsg::ExitStatus { exit_status } => {
-                    request_confirmed = true;
-                    code = Some(exit_status as i32);
-                }
-                ChannelMsg::ExitSignal { .. } => {
-                    request_confirmed = true;
-                    code.get_or_insert(-1);
-                }
-                ChannelMsg::Close | ChannelMsg::Eof => {}
-                _ => {}
+        match message {
+            ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                request_confirmed = true;
+                let _ = event_tx
+                    .send(WorkerEvent::Output(
+                        String::from_utf8_lossy(data.as_ref()).into_owned(),
+                    ))
+                    .await;
             }
-        }
-
-        Ok(SshCommandResult {
-            code: code.unwrap_or(-1),
-            success: code == Some(0),
-            timed_out: false,
-        })
-    })
-        .await;
-
-    match wait_result {
-        Ok(result) => result,
-        Err(_) => {
-            connection.discard();
-            let _ = channel.close().await;
-            Err(CommandAttemptError {
-                error: SshError::Timeout(request.timeout_ms),
-                stage: CommandAttemptStage::Runtime,
-            })
+            ChannelMsg::Success => {
+                request_confirmed = true;
+            }
+            ChannelMsg::Failure => {
+                return Err(CommandAttemptError {
+                    error: SshError::CommandStart(
+                        user.clone(),
+                        host.clone(),
+                        port,
+                        "remote server rejected exec request".to_string(),
+                    ),
+                    stage: if request_confirmed {
+                        CommandAttemptStage::Runtime
+                    } else {
+                        CommandAttemptStage::ConnectionSetup
+                    },
+                });
+            }
+            ChannelMsg::ExitStatus { exit_status } => {
+                request_confirmed = true;
+                code = Some(exit_status as i32);
+            }
+            ChannelMsg::ExitSignal { .. } => {
+                request_confirmed = true;
+                code.get_or_insert(-1);
+            }
+            ChannelMsg::Close | ChannelMsg::Eof => {}
+            _ => {}
         }
     }
+
+    Ok(SshCommandResult {
+        code: code.unwrap_or(-1),
+        success: code == Some(0),
+        timed_out: false,
+    })
 }
 
 fn should_retry_with_fresh_session(
@@ -417,10 +428,12 @@ async fn connect_session(target: SshTarget) -> Result<SshSessionHandle, SshError
 }
 
 fn build_client_config(target: &SshTarget) -> client::Config {
-    let mut config = client::Config::default();
-    config.nodelay = true;
-    config.inactivity_timeout = Some(target.connection_idle_timeout);
-    config.keepalive_max = KEEPALIVE_FAILURE_THRESHOLD;
+    let mut config = client::Config {
+        nodelay: true,
+        inactivity_timeout: Some(target.connection_idle_timeout),
+        keepalive_max: KEEPALIVE_FAILURE_THRESHOLD,
+        ..client::Config::default()
+    };
     if let Some(interval) = keepalive_interval_for(target.connection_idle_timeout) {
         config.keepalive_interval = Some(interval);
     }
@@ -477,10 +490,10 @@ async fn authenticate_with_identity_file(
         session,
         matches!(private_key.algorithm(), Algorithm::Rsa { .. }),
     )
-        .await
-        .map_err(|error| {
-            SshError::Authentication(user.clone(), host.clone(), port, error.to_string())
-        })?;
+    .await
+    .map_err(|error| {
+        SshError::Authentication(user.clone(), host.clone(), port, error.to_string())
+    })?;
     let auth_result = session
         .authenticate_publickey(
             target.user.clone(),
@@ -521,10 +534,10 @@ async fn authenticate_with_agent(
             session,
             matches!(identity.algorithm(), Algorithm::Rsa { .. }),
         )
-            .await
-            .map_err(|error| {
-                SshError::Authentication(user.clone(), host.clone(), port, error.to_string())
-            })?;
+        .await
+        .map_err(|error| {
+            SshError::Authentication(user.clone(), host.clone(), port, error.to_string())
+        })?;
         let auth_result = session
             .authenticate_publickey_with(target.user.clone(), identity, hash_alg, &mut agent)
             .await
@@ -598,6 +611,7 @@ impl SshClientHandler {
             host: target.host,
             port: target.port,
             known_hosts_file: target.known_hosts_file,
+            verify_host_key: target.verify_host_key,
         }
     }
 }
@@ -609,11 +623,19 @@ impl client::Handler for SshClientHandler {
         &mut self,
         server_public_key: &PublicKey,
     ) -> Result<bool, Self::Error> {
-        let Some(known_hosts_path) = self.known_hosts_file.clone() else {
+        let known_hosts_path = self
+            .known_hosts_file
+            .as_deref()
+            .unwrap_or("~/.ssh/known_hosts")
+            .to_string();
+        if !self.verify_host_key {
             return Ok(true);
+        }
+        let verification = match self.known_hosts_file.as_deref() {
+            Some(path) => check_known_hosts_path(&self.host, self.port, server_public_key, path),
+            None => check_known_hosts(&self.host, self.port, server_public_key),
         };
-
-        match check_known_hosts_path(&self.host, self.port, server_public_key, &known_hosts_path) {
+        match verification {
             Ok(true) => Ok(true),
             Ok(false) => Err(ClientHandlerError::HostVerification(
                 self.host.clone(),
@@ -668,6 +690,7 @@ mod tests {
             user: "deploy".to_string(),
             auth: SshAuthTarget::PasswordEnv("HOST_BRIDGE_TEST_SSH_PASSWORD".to_string()),
             known_hosts_file: None,
+            verify_host_key: true,
             connection_idle_timeout: Duration::from_secs(30),
         };
 

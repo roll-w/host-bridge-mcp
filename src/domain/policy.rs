@@ -240,7 +240,8 @@ fn strip_ascii_case_suffix<'a>(value: &'a str, suffix: &str) -> Option<&'a str> 
     }
 
     let split_point = value.len() - suffix.len();
-    let (head, tail) = value.split_at(split_point);
+    let head = value.get(..split_point)?;
+    let tail = value.get(split_point..)?;
     if tail.eq_ignore_ascii_case(suffix) {
         Some(head)
     } else {
@@ -254,9 +255,16 @@ mod tests {
     use crate::config::{CommandPolicyConfig, CommandRuleConfig, ExecutionConfig, PolicyAction};
 
     fn test_config(execution: ExecutionConfig) -> AppConfig {
-        let mut config = AppConfig::default();
-        config.execution = execution;
-        config
+        AppConfig {
+            execution,
+            ..AppConfig::default()
+        }
+    }
+
+    #[test]
+    fn unicode_command_names_do_not_panic() {
+        assert_eq!(normalize_command("中文"), "中文");
+        assert_eq!(normalize_command("工具.EXE"), "工具");
     }
 
     #[test]
@@ -451,7 +459,7 @@ mod tests {
 
         assert_eq!(
             engine
-                .evaluate("host", "rm", &["-rf".to_string(), "workspace".to_string()], )
+                .evaluate("host", "rm", &["-rf".to_string(), "workspace".to_string()],)
                 .decision,
             PolicyDecision::Deny
         );

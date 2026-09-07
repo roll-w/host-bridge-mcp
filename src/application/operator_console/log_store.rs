@@ -160,10 +160,10 @@ impl LogStoreReconfigureSnapshot {
 impl LogFileStorage {
     fn new(logging: LoggingConfig, data_directory: &DataDirectory) -> io::Result<Self> {
         let path = data_directory.runtime_log_path()?;
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
         }
 
         archive_existing_log_file(&path)?;
@@ -206,11 +206,12 @@ impl LogFileStorage {
             let _ = self.rotate(global_line_index);
         }
 
-        if let Some(writer) = self.writer.as_mut() {
-            if writer.write_all(serialized.as_bytes()).is_ok() && writer.flush().is_ok() {
-                self.line_offsets.push(self.next_offset);
-                self.next_offset += serialized.len() as u64;
-            }
+        if let Some(writer) = self.writer.as_mut()
+            && writer.write_all(serialized.as_bytes()).is_ok()
+            && writer.flush().is_ok()
+        {
+            self.line_offsets.push(self.next_offset);
+            self.next_offset += serialized.len() as u64;
         }
     }
 
@@ -396,8 +397,8 @@ fn is_archived_log_path(active_path: &Path, candidate: &Path) -> bool {
     parts.next().is_none()
         && !date.is_empty()
         && date
-        .chars()
-        .all(|character| character.is_ascii_digit() || character == '-')
+            .chars()
+            .all(|character| character.is_ascii_digit() || character == '-')
         && !index.is_empty()
         && index.chars().all(|character| character.is_ascii_digit())
 }

@@ -58,15 +58,16 @@ pub(super) async fn run_execution(
     }
 }
 
+const OUTPUT_DRAIN_GRACE_PERIOD: Duration = Duration::from_secs(1);
+
 async fn run_host_execution(
     execution_id: Uuid,
     record: Arc<ExecutionRecord>,
     run: HostRunExecution,
     spawn_planner: SpawnPlanner,
 ) {
-    let mut command = if run.shell_wrapped {
-        let full_command_line = build_shell_command_line(&run.program, &run.args);
-        let mut cmd = build_shell_invocation(&full_command_line);
+    let mut command = if let Some(command_line) = &run.shell_command {
+        let mut cmd = build_shell_invocation(command_line);
         cmd.current_dir(&run.working_directory)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -86,6 +87,9 @@ async fn run_host_execution(
         apply_spawn_plan(&mut cmd, &spawn_plan);
         cmd
     };
+
+    #[cfg(unix)]
+    command.process_group(0);
 
     for (key, value) in &run.env {
         command.env(key, value);
@@ -120,6 +124,7 @@ async fn run_host_execution(
     let (timed_out, status_result) = match wait_result {
         Ok(status_result) => (false, status_result),
         Err(_) => {
+            terminate_process_tree(child.id()).await;
             let _ = child.start_kill();
             emit_event(
                 execution_id,
@@ -160,10 +165,10 @@ async fn run_host_execution(
     drop(child);
 
     if let Some(task) = stdout_task {
-        let _ = task.await;
+        finish_output_task(task).await;
     }
     if let Some(task) = stderr_task {
-        let _ = task.await;
+        finish_output_task(task).await;
     }
 
     finalize_output_store(execution_id, &record);
@@ -357,6 +362,37 @@ where
     })
 }
 
+async fn finish_output_task(task: JoinHandle<()>) {
+    let mut task = task;
+    if timeout(OUTPUT_DRAIN_GRACE_PERIOD, &mut task).await.is_err() {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+async fn terminate_process_tree(process_id: Option<u32>) {
+    let Some(process_id) = process_id else {
+        return;
+    };
+
+    #[cfg(unix)]
+    {
+        let process_group = format!("-{process_id}");
+        let _ = tokio::process::Command::new("/bin/kill")
+            .args(["-KILL", &process_group])
+            .status()
+            .await;
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = tokio::process::Command::new("taskkill")
+            .args(["/PID", &process_id.to_string(), "/T", "/F"])
+            .status()
+            .await;
+    }
+}
+
 fn emit_event(execution_id: Uuid, record: &ExecutionRecord, event: ExecutionEvent) {
     log_execution_event(execution_id, &event);
     if let ExecutionEvent::Exit {
@@ -371,14 +407,14 @@ fn emit_event(execution_id: Uuid, record: &ExecutionRecord, event: ExecutionEven
             timed_out: *timed_out,
         });
     }
-    if let ExecutionEvent::Output { text } = &event {
-        if let Err(error) = record.append_output(text) {
-            tracing::error!(
-                execution_id = %execution_id,
-                error = %error,
-                "Failed to persist merged execution output"
-            );
-        }
+    if let ExecutionEvent::Output { text } = &event
+        && let Err(error) = record.append_output(text)
+    {
+        tracing::error!(
+            execution_id = %execution_id,
+            error = %error,
+            "Failed to persist merged execution output"
+        );
     }
     record.send(event);
 }
@@ -420,20 +456,35 @@ fn short_id(execution_id: Uuid) -> String {
     execution_id.to_string().chars().take(8).collect()
 }
 
-fn build_shell_command_line(program: &str, args: &[String]) -> String {
-    let mut parts = vec![program.to_string()];
-    parts.extend(args.iter().cloned());
-    parts.join(" ")
-}
-
 fn build_shell_invocation(command_line: &str) -> Command {
     if cfg!(windows) {
         let mut cmd = Command::new("cmd");
-        cmd.args(["/C", command_line]);
+        cmd.args(["/D", "/S", "/C"]);
+        #[cfg(windows)]
+        cmd.raw_arg(format!("\"{command_line}\""));
         cmd
     } else {
         let mut cmd = Command::new("sh");
         cmd.args(["-c", command_line]);
         cmd
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::pending;
+    use std::time::Instant;
+
+    #[tokio::test]
+    async fn stalled_output_task_is_bounded_and_aborted() {
+        let task = tokio::spawn(async {
+            pending::<()>().await;
+        });
+        let started_at = Instant::now();
+
+        finish_output_task(task).await;
+
+        assert!(started_at.elapsed() < OUTPUT_DRAIN_GRACE_PERIOD + Duration::from_secs(1));
     }
 }

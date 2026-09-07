@@ -47,6 +47,7 @@ pub struct SshTarget {
     pub user: String,
     pub auth: SshAuthTarget,
     pub known_hosts_file: Option<String>,
+    pub verify_host_key: bool,
     pub connection_idle_timeout: Duration,
 }
 
@@ -132,6 +133,7 @@ fn build_target(server: &ExecutionServerConfig) -> ExecutionTarget {
             target_platform,
             auth,
             known_hosts_file,
+            verify_host_key,
             connection_idle_timeout_ms,
         } => ExecutionTarget {
             name: name.clone(),
@@ -141,6 +143,7 @@ fn build_target(server: &ExecutionServerConfig) -> ExecutionTarget {
                 user: user.clone(),
                 auth: build_ssh_auth_target(auth),
                 known_hosts_file: known_hosts_file.clone(),
+                verify_host_key: *verify_host_key,
                 connection_idle_timeout: Duration::from_millis(*connection_idle_timeout_ms),
             }),
             target_platform: resolve_target_platform(*target_platform),
@@ -213,6 +216,7 @@ mod tests {
                     r#ref: Some("SSH_PASSWORD".to_string()),
                 },
                 known_hosts_file: Some("/home/dev/.ssh/known_hosts".to_string()),
+                verify_host_key: true,
                 connection_idle_timeout_ms: 45_000,
             }],
             ..ExecutionConfig::default()

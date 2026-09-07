@@ -1126,6 +1126,18 @@ function ServerEditor({
                                 )}
                             </div>
                         )}
+                        <ToggleField
+                            label={t("verifyHostKey")}
+                            value={server["verify-host-key"]}
+                            onChange={(value) =>
+                                updateDraft((next) => {
+                                    const target = next.execution.servers[index];
+                                    if (target.transport === "ssh")
+                                        target["verify-host-key"] = value;
+                                })
+                            }
+                            description={t("verifyHostKeyHint")}
+                        />
                         <Field
                             label={t("knownHostsFile")}
                             value={server["known-hosts-file"] ?? ""}
@@ -1199,6 +1211,7 @@ function newSsh(): SshServerConfig {
         "target-platform": "linux",
         auth: {type: "agent", ref: null},
         "known-hosts-file": null,
+        "verify-host-key": true,
         "connection-idle-timeout-ms": 300000,
     };
 }

@@ -19,14 +19,12 @@ use crate::application::operator_console::ConsoleApprovalError;
 use crate::transport::mcp_streamable_http::output::OutputRenderOptions;
 use crate::transport::mcp_streamable_http::{ExecuteCommandToolArgs, HostBridgeMcpServer};
 use rmcp::ErrorData as McpError;
-use rmcp::model::{CallToolResult, LoggingLevel, LoggingMessageNotificationParam};
-use rmcp::service::{RequestContext, RoleServer};
-use serde_json::{Value, json};
+use rmcp::model::CallToolResult;
+use serde_json::json;
 
 pub(super) async fn execute_command_tool(
     server: &HostBridgeMcpServer,
     args: ExecuteCommandToolArgs,
-    context: RequestContext<RoleServer>,
 ) -> Result<CallToolResult, McpError> {
     let output_options = OutputRenderOptions::new(args.head_lines, args.tail_lines, args.max_chars);
     let input = ExecuteCommandInput {
@@ -43,19 +41,9 @@ pub(super) async fn execute_command_tool(
     };
 
     if let Some(request) = prepared.confirmation_request().cloned() {
-        let _ = notify_mcp_log(
-            &context.peer,
-            LoggingLevel::Info,
-            json!({
-                "type": "approval_pending",
-                "preview": request,
-            }),
-        )
-            .await;
-
         let approved = match server
             .operator_console
-            .request_confirmation(prepared.execution_id(), request.clone())
+            .request_confirmation(prepared.execution_id(), request)
             .await
         {
             Ok(approved) => approved,
@@ -68,16 +56,6 @@ pub(super) async fn execute_command_tool(
                 ));
             }
         };
-
-        let _ = notify_mcp_log(
-            &context.peer,
-            LoggingLevel::Info,
-            json!({
-                "type": "approval_resolved",
-                "approved": approved,
-            }),
-        )
-            .await;
 
         if !approved {
             return Ok(structured_error("command confirmation was rejected"));
@@ -104,17 +82,7 @@ pub(super) async fn execute_command_tool(
             Ok(event) => match event {
                 ExecutionEvent::Status { state, message } => {
                     final_state = state;
-                    last_status_message = message.clone();
-                    let _ = notify_mcp_log(
-                        &context.peer,
-                        LoggingLevel::Info,
-                        json!({
-                            "type": "status",
-                            "state": final_state,
-                            "message": message,
-                        }),
-                    )
-                        .await;
+                    last_status_message = message;
 
                     if matches!(
                         final_state,
@@ -123,17 +91,7 @@ pub(super) async fn execute_command_tool(
                         break;
                     }
                 }
-                ExecutionEvent::Output { text } => {
-                    let _ = notify_mcp_log(
-                        &context.peer,
-                        LoggingLevel::Info,
-                        json!({
-                            "type": "output",
-                            "text": text,
-                        }),
-                    )
-                        .await;
-                }
+                ExecutionEvent::Output { .. } => {}
                 ExecutionEvent::Exit {
                     code,
                     success,
@@ -142,41 +100,10 @@ pub(super) async fn execute_command_tool(
                     exit_code = Some(code);
                     exit_success = Some(success);
                     exit_timed_out = Some(timed_out);
-                    let _ = notify_mcp_log(
-                        &context.peer,
-                        LoggingLevel::Info,
-                        json!({
-                            "type": "exit",
-                            "code": code,
-                            "success": success,
-                            "timedOut": timed_out,
-                        }),
-                    )
-                        .await;
                 }
-                ExecutionEvent::Error { message } => {
-                    let _ = notify_mcp_log(
-                        &context.peer,
-                        LoggingLevel::Error,
-                        json!({
-                            "type": "error",
-                            "message": message,
-                        }),
-                    )
-                        .await;
-                }
+                ExecutionEvent::Error { .. } => {}
             },
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                let _ = notify_mcp_log(
-                    &context.peer,
-                    LoggingLevel::Warning,
-                    json!({
-                        "type": "lagged",
-                        "skipped": skipped,
-                    }),
-                )
-                    .await;
-            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                 break;
             }
@@ -209,22 +136,4 @@ fn structured_error(message: impl Into<String>) -> CallToolResult {
     CallToolResult::structured_error(json!({
         "message": message.into()
     }))
-}
-
-async fn notify_mcp_log(
-    peer: &rmcp::service::Peer<RoleServer>,
-    level: LoggingLevel,
-    data: Value,
-) -> Result<(), ()> {
-    if let Err(error) = peer
-        .notify_logging_message(
-            LoggingMessageNotificationParam::new(level, data).with_logger("host-bridge-mcp"),
-        )
-        .await
-    {
-        tracing::debug!(error = %error, "Failed to send MCP logging message");
-        return Err(());
-    }
-
-    Ok(())
 }

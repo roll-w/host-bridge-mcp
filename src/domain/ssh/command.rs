@@ -43,10 +43,13 @@ pub(super) fn keepalive_interval_for(idle_timeout: Duration) -> Option<Duration>
 
 fn build_posix_remote_command(request: &SshCommandRequest) -> String {
     let env_prefix = build_posix_env_prefix(&request.env);
-    let command = std::iter::once(quote_posix(&request.executable))
-        .chain(request.args.iter().map(|value| quote_posix(value)))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let command = match &request.shell_command {
+        Some(command) => format!("sh -c {}", quote_posix(command)),
+        None => std::iter::once(quote_posix(&request.executable))
+            .chain(request.args.iter().map(|value| quote_posix(value)))
+            .collect::<Vec<_>>()
+            .join(" "),
+    };
     let exec_command = if env_prefix.is_empty() {
         format!("exec {command}")
     } else {
@@ -101,6 +104,23 @@ fn build_windows_script(request: &SshCommandRequest) -> String {
                 quote_powershell(value)
             ));
         }
+    }
+
+    if let Some(command) = &request.shell_command {
+        // Preserve the approved text without PowerShell's native argument rewriting.
+        lines.extend([
+            "$startInfo = New-Object System.Diagnostics.ProcessStartInfo".to_string(),
+            "$startInfo.FileName = $env:ComSpec".to_string(),
+            format!(
+                "$startInfo.Arguments = {}",
+                quote_powershell(&format!("/D /S /C {command}"))
+            ),
+            "$startInfo.UseShellExecute = $false".to_string(),
+            "$process = [System.Diagnostics.Process]::Start($startInfo)".to_string(),
+            "$process.WaitForExit()".to_string(),
+            "exit $process.ExitCode".to_string(),
+        ]);
+        return lines.join("\n");
     }
 
     let command = std::iter::once(quote_powershell(&request.executable))
@@ -169,6 +189,7 @@ mod tests {
 
     fn request() -> SshCommandRequest {
         SshCommandRequest {
+            shell_command: None,
             executable: "cargo".to_string(),
             args: vec!["build".to_string(), "--release".to_string()],
             env: HashMap::from([("RUST_LOG".to_string(), "info debug".to_string())]),

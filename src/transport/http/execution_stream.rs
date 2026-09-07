@@ -87,6 +87,6 @@ fn serialize_event(event: &ExecutionEvent) -> String {
             "type": "error",
             "message": format!("failed to serialize event: {error}")
         })
-            .to_string()
+        .to_string()
     })
 }

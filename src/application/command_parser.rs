@@ -29,124 +29,136 @@ pub struct ParsedCommand {
     pub contains_shell_operator: bool,
 }
 
-pub fn parse_command_line(input: &str) -> Result<ParsedCommand, CommandParseError> {
-    let has_shell_operator = detect_shell_operators(input);
-    let tokens = split_command_line(input)?;
-    let mut iter = tokens.into_iter();
-    let program = iter.next().ok_or(CommandParseError::Empty)?;
-    let args = iter.collect::<Vec<_>>();
-
-    Ok(ParsedCommand {
-        program,
-        args,
-        contains_shell_operator: has_shell_operator,
-    })
-}
-
-fn split_command_line(input: &str) -> Result<Vec<String>, CommandParseError> {
+pub fn parse_command_line(
+    input: &str,
+    platform: crate::domain::platform::runtime::RuntimePlatform,
+) -> Result<ParsedCommand, CommandParseError> {
+    let windows = platform.is_windows();
     let mut tokens = Vec::new();
     let mut current = String::new();
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let mut escaped = false;
+    let mut started = false;
+    let mut single_quote = false;
+    let mut double_quote = false;
+    let mut contains_shell_operator = false;
+    let mut chars = input.chars().peekable();
 
-    for ch in input.chars() {
-        if escaped {
-            current.push(ch);
-            escaped = false;
-            continue;
-        }
-
-        if ch == '\\' && !in_single_quote {
-            escaped = true;
-            continue;
-        }
-
-        if ch == '\'' && !in_double_quote {
-            in_single_quote = !in_single_quote;
-            continue;
-        }
-
-        if ch == '"' && !in_single_quote {
-            in_double_quote = !in_double_quote;
-            continue;
-        }
-
-        if ch.is_whitespace() && !in_single_quote && !in_double_quote {
-            if !current.is_empty() {
-                tokens.push(std::mem::take(&mut current));
+    while let Some(ch) = chars.next() {
+        if ch == '\\' && !single_quote {
+            started = true;
+            if windows {
+                let mut count = 1;
+                while chars.peek() == Some(&'\\') {
+                    chars.next();
+                    count += 1;
+                }
+                if chars.peek() == Some(&'"') {
+                    current.extend(std::iter::repeat_n('\\', count / 2));
+                    chars.next();
+                    if count % 2 == 0 {
+                        double_quote = !double_quote;
+                    } else {
+                        current.push('"');
+                    }
+                } else {
+                    current.extend(std::iter::repeat_n('\\', count));
+                }
+            } else if let Some(&next) = chars.peek() {
+                if !double_quote || matches!(next, '$' | '`' | '"' | '\\' | '\n') {
+                    chars.next();
+                    if next != '\n' {
+                        current.push(next);
+                    }
+                } else {
+                    current.push('\\');
+                }
+            } else {
+                current.push('\\');
             }
             continue;
         }
-
+        if windows && ch == '^' && !double_quote {
+            started = true;
+            current.push(chars.next().unwrap_or('^'));
+            continue;
+        }
+        if !windows && ch == '\'' && !double_quote {
+            single_quote = !single_quote;
+            started = true;
+            continue;
+        }
+        if ch == '"' && !single_quote {
+            double_quote = !double_quote;
+            started = true;
+            continue;
+        }
+        if !single_quote && !double_quote {
+            if matches!(ch, ';' | '|' | '<' | '>' | '&' | '\n' | '\r') {
+                contains_shell_operator = true;
+            }
+            if ch.is_whitespace() {
+                if started {
+                    tokens.push(std::mem::take(&mut current));
+                    started = false;
+                }
+                continue;
+            }
+        }
+        started = true;
         current.push(ch);
     }
 
-    if escaped {
-        current.push('\\');
-    }
-
-    if in_single_quote || in_double_quote {
+    if single_quote || double_quote {
         return Err(CommandParseError::UnclosedQuote);
     }
-
-    if !current.is_empty() {
+    if started {
         tokens.push(current);
     }
-
-    if tokens.is_empty() {
-        return Err(CommandParseError::Empty);
-    }
-
-    Ok(tokens)
-}
-
-fn detect_shell_operators(input: &str) -> bool {
-    let mut chars = input.chars().peekable();
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let mut escaped = false;
-
-    while let Some(ch) = chars.next() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-
-        if ch == '\\' && !in_single_quote {
-            escaped = true;
-            continue;
-        }
-
-        if ch == '\'' && !in_double_quote {
-            in_single_quote = !in_single_quote;
-            continue;
-        }
-
-        if ch == '"' && !in_single_quote {
-            in_double_quote = !in_double_quote;
-            continue;
-        }
-
-        if in_single_quote || in_double_quote {
-            continue;
-        }
-
-        if ch == ';' || ch == '|' || ch == '<' || ch == '>' || ch == '\n' || ch == '\r' {
-            return true;
-        }
-
-        if ch == '&' && matches!(chars.peek(), Some('&')) {
-            return true;
-        }
-    }
-
-    false
+    let mut tokens = tokens.into_iter();
+    let program = tokens
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or(CommandParseError::Empty)?;
+    Ok(ParsedCommand {
+        program,
+        args: tokens.collect(),
+        contains_shell_operator,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::platform::runtime::RuntimePlatform;
+
+    fn parse_command_line(input: &str) -> Result<ParsedCommand, CommandParseError> {
+        super::parse_command_line(input, RuntimePlatform::Linux)
+    }
+
+    #[test]
+    fn windows_paths_and_empty_arguments_are_preserved() {
+        let parsed = super::parse_command_line(
+            r#"tool.exe "C:\Users\Public\file.txt" "" next"#,
+            RuntimePlatform::Windows,
+        )
+        .unwrap();
+        assert_eq!(parsed.args, [r"C:\Users\Public\file.txt", "", "next"]);
+    }
+
+    #[test]
+    fn posix_empty_arguments_and_quoted_backslashes_are_preserved() {
+        let parsed = parse_command_line(r#"tool '' "" "a\b" a\ b"#).unwrap();
+        assert_eq!(parsed.args, ["", "", r"a\b", "a b"]);
+    }
+
+    #[test]
+    fn windows_escaped_quotes_and_trailing_backslashes_are_preserved() {
+        let parsed = super::parse_command_line(
+            r#"tool "C:\Program Files\\" "a\"b""#,
+            RuntimePlatform::Windows,
+        )
+        .unwrap();
+        assert_eq!(parsed.args, ["C:\\Program Files\\", "a\"b"]);
+    }
 
     #[test]
     fn parses_simple_command() {

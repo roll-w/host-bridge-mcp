@@ -16,7 +16,7 @@
 
 use super::*;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
@@ -193,7 +193,7 @@ fn write_temp_config(contents: &str) -> PathBuf {
     path
 }
 
-fn resolved_temp_config(path: &PathBuf) -> ResolvedConfigPath {
+fn resolved_temp_config(path: &Path) -> ResolvedConfigPath {
     ResolvedConfigPath {
         path: path.display().to_string(),
         explicit: true,
@@ -211,6 +211,34 @@ fn default_config_uses_single_server() {
 }
 
 #[test]
+fn ssh_host_key_verification_defaults_to_enabled_and_can_be_disabled() {
+    let config = AppConfig::parse_raw(
+        "test.yaml",
+        "execution:\n  default-server: verified\n  servers:\n    - transport: ssh\n      name: verified\n      host: example.com\n      user: deploy\n      target-platform: linux\n      auth:\n        type: agent\n    - transport: ssh\n      name: unverified\n      host: example.net\n      user: deploy\n      target-platform: linux\n      verify-host-key: false\n      auth:\n        type: agent\n",
+    )
+    .expect("SSH host-key configuration should parse");
+
+    let [verified, unverified] = match config.execution.servers.as_slice() {
+        [verified, unverified] => [verified, unverified],
+        _ => panic!("expected two SSH targets"),
+    };
+    assert!(matches!(
+        verified,
+        ExecutionServerConfig::Ssh {
+            verify_host_key: true,
+            ..
+        }
+    ));
+    assert!(matches!(
+        unverified,
+        ExecutionServerConfig::Ssh {
+            verify_host_key: false,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn reject_default_server_when_missing_from_configured_servers() {
     let config = AppConfig {
         execution: ExecutionConfig {
@@ -223,6 +251,7 @@ fn reject_default_server_when_missing_from_configured_servers() {
                 target_platform: TargetPlatform::Linux,
                 auth: SshAuthConfig::default(),
                 known_hosts_file: None,
+                verify_host_key: true,
                 connection_idle_timeout_ms: 30_000,
             }],
             ..ExecutionConfig::default()
@@ -273,6 +302,7 @@ fn reject_ssh_server_with_auto_target_platform() {
                 target_platform: TargetPlatform::Auto,
                 auth: SshAuthConfig::default(),
                 known_hosts_file: None,
+                verify_host_key: true,
                 connection_idle_timeout_ms: 30_000,
             }],
             ..ExecutionConfig::default()
@@ -300,6 +330,7 @@ fn reject_ssh_server_named_host() {
                 target_platform: TargetPlatform::Linux,
                 auth: SshAuthConfig::default(),
                 known_hosts_file: None,
+                verify_host_key: true,
                 connection_idle_timeout_ms: 30_000,
             }],
             ..ExecutionConfig::default()
@@ -326,6 +357,7 @@ fn reject_missing_auth_ref_for_password_file() {
                     r#ref: None,
                 },
                 known_hosts_file: None,
+                verify_host_key: true,
                 connection_idle_timeout_ms: 30_000,
             }],
             ..ExecutionConfig::default()
@@ -352,6 +384,7 @@ fn reject_auth_ref_for_agent_auth() {
                     r#ref: Some("unexpected".to_string()),
                 },
                 known_hosts_file: None,
+                verify_host_key: true,
                 connection_idle_timeout_ms: 30_000,
             }],
             ..ExecutionConfig::default()
@@ -379,6 +412,7 @@ fn reject_zero_ssh_connection_idle_timeout() {
                 target_platform: TargetPlatform::Linux,
                 auth: SshAuthConfig::default(),
                 known_hosts_file: None,
+                verify_host_key: true,
                 connection_idle_timeout_ms: 0,
             }],
             ..ExecutionConfig::default()
@@ -400,7 +434,7 @@ fn explicit_missing_config_path_fails_to_load() {
         path: "definitely-missing-config.yaml".to_string(),
         explicit: true,
     })
-        .expect_err("missing explicit config should fail");
+    .expect_err("missing explicit config should fail");
 
     assert!(matches!(error, ConfigError::Read { .. }));
 }

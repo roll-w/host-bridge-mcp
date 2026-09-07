@@ -249,10 +249,10 @@ fn apply_visual_patch(raw: &str, patch: &VisualConfigPatch) -> Result<String, Co
     ];
 
     for (path, value) in updates {
-        if let Some(value) = value {
-            if !replace_yaml_scalar(&mut lines, path, &value) {
-                let _ = insert_yaml_scalar(&mut lines, path, &value);
-            }
+        if let Some(value) = value
+            && !replace_yaml_scalar(&mut lines, path, &value)
+        {
+            let _ = insert_yaml_scalar(&mut lines, path, &value);
         }
     }
 
@@ -476,9 +476,9 @@ fn find_yaml_mapping(lines: &[String], wanted: &[&str]) -> Option<(usize, usize,
 
         if stack.len() == wanted.len()
             && stack
-            .iter()
-            .map(|(_, key)| key.as_str())
-            .eq(wanted.iter().copied())
+                .iter()
+                .map(|(_, key)| key.as_str())
+                .eq(wanted.iter().copied())
         {
             return Some((line_index, indent, colon_index));
         }
@@ -591,14 +591,14 @@ fn find_inline_comment(content: &str, start: usize) -> Option<usize> {
             (Some(current), value) if current == value => quote = None,
             (None, '"' | '\'') => quote = Some(character),
             (None, '#')
-            if index == start
-                || content[..index]
-                .chars()
-                .last()
-                .is_some_and(char::is_whitespace) =>
-                {
-                    return Some(index);
-                }
+                if index == start
+                    || content[..index]
+                        .chars()
+                        .last()
+                        .is_some_and(char::is_whitespace) =>
+            {
+                return Some(index);
+            }
             _ => {}
         }
     }
@@ -619,7 +619,7 @@ mod tests {
                 ..VisualConfigPatch::default()
             },
         )
-            .expect("visual patch should serialize");
+        .expect("visual patch should serialize");
 
         assert!(patched.contains("# keep this"));
         assert!(patched.contains("# keep address note"));
@@ -644,7 +644,7 @@ mod tests {
                 ..VisualConfigPatch::default()
             },
         )
-            .expect("visual patch should serialize");
+        .expect("visual patch should serialize");
 
         let config = crate::config::AppConfig::parse_raw("test.yaml", &patched)
             .expect("inserted visual fields should remain valid configuration");
@@ -686,7 +686,7 @@ mod tests {
                 ..VisualConfigPatch::default()
             },
         )
-            .expect("visual collections should serialize");
+        .expect("visual collections should serialize");
 
         let config = crate::config::AppConfig::parse_raw("test.yaml", &patched)
             .expect("visual collections should remain valid configuration");
@@ -716,7 +716,7 @@ mod tests {
                 ..VisualConfigPatch::default()
             },
         )
-            .expect("visual collections should serialize");
+        .expect("visual collections should serialize");
 
         let config = crate::config::AppConfig::parse_raw("test.yaml", &patched)
             .expect("replaced visual collections should remain valid configuration");

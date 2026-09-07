@@ -222,7 +222,7 @@ fn init_logging(operator_console: OperatorConsole, mirror_to_stderr: bool) {
         .with(OperatorConsoleLayer { operator_console })
         .with(mirror_to_stderr.then(|| {
             tracing_fmt::layer()
-                .with_timer(tracing_fmt::time::SystemTime::default())
+                .with_timer(tracing_fmt::time::SystemTime)
                 .with_target(false)
                 .with_writer(io::stderr)
         }))
@@ -293,6 +293,20 @@ impl Visit for EventFieldVisitor {
     }
 }
 
+fn spawn_system_signal_handler(shutdown_controller: ShutdownController) {
+    tokio::spawn(async move {
+        match wait_for_termination_signal().await {
+            Ok(signal_name) => {
+                tracing::warn!(signal = %signal_name, "System signal received. Shutting down server");
+                let _ = shutdown_controller.request_shutdown();
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "Failed to install termination signal handler");
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,18 +337,4 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
         assert!(format_bind_error(&bind_address, &error).contains("already in use"));
     }
-}
-
-fn spawn_system_signal_handler(shutdown_controller: ShutdownController) {
-    tokio::spawn(async move {
-        match wait_for_termination_signal().await {
-            Ok(signal_name) => {
-                tracing::warn!(signal = %signal_name, "System signal received. Shutting down server");
-                let _ = shutdown_controller.request_shutdown();
-            }
-            Err(error) => {
-                tracing::error!(error = %error, "Failed to install termination signal handler");
-            }
-        }
-    });
 }

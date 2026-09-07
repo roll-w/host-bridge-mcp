@@ -542,7 +542,7 @@ mod tests {
             None,
             &runtime_environment,
         )
-            .expect("resolver should use PATHEXT for explicit path");
+        .expect("resolver should use PATHEXT for explicit path");
         assert_eq!(
             resolved.to_string_lossy().to_ascii_lowercase(),
             tool_cmd.to_string_lossy().to_ascii_lowercase()
@@ -687,7 +687,7 @@ mod tests {
             Some(&project),
             &runtime_environment,
         )
-            .expect("resolver should honor working directory for relative paths");
+        .expect("resolver should honor working directory for relative paths");
         assert_eq!(
             resolved.to_string_lossy().to_ascii_lowercase(),
             shim.to_string_lossy().to_ascii_lowercase()

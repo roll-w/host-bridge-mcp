@@ -148,7 +148,7 @@ pub(crate) fn spawn_config_reloader(
             &mut state,
             CONFIG_RELOAD_FALLBACK_POLL_INTERVAL,
         )
-            .await;
+        .await;
     });
 }
 
@@ -538,8 +538,8 @@ fn event_targets_config_path(event: &Event, config_path: &Path, watched_director
         let path = normalize_watch_path_lexically(path);
         path == config_path
             || (path.parent() == Some(watched_directory.as_path())
-            && path.file_name().is_some()
-            && same_file_name(path.file_name(), target_file_name))
+                && path.file_name().is_some()
+                && same_file_name(path.file_name(), target_file_name))
     })
 }
 
@@ -709,7 +709,7 @@ execution:
   default-action: deny
 "#,
         )
-            .expect("updated config should be written");
+        .expect("updated config should be written");
 
         state.reload_if_needed(&resolved_path, &reload_context);
 
@@ -847,7 +847,7 @@ execution:
   default-action: allow
 "#,
         )
-            .expect("initial config should be restored");
+        .expect("initial config should be restored");
 
         state.reload_if_needed(&resolved_path, &reload_context);
         assert_eq!(state.last_failed_fingerprint, None);
@@ -925,6 +925,6 @@ execution:
             .reconfigure_logging(LoggingConfig { retention_days: 0 })
             .expect("logging should reconfigure");
 
-        assert_eq!(console.snapshot().interactive, false);
+        assert!(!console.snapshot().interactive);
     }
 }

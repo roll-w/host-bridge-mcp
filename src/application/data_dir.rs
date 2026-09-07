@@ -27,7 +27,6 @@ const EXECUTION_HISTORY_FILE_NAME: &str = "history.json";
 const LOGS_DIR_NAME: &str = "logs";
 const PASSWORDS_DIR_NAME: &str = "passwords";
 const DEFAULT_LOG_FILE_NAME: &str = "host-bridge.log";
-const TEMP_LOG_FILE_PREFIX: &str = "host-bridge-mcp-";
 const SSH_PASSWORD_FILE_PREFIX: &str = "ssh-password-";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +49,7 @@ impl DataDirectory {
         Ok(Self { root })
     }
 
+    #[cfg(test)]
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }
@@ -68,12 +68,6 @@ impl DataDirectory {
 
     pub(crate) fn runtime_log_path(&self) -> io::Result<PathBuf> {
         Ok(self.subdir(LOGS_DIR_NAME)?.join(DEFAULT_LOG_FILE_NAME))
-    }
-
-    pub(crate) fn temporary_log_path(&self) -> io::Result<PathBuf> {
-        Ok(self
-            .subdir(LOGS_DIR_NAME)?
-            .join(format!("{TEMP_LOG_FILE_PREFIX}{}.log", Uuid::new_v4())))
     }
 
     pub(crate) fn ssh_password_file_path(&self, server_name: &str) -> io::Result<PathBuf> {
@@ -241,24 +235,6 @@ mod tests {
             directory.runtime_log_path().expect("runtime log path"),
             root.join("logs/host-bridge.log")
         );
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn temporary_log_path_uses_logs_subdir_with_unique_name() {
-        let root = unique_temp_path("temporary-log");
-        let directory = DataDirectory { root: root.clone() };
-        let path = directory.temporary_log_path().expect("temporary log path");
-
-        let logs_dir = root.join("logs");
-        assert_eq!(path.parent(), Some(logs_dir.as_path()));
-        let file_name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .expect("temporary log path should have a file name");
-        assert!(file_name.starts_with(TEMP_LOG_FILE_PREFIX));
-        assert!(file_name.ends_with(".log"));
 
         let _ = fs::remove_dir_all(root);
     }

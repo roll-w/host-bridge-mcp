@@ -114,7 +114,7 @@ mod tests {
             crate::config::LoggingConfig::default(),
             data_directory,
         )
-            .expect("test operator console should initialize");
+        .expect("test operator console should initialize");
         let _ = fs::remove_dir_all(root);
         console
     }

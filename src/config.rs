@@ -44,7 +44,7 @@ pub struct ServerConfig {
     pub access: AccessConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct AccessConfig {
     pub api_key_env: Option<String>,
@@ -103,6 +103,8 @@ pub enum ExecutionServerConfig {
         auth: SshAuthConfig,
         #[serde(default)]
         known_hosts_file: Option<String>,
+        #[serde(default = "default_verify_ssh_host_key")]
+        verify_host_key: bool,
         #[serde(default = "default_ssh_connection_idle_timeout_ms")]
         connection_idle_timeout_ms: u64,
     },
@@ -189,7 +191,7 @@ pub enum ConfigError {
     Parse {
         path: String,
         #[source]
-        source: serde_saphyr::Error,
+        source: Box<serde_saphyr::Error>,
     },
     #[error("invalid config: {0}")]
     Validation(String),
@@ -221,12 +223,6 @@ impl Default for ServerConfig {
             bind_address: "127.0.0.1:8810".to_string(),
             access: AccessConfig::default(),
         }
-    }
-}
-
-impl Default for AccessConfig {
-    fn default() -> Self {
-        Self { api_key_env: None }
     }
 }
 
@@ -276,6 +272,10 @@ fn default_ssh_connection_idle_timeout_ms() -> u64 {
     DEFAULT_SSH_CONNECTION_IDLE_TIMEOUT_MS
 }
 
+fn default_verify_ssh_host_key() -> bool {
+    true
+}
+
 impl AppConfig {
     pub fn resolve_config_path(config_path: Option<&str>) -> ResolvedConfigPath {
         let explicit = config_path.is_some() || std::env::var(CONFIG_ENV_KEY).is_ok();
@@ -312,7 +312,7 @@ impl AppConfig {
     pub fn parse_raw(path: &str, raw: &str) -> Result<Self, ConfigError> {
         let config = serde_saphyr::from_str::<Self>(raw).map_err(|source| ConfigError::Parse {
             path: path.to_string(),
-            source,
+            source: Box::new(source),
         })?;
         config.validate()?;
         Ok(config)
@@ -509,12 +509,12 @@ fn validate_non_empty(value: &str, location: &str) -> Result<(), ConfigError> {
 }
 
 fn validate_server_access(access: &AccessConfig, location: &str) -> Result<(), ConfigError> {
-    if let Some(api_key_env) = access.api_key_env.as_deref() {
-        if api_key_env.trim().is_empty() {
-            return Err(ConfigError::Validation(format!(
-                "{location}.api-key-env cannot be empty when provided"
-            )));
-        }
+    if let Some(api_key_env) = access.api_key_env.as_deref()
+        && api_key_env.trim().is_empty()
+    {
+        return Err(ConfigError::Validation(format!(
+            "{location}.api-key-env cannot be empty when provided"
+        )));
     }
 
     Ok(())
@@ -533,24 +533,24 @@ fn validate_args_prefix(args_prefix: &[String], location: &str) -> Result<(), Co
 }
 
 fn validate_working_directory(path: Option<&str>, location: &str) -> Result<(), ConfigError> {
-    if let Some(path) = path {
-        if path.trim().is_empty() {
-            return Err(ConfigError::Validation(format!(
-                "{location} cannot be empty when provided"
-            )));
-        }
+    if let Some(path) = path
+        && path.trim().is_empty()
+    {
+        return Err(ConfigError::Validation(format!(
+            "{location} cannot be empty when provided"
+        )));
     }
 
     Ok(())
 }
 
 fn validate_optional_non_empty(value: Option<&str>, location: &str) -> Result<(), ConfigError> {
-    if let Some(value) = value {
-        if value.trim().is_empty() {
-            return Err(ConfigError::Validation(format!(
-                "{location} cannot be empty when provided"
-            )));
-        }
+    if let Some(value) = value
+        && value.trim().is_empty()
+    {
+        return Err(ConfigError::Validation(format!(
+            "{location} cannot be empty when provided"
+        )));
     }
 
     Ok(())

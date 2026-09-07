@@ -22,9 +22,10 @@ use crate::config::{
 use crate::domain::execution_target::SshAuthTarget;
 
 fn test_config(execution: ExecutionConfig) -> Arc<AppConfig> {
-    let mut config = AppConfig::default();
-    config.execution = execution;
-    Arc::new(config)
+    Arc::new(AppConfig {
+        execution,
+        ..AppConfig::default()
+    })
 }
 
 #[tokio::test]
@@ -200,6 +201,7 @@ async fn prepare_command_builds_ssh_invocation_for_remote_server() {
                 r#ref: Some("SSH_PASSWORD".to_string()),
             },
             known_hosts_file: Some("/home/dev/.ssh/known_hosts".to_string()),
+            verify_host_key: true,
             connection_idle_timeout_ms: 90_000,
         }],
         ..ExecutionConfig::default()

@@ -73,6 +73,7 @@ pub enum ExecutionError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutionServiceInitError {
+    #[cfg(test)]
     #[error("failed to initialize application data directory: {0}")]
     DataDirectory(String),
     #[error("failed to initialize execution history: {0}")]
@@ -196,7 +197,7 @@ enum RunExecutionBackend {
 struct HostRunExecution {
     program: String,
     args: Vec<String>,
-    shell_wrapped: bool,
+    shell_command: Option<String>,
     working_directory: PathBuf,
     env: HashMap<String, String>,
     timeout_ms: u64,
@@ -315,11 +316,11 @@ impl ExecutionRecord {
 
 impl RawOutputStore {
     fn new(path: PathBuf) -> Result<Self, ExecutionError> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)
-                    .map_err(|error| ExecutionError::OutputStore(error.to_string()))?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)
+                .map_err(|error| ExecutionError::OutputStore(error.to_string()))?;
         }
 
         let file = open_private_output_file(&path)
@@ -370,6 +371,7 @@ impl ExecutionService {
         Self::try_new(config).expect("execution service should initialize")
     }
 
+    #[cfg(test)]
     pub fn try_new(config: Arc<AppConfig>) -> Result<Self, ExecutionServiceInitError> {
         let data_directory = DataDirectory::new(config.data_dir.as_deref())
             .map_err(|error| ExecutionServiceInitError::DataDirectory(error.to_string()))?;
@@ -455,8 +457,8 @@ impl ExecutionService {
     ) -> Result<PreparedExecution, ExecutionError> {
         let runtime = self.runtime_snapshot();
         let execution_id = Uuid::new_v4();
-        let parsed = parse_command_line(&input.command)?;
         let target = runtime.resolve_target(input.server.as_deref())?.clone();
+        let parsed = parse_command_line(&input.command, target.target_platform)?;
         let policy = runtime
             .policy_engine
             .evaluate(&target.name, &parsed.program, &parsed.args);
@@ -490,7 +492,9 @@ impl ExecutionService {
                     RunExecutionBackend::Host(HostRunExecution {
                         program: executable.clone(),
                         args: args.clone(),
-                        shell_wrapped: parsed.contains_shell_operator,
+                        shell_command: parsed
+                            .contains_shell_operator
+                            .then(|| input.command.clone()),
                         working_directory: working_directory.clone(),
                         env: input.env.clone(),
                         timeout_ms,
@@ -508,6 +512,9 @@ impl ExecutionService {
                         target: ssh_target.clone(),
                         platform: target.target_platform,
                         request: SshCommandRequest {
+                            shell_command: parsed
+                                .contains_shell_operator
+                                .then(|| input.command.clone()),
                             executable: executable.clone(),
                             args: args.clone(),
                             env: input.env.clone(),

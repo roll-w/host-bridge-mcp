@@ -326,6 +326,10 @@ fn log_line(entry: &ConsoleLogEntry, selected: bool) -> Line<'static> {
     ])
 }
 
+fn short_id(id: uuid::Uuid) -> String {
+    id.to_string().chars().take(8).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,8 +389,4 @@ mod tests {
 
         assert_eq!(created_at_line, "createdAt  : 2026-03-15T10:20:30.123456Z");
     }
-}
-
-fn short_id(id: uuid::Uuid) -> String {
-    id.to_string().chars().take(8).collect()
 }

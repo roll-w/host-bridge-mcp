@@ -47,7 +47,7 @@ pub struct CliOptions {
 
 pub fn parse_args<I, T>(args: I) -> Result<CliOptions, clap::Error>
 where
-    I: IntoIterator<Item=T>,
+    I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
     CliOptions::try_parse_from(args)

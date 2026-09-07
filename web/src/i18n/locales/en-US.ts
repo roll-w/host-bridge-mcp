@@ -248,6 +248,9 @@ export const enUSMessages = {
     passwordFileWritten: "The password file was written locally.",
     passwordFileReady: "Password file updated. Save the configuration to use it.",
     knownHostsFile: "known_hosts path",
+    verifyHostKey: "Verify SSH host key",
+    verifyHostKeyHint:
+        "Enabled by default. Disable only when the SSH server is trusted through another mechanism.",
     connectionIdleTimeout: "Connection idle timeout (ms)",
     policyAllow: "Allow",
     policyConfirm: "Confirm",

@@ -17,6 +17,7 @@
 use crate::application::operator_console::{ConsoleSnapshot, PendingApprovalView};
 use ratatui::layout::Rect;
 
+#[derive(Default)]
 pub(super) struct TuiState {
     pub(super) selected_approval_index: usize,
     pub(super) log_start_index: usize,
@@ -29,24 +30,6 @@ pub(super) struct TuiState {
     pub(super) visible_log_start: usize,
     pub(super) visible_log_count: usize,
     pub(super) active_log_selection: Option<LogSelection>,
-}
-
-impl Default for TuiState {
-    fn default() -> Self {
-        Self {
-            selected_approval_index: 0,
-            log_start_index: 0,
-            log_page_size: 0,
-            log_horizontal_offset: 0,
-            max_log_horizontal_offset: 0,
-            follow_logs: false,
-            last_pending_count: 0,
-            logs_area: None,
-            visible_log_start: 0,
-            visible_log_count: 0,
-            active_log_selection: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

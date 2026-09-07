@@ -26,9 +26,7 @@ use axum::middleware;
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{
     CallToolResult, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
-    SetLevelRequestParams,
 };
-use rmcp::service::{RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
@@ -115,9 +113,8 @@ impl HostBridgeMcpServer {
     async fn execute_command(
         &self,
         Parameters(args): Parameters<ExecuteCommandToolArgs>,
-        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        execute_command_tool(self, args, context).await
+        execute_command_tool(self, args).await
     }
 
     #[tool(
@@ -134,12 +131,7 @@ impl HostBridgeMcpServer {
 #[tool_handler]
 impl ServerHandler for HostBridgeMcpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
-            ServerCapabilities::builder()
-                .enable_tools()
-                .enable_logging()
-                .build(),
-        )
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(server_implementation())
             .with_protocol_version(ProtocolVersion::V_2026_07_28)
             .with_instructions(
@@ -151,162 +143,10 @@ impl ServerHandler for HostBridgeMcpServer {
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
         Cow::Borrowed(MCP_SUPPORTED_PROTOCOL_VERSIONS)
     }
-
-    async fn set_level(
-        &self,
-        request: SetLevelRequestParams,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<(), McpError> {
-        tracing::debug!(level = ?request.level, "Client set MCP logging level");
-        Ok(())
-    }
 }
 
 fn server_implementation() -> Implementation {
     Implementation::new(MCP_SERVER_NAME, MCP_SERVER_VERSION)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::HostBridgeMcpServer;
-    use super::{ExecuteCommandToolArgs, MCP_SUPPORTED_PROTOCOL_VERSIONS, server_implementation};
-    use crate::application::execution_service::ExecutionService;
-    use crate::application::operator_console::OperatorConsole;
-    use crate::config::{
-        AppConfig, ExecutionConfig, ExecutionServerConfig, SshAuthConfig, SshAuthType,
-        TargetPlatform,
-    };
-    use rmcp::ServerHandler;
-    use rmcp::model::ProtocolVersion;
-    use rmcp::schemars;
-    use serde_json::json;
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
-    #[test]
-    fn deserializes_output_limit_arguments() {
-        let args: ExecuteCommandToolArgs = serde_json::from_value(json!({
-            "command": "cargo test",
-            "server": "prod",
-            "workingDirectory": "/workspace/project",
-            "timeoutMs": 120000,
-            "headLines": 12,
-            "tailLines": 8,
-            "maxChars": 0,
-            "env": {
-                "RUST_LOG": "debug"
-            }
-        }))
-            .expect("arguments should deserialize");
-
-        assert_eq!(args.command, "cargo test");
-        assert_eq!(args.server.as_deref(), Some("prod"));
-        assert_eq!(
-            args.working_directory.as_deref(),
-            Some("/workspace/project")
-        );
-        assert_eq!(args.timeout_ms, Some(120000));
-        assert_eq!(args.head_lines, Some(12));
-        assert_eq!(args.tail_lines, Some(8));
-        assert_eq!(args.max_chars, Some(0));
-        assert_eq!(
-            args.env,
-            HashMap::from([(String::from("RUST_LOG"), String::from("debug"))])
-        );
-    }
-
-    #[test]
-    fn schema_contains_agent_visible_field_descriptions() {
-        let schema = schemars::schema_for!(ExecuteCommandToolArgs);
-        let schema_json = serde_json::to_string(&schema).expect("schema should serialize");
-
-        assert!(
-            schema_json.contains(
-                "Shell operators such as &&, ||, ;, |, and redirections require operator approval."
-            )
-        );
-        assert!(schema_json.contains("Use 0 to disable the character cap."));
-        assert!(schema_json.contains("merged command output"));
-    }
-
-    #[test]
-    fn server_implementation_uses_package_metadata() {
-        let implementation = server_implementation();
-
-        assert_eq!(implementation.name, env!("CARGO_PKG_NAME"));
-        assert_eq!(implementation.version, env!("CARGO_PKG_VERSION"));
-    }
-
-    #[test]
-    fn server_info_advertises_latest_and_legacy_mcp_versions() {
-        let server = HostBridgeMcpServer::new(
-            ExecutionService::new(Arc::new(AppConfig::default())),
-            OperatorConsole::default(),
-        );
-
-        assert_eq!(
-            server.get_info().protocol_version,
-            ProtocolVersion::V_2026_07_28
-        );
-        assert_eq!(
-            server.supported_protocol_versions().as_ref(),
-            MCP_SUPPORTED_PROTOCOL_VERSIONS
-        );
-        assert!(!MCP_SUPPORTED_PROTOCOL_VERSIONS.contains(&ProtocolVersion::V_2024_11_05));
-    }
-
-    #[tokio::test]
-    async fn get_execution_environment_reports_named_environments() {
-        let server = HostBridgeMcpServer::new(
-            ExecutionService::new(Arc::new(AppConfig {
-                execution: ExecutionConfig {
-                    default_server: "prod".to_string(),
-                    servers: vec![ExecutionServerConfig::Ssh {
-                        name: "prod".to_string(),
-                        host: "prod.example.com".to_string(),
-                        port: 22,
-                        user: "deploy".to_string(),
-                        target_platform: TargetPlatform::Linux,
-                        auth: SshAuthConfig {
-                            kind: SshAuthType::Agent,
-                            r#ref: None,
-                        },
-                        known_hosts_file: None,
-                        connection_idle_timeout_ms: 30_000,
-                    }],
-                    ..ExecutionConfig::default()
-                },
-                ..AppConfig::default()
-            })),
-            OperatorConsole::default(),
-        );
-
-        let result = server
-            .get_execution_environment()
-            .await
-            .expect("environment query should succeed");
-        let payload = result
-            .structured_content
-            .expect("structured payload should exist");
-
-        assert_eq!(payload.get("defaultEnvironment"), Some(&json!("prod")));
-        let environments = payload
-            .get("environments")
-            .and_then(serde_json::Value::as_array)
-            .expect("environments should be an array");
-        assert_eq!(environments.len(), 2);
-        assert!(environments.iter().any(|environment| {
-            environment.get("name") == Some(&json!("prod"))
-                && environment.get("platform") == Some(&json!("linux"))
-        }));
-        assert!(environments.iter().any(|environment| {
-            environment.get("name") == Some(&json!("host"))
-                && environment
-                .get("platform")
-                .and_then(serde_json::Value::as_str)
-                .is_some()
-        }));
-    }
 }
 
 pub(crate) fn router(
@@ -340,4 +180,151 @@ pub(crate) fn router(
         ));
 
     Router::<crate::transport::http::HttpState>::new().merge(protected_routes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HostBridgeMcpServer;
+    use super::{ExecuteCommandToolArgs, MCP_SUPPORTED_PROTOCOL_VERSIONS, server_implementation};
+    use crate::application::execution_service::ExecutionService;
+    use crate::application::operator_console::OperatorConsole;
+    use crate::config::{
+        AppConfig, ExecutionConfig, ExecutionServerConfig, SshAuthConfig, SshAuthType,
+        TargetPlatform,
+    };
+    use rmcp::ServerHandler;
+    use rmcp::model::ProtocolVersion;
+    use rmcp::schemars;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    #[test]
+    fn deserializes_output_limit_arguments() {
+        let args: ExecuteCommandToolArgs = serde_json::from_value(json!({
+            "command": "cargo test",
+            "server": "prod",
+            "workingDirectory": "/workspace/project",
+            "timeoutMs": 120000,
+            "headLines": 12,
+            "tailLines": 8,
+            "maxChars": 0,
+            "env": {
+                "RUST_LOG": "debug"
+            }
+        }))
+        .expect("arguments should deserialize");
+
+        assert_eq!(args.command, "cargo test");
+        assert_eq!(args.server.as_deref(), Some("prod"));
+        assert_eq!(
+            args.working_directory.as_deref(),
+            Some("/workspace/project")
+        );
+        assert_eq!(args.timeout_ms, Some(120000));
+        assert_eq!(args.head_lines, Some(12));
+        assert_eq!(args.tail_lines, Some(8));
+        assert_eq!(args.max_chars, Some(0));
+        assert_eq!(
+            args.env,
+            HashMap::from([(String::from("RUST_LOG"), String::from("debug"))])
+        );
+    }
+
+    #[test]
+    fn schema_contains_agent_visible_field_descriptions() {
+        let schema = schemars::schema_for!(ExecuteCommandToolArgs);
+        let schema_json = serde_json::to_string(&schema).expect("schema should serialize");
+
+        assert!(schema_json.contains(
+            "Shell operators such as &&, ||, ;, |, and redirections require operator approval."
+        ));
+        assert!(schema_json.contains("Use 0 to disable the character cap."));
+        assert!(schema_json.contains("merged command output"));
+    }
+
+    #[test]
+    fn server_implementation_uses_package_metadata() {
+        let implementation = server_implementation();
+
+        assert_eq!(implementation.name, env!("CARGO_PKG_NAME"));
+        assert_eq!(implementation.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn server_info_advertises_latest_and_legacy_mcp_versions() {
+        let server = HostBridgeMcpServer::new(
+            ExecutionService::new(Arc::new(AppConfig::default())),
+            OperatorConsole::default(),
+        );
+
+        assert_eq!(
+            server.get_info().protocol_version,
+            ProtocolVersion::V_2026_07_28
+        );
+        assert_eq!(
+            server.supported_protocol_versions().as_ref(),
+            MCP_SUPPORTED_PROTOCOL_VERSIONS
+        );
+        assert!(!MCP_SUPPORTED_PROTOCOL_VERSIONS.contains(&ProtocolVersion::V_2024_11_05));
+
+        let capabilities = serde_json::to_value(server.get_info().capabilities)
+            .expect("server capabilities should serialize");
+        assert!(capabilities.get("tools").is_some());
+        assert!(capabilities.get("logging").is_none());
+    }
+
+    #[tokio::test]
+    async fn get_execution_environment_reports_named_environments() {
+        let server = HostBridgeMcpServer::new(
+            ExecutionService::new(Arc::new(AppConfig {
+                execution: ExecutionConfig {
+                    default_server: "prod".to_string(),
+                    servers: vec![ExecutionServerConfig::Ssh {
+                        name: "prod".to_string(),
+                        host: "prod.example.com".to_string(),
+                        port: 22,
+                        user: "deploy".to_string(),
+                        target_platform: TargetPlatform::Linux,
+                        auth: SshAuthConfig {
+                            kind: SshAuthType::Agent,
+                            r#ref: None,
+                        },
+                        known_hosts_file: None,
+                        verify_host_key: true,
+                        connection_idle_timeout_ms: 30_000,
+                    }],
+                    ..ExecutionConfig::default()
+                },
+                ..AppConfig::default()
+            })),
+            OperatorConsole::default(),
+        );
+
+        let result = server
+            .get_execution_environment()
+            .await
+            .expect("environment query should succeed");
+        let payload = result
+            .structured_content
+            .expect("structured payload should exist");
+
+        assert_eq!(payload.get("defaultEnvironment"), Some(&json!("prod")));
+        let environments = payload
+            .get("environments")
+            .and_then(serde_json::Value::as_array)
+            .expect("environments should be an array");
+        assert_eq!(environments.len(), 2);
+        assert!(environments.iter().any(|environment| {
+            environment.get("name") == Some(&json!("prod"))
+                && environment.get("platform") == Some(&json!("linux"))
+        }));
+        assert!(environments.iter().any(|environment| {
+            environment.get("name") == Some(&json!("host"))
+                && environment
+                    .get("platform")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some()
+        }));
+    }
 }

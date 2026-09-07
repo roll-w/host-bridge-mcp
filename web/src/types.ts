@@ -134,6 +134,7 @@ export interface SshServerConfig {
     "target-platform": Exclude<TargetPlatform, "auto">;
     auth: { type: SshAuthType; ref: string | null };
     "known-hosts-file": string | null;
+    "verify-host-key": boolean;
     "connection-idle-timeout-ms": number;
 }
 

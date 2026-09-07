@@ -228,6 +228,8 @@ export const zhCNMessages = {
     passwordFileWritten: "密码文件已写入本机。",
     passwordFileReady: "密码文件已更新，保存配置后即可使用。",
     knownHostsFile: "known_hosts 路径",
+    verifyHostKey: "验证 SSH 主机密钥",
+    verifyHostKeyHint: "默认启用；只有在其他机制已确保 SSH 服务器可信时才关闭。",
     connectionIdleTimeout: "连接空闲超时（毫秒）",
     policyAllow: "允许",
     policyConfirm: "需要确认",

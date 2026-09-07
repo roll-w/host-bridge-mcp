@@ -108,7 +108,7 @@ pub(crate) async fn exchange_session(
             "authenticated": true,
             "apiKeyConfigured": state.auth_controller.is_configured(),
         }))
-            .into_response(),
+        .into_response(),
         WebSessionController::session_cookie(&session),
     ))
 }
@@ -138,7 +138,7 @@ pub(crate) async fn login_session(
             "authenticated": true,
             "apiKeyConfigured": true,
         }))
-            .into_response(),
+        .into_response(),
         WebSessionController::session_cookie(&session),
     ))
 }
@@ -226,7 +226,7 @@ pub(crate) async fn runtime_log_stream(
             api::success_value(json!({
                 "entries": entries,
             }))
-                .to_string(),
+            .to_string(),
         ),
     ));
     let updates =

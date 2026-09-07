@@ -84,10 +84,10 @@ impl SshConnectionManager {
         &self,
         target: SshTarget,
     ) -> Result<SshConnectionLease, SshError> {
-        if let Some(connection) = self.state.take_connection(&target) {
-            if !connection.handle.is_closed() {
-                schedule_disconnect(connection.handle, "connection refresh");
-            }
+        if let Some(connection) = self.state.take_connection(&target)
+            && !connection.handle.is_closed()
+        {
+            schedule_disconnect(connection.handle, "connection refresh");
         }
 
         let handle = create_authenticated_session(target.clone()).await?;
@@ -112,7 +112,7 @@ impl SshConnectionLease {
             target,
             handle: Some(handle),
             reused,
-            discard_on_drop: false,
+            discard_on_drop: true,
         }
     }
 
@@ -120,6 +120,10 @@ impl SshConnectionLease {
         self.handle
             .as_ref()
             .expect("ssh connection lease must hold a handle until drop")
+    }
+
+    pub(super) fn mark_reusable(&mut self) {
+        self.discard_on_drop = false;
     }
 
     pub(super) fn discard(&mut self) {
@@ -255,19 +259,21 @@ fn schedule_disconnect(handle: SshSessionHandle, description: &'static str) {
     }
 
     spawn_background_task(async move {
-        let _ = handle
-            .disconnect(
+        let _ = tokio::time::timeout(
+            Duration::from_secs(1),
+            handle.disconnect(
                 Disconnect::ByApplication,
                 description,
                 SSH_DISCONNECT_LANGUAGE,
-            )
-            .await;
+            ),
+        )
+        .await;
     });
 }
 
 fn spawn_background_task<F>(future: F) -> Option<JoinHandle<()>>
 where
-    F: Future<Output=()> + Send + 'static,
+    F: Future<Output = ()> + Send + 'static,
 {
     if let Ok(runtime_handle) = tokio::runtime::Handle::try_current() {
         return Some(runtime_handle.spawn(future));

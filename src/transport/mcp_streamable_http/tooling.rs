@@ -59,10 +59,8 @@ pub(super) async fn execute_command_tool(
             .await
         {
             Ok(approved) => approved,
-            Err(ConsoleApprovalError::Unavailable) => {
-                return Ok(structured_error(
-                    "command requires confirmation but the TUI is unavailable",
-                ));
+            Err(ConsoleApprovalError::TimedOut) => {
+                return Ok(structured_error("command confirmation timed out"));
             }
             Err(ConsoleApprovalError::Cancelled) => {
                 return Ok(structured_error(

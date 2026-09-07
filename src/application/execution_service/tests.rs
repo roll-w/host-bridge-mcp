@@ -221,6 +221,7 @@ async fn prepare_command_builds_ssh_invocation_for_remote_server() {
         .expect("confirmation should exist");
     assert_eq!(confirmation.server, "prod");
     assert_eq!(confirmation.platform, "linux");
+    assert_eq!(confirmation.timeout_ms, 5_000);
     assert_eq!(
         confirmation.working_directory.as_deref(),
         Some("/workspace/app")

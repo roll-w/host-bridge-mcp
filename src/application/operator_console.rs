@@ -68,6 +68,7 @@ pub enum ApprovalDecision {
 #[serde(rename_all = "camelCase")]
 pub struct ConsoleSnapshot {
     pub interactive: bool,
+    pub approval_available: bool,
     #[serde(skip_serializing)]
     pub total_log_count: usize,
     #[serde(skip_serializing)]
@@ -97,8 +98,8 @@ fn push_runtime_log(state: &mut ConsoleState, entry: ConsoleLogEntry) {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConsoleApprovalError {
-    #[error("interactive TUI is unavailable")]
-    Unavailable,
+    #[error("approval request timed out")]
+    TimedOut,
     #[error("approval request was cancelled")]
     Cancelled,
 }
@@ -114,6 +115,7 @@ pub(crate) struct PreparedLoggingReconfigure {
 
 struct ConsoleState {
     interactive: bool,
+    web_enabled: bool,
     log_store: LogStore,
     runtime_logs: VecDeque<ConsoleLogEntry>,
     runtime_log_sender: broadcast::Sender<ConsoleLogEntry>,
@@ -134,6 +136,7 @@ impl OperatorConsole {
         Ok(Self {
             state: Arc::new(Mutex::new(ConsoleState {
                 interactive: false,
+                web_enabled: false,
                 log_store: LogStore::new(logging, &data_directory)?,
                 runtime_logs: VecDeque::new(),
                 runtime_log_sender,
@@ -147,6 +150,13 @@ impl OperatorConsole {
             .lock()
             .expect("console lock poisoned")
             .interactive = interactive;
+    }
+
+    pub fn set_web_enabled(&self, enabled: bool) {
+        self.state
+            .lock()
+            .expect("console lock poisoned")
+            .web_enabled = enabled;
     }
 
     pub fn push_log(&self, level: ConsoleLogLevel, message: impl Into<String>) {
@@ -189,6 +199,7 @@ impl OperatorConsole {
         let state = self.state.lock().expect("console lock poisoned");
         ConsoleSnapshot {
             interactive: state.interactive,
+            approval_available: state.interactive || state.web_enabled,
             total_log_count: state.log_store.total_log_count(),
             log_file_path: state.log_store.log_path().display().to_string(),
             pending_approvals: state
@@ -261,13 +272,10 @@ impl OperatorConsole {
         request: ConfirmationRequest,
     ) -> Result<bool, ConsoleApprovalError> {
         let request_preview = request.command_line.clone();
+        let approval_timeout = std::time::Duration::from_millis(request.timeout_ms);
         let (sender, receiver) = oneshot::channel();
         let (approval_id, receiver) = {
             let mut state = self.state.lock().expect("console lock poisoned");
-
-            if !state.interactive {
-                return Err(ConsoleApprovalError::Unavailable);
-            }
 
             let approval_id = Uuid::new_v4();
             state.pending_approvals.push(PendingApproval::new(
@@ -287,11 +295,18 @@ impl OperatorConsole {
 
         let mut guard = PendingApprovalGuard::new(self.clone(), approval_id);
 
-        let approved = receiver
-            .await
-            .map_err(|_| ConsoleApprovalError::Cancelled)?;
-        guard.disarm();
-        Ok(approved)
+        match tokio::time::timeout(approval_timeout, receiver).await {
+            Ok(result) => {
+                let approved = result.map_err(|_| ConsoleApprovalError::Cancelled)?;
+                guard.disarm();
+                Ok(approved)
+            }
+            Err(_) => {
+                self.expire_pending_confirmation(approval_id);
+                guard.disarm();
+                Err(ConsoleApprovalError::TimedOut)
+            }
+        }
     }
 
     pub fn resolve_confirmation(&self, approval_id: Uuid, decision: ApprovalDecision) -> bool {
@@ -327,17 +342,34 @@ impl OperatorConsole {
     }
 
     pub fn shutdown(&self, reason: &str) {
-        let pending_approvals = {
-            let mut state = self.state.lock().expect("console lock poisoned");
-            state.interactive = false;
-            state.pending_approvals.drain(..).collect::<Vec<_>>()
-        };
-
-        for mut approval in pending_approvals {
-            approval.cancel();
-        }
+        self.state
+            .lock()
+            .expect("console lock poisoned")
+            .interactive = false;
 
         self.push_log(ConsoleLogLevel::Error, reason.to_string());
+    }
+
+    fn expire_pending_confirmation(&self, approval_id: Uuid) {
+        let expired = {
+            let mut state = self.state.lock().expect("console lock poisoned");
+            let Some(index) = state
+                .pending_approvals
+                .iter()
+                .position(|pending| pending.id == approval_id)
+            else {
+                return;
+            };
+            state.pending_approvals.remove(index)
+        };
+
+        self.push_log(
+            ConsoleLogLevel::Warn,
+            format!(
+                "Approval timed out [{}]: {}",
+                expired.id, expired.request.command_line
+            ),
+        );
     }
 
     fn cancel_pending_confirmation(&self, approval_id: Uuid) {
@@ -395,13 +427,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_confirmation_requires_interactive_console() {
+    async fn request_confirmation_times_out_without_interface() {
         let console = OperatorConsole::new(sample_logging()).expect("console should initialize");
+        let request = ConfirmationRequest {
+            timeout_ms: 20,
+            ..sample_request()
+        };
 
         let result = console
-            .request_confirmation(Uuid::new_v4(), sample_request())
+            .request_confirmation(Uuid::new_v4(), request)
             .await;
-        assert!(matches!(result, Err(ConsoleApprovalError::Unavailable)));
+        assert!(matches!(result, Err(ConsoleApprovalError::TimedOut)));
+        assert!(console.snapshot().pending_approvals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn web_console_can_handle_confirmation_without_tui() {
+        let console = OperatorConsole::new(sample_logging()).expect("console should initialize");
+        console.set_web_enabled(true);
+
+        let waiter_console = console.clone();
+        let wait_task = tokio::spawn(async move {
+            waiter_console
+                .request_confirmation(Uuid::new_v4(), sample_request())
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        let snapshot = console.snapshot();
+        assert!(!snapshot.interactive);
+        assert!(snapshot.approval_available);
+        let approval_id = snapshot.pending_approvals[0].id;
+        assert!(console.resolve_confirmation(approval_id, ApprovalDecision::ApproveOnce));
+
+        let approved = timeout(Duration::from_secs(1), wait_task)
+            .await
+            .expect("wait task should complete before timeout")
+            .expect("wait task should not panic")
+            .expect("approval should be delivered");
+        assert!(approved);
+    }
+
+    #[tokio::test]
+    async fn stopping_tui_keeps_pending_approval_for_web_console() {
+        let console = OperatorConsole::new(sample_logging()).expect("console should initialize");
+        console.set_interactive(true);
+        console.set_web_enabled(true);
+
+        let waiter_console = console.clone();
+        let wait_task = tokio::spawn(async move {
+            waiter_console
+                .request_confirmation(Uuid::new_v4(), sample_request())
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        console.shutdown("TUI stopped.");
+        let snapshot = console.snapshot();
+        assert!(!snapshot.interactive);
+        assert!(snapshot.approval_available);
+        let approval_id = snapshot.pending_approvals[0].id;
+        assert!(console.resolve_confirmation(approval_id, ApprovalDecision::ApproveOnce));
+
+        let approved = timeout(Duration::from_secs(1), wait_task)
+            .await
+            .expect("wait task should complete before timeout")
+            .expect("wait task should not panic")
+            .expect("approval should be delivered");
+        assert!(approved);
     }
 
     #[tokio::test]

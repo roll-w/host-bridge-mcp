@@ -51,7 +51,7 @@ const MCP_SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
 #[serde(rename_all = "camelCase")]
 struct ExecuteCommandToolArgs {
     #[schemars(
-        description = "Exactly one command line to execute. Shell operators such as &&, ||, ;, |, and redirections enter the local TUI approval flow."
+        description = "Exactly one command line to execute. Shell operators such as &&, ||, ;, |, and redirections require operator approval."
     )]
     command: String,
     #[serde(default)]
@@ -71,7 +71,7 @@ struct ExecuteCommandToolArgs {
     env: HashMap<String, String>,
     #[serde(default)]
     #[schemars(
-        description = "Optional execution timeout in milliseconds. If omitted, the server default applies. Values above the server maximum are clamped."
+        description = "Optional timeout in milliseconds for waiting for approval and command execution. If omitted, the server default applies. Values above the server maximum are clamped."
     )]
     timeout_ms: Option<u64>,
     #[serde(default)]
@@ -110,7 +110,7 @@ impl HostBridgeMcpServer {
     }
 
     #[tool(
-        description = "Execute exactly one command line in the selected execution server. Shell operators such as &&, ||, ;, |, and redirections enter the local TUI approval flow. If approval is required, the call stays pending until the TUI operator approves or rejects it."
+        description = "Execute exactly one command line in the selected execution server. Shell operators such as &&, ||, ;, |, and redirections require operator approval. If approval is required, the call stays pending until an operator approves, rejects, or the request timeout expires."
     )]
     async fn execute_command(
         &self,
@@ -222,7 +222,7 @@ mod tests {
 
         assert!(
             schema_json.contains(
-                "Shell operators such as &&, ||, ;, |, and redirections enter the local TUI approval flow."
+                "Shell operators such as &&, ||, ;, |, and redirections require operator approval."
             )
         );
         assert!(schema_json.contains("Use 0 to disable the character cap."));

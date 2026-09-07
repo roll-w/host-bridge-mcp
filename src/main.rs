@@ -108,6 +108,7 @@ async fn main() -> ExitCode {
     };
 
     let shutdown_controller = ShutdownController::default();
+    operator_console.set_web_enabled(config.web);
     let tui_active = tui::start(
         operator_console.clone(),
         shutdown_controller.clone(),
@@ -117,9 +118,11 @@ async fn main() -> ExitCode {
 
     if tui_active {
         tracing::info!("Interactive TUI ready");
+    } else if config.web {
+        tracing::info!("Web console available for approvals");
     } else {
         tracing::warn!(
-            "Interactive TUI unavailable; confirmation-required commands will be rejected"
+            "No approval interface is available; confirmation-required commands will wait until their timeout"
         );
     }
 

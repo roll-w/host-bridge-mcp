@@ -147,9 +147,10 @@ export const enUSMessages = {
     interfaceSection: "Startup",
     interfaceSectionHint: "Choose which local operator interfaces are active when the service starts.",
     tuiEnabled: "Enable TUI",
-    webEnabled: "Open web console on startup",
+    webEnabled: "Enable web approvals and open console on startup",
     restartRequiredHint: "Restart required after changing this setting.",
-    webEnabledHint: "The HTTP API remains available; this controls browser auto-open.",
+    webEnabledHint:
+        "The HTTP API remains available; this controls browser auto-open and web approvals.",
     loggingSection: "Logging",
     executionSection: "Execution",
     approvalDetail: "Approval details",

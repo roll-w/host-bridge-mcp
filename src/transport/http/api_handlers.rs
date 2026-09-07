@@ -176,7 +176,7 @@ pub(crate) async fn get_overview(State(state): State<HttpState>) -> impl IntoRes
 pub(crate) async fn list_approvals(State(state): State<HttpState>) -> impl IntoResponse {
     let snapshot = state.operator_console.snapshot();
     api::success(json!({
-        "interactive": snapshot.interactive,
+        "approvalAvailable": snapshot.approval_available,
         "items": snapshot.pending_approvals,
     }))
 }

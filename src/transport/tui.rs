@@ -122,6 +122,7 @@ mod tests {
     fn snapshot(total_log_count: usize) -> ConsoleSnapshot {
         ConsoleSnapshot {
             interactive: true,
+            approval_available: true,
             total_log_count,
             log_file_path: "test.log".to_string(),
             pending_approvals: Vec::new(),

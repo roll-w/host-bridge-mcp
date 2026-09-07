@@ -54,10 +54,6 @@ impl PendingApproval {
             let _ = sender.send(approved);
         }
     }
-
-    pub(super) fn cancel(&mut self) {
-        self.responder.take();
-    }
 }
 
 impl PendingApprovalGuard {

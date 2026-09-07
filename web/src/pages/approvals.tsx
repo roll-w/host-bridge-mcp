@@ -36,16 +36,16 @@ export function ApprovalsPage({
     onResolved?: (item: PendingApproval, decision: ApprovalDecision) => void;
 }) {
     const [items, setItems] = useState<PendingApproval[]>([]);
-    const [interactive, setInteractive] = useState(false);
+    const [approvalAvailable, setApprovalAvailable] = useState(false);
     const [selected, setSelected] = useState<PendingApproval | null>(null);
     const [error, setError] = useState<string | null>(null);
     const {notify} = useNotifications();
 
     const load = () =>
-        apiRequest<{ items: PendingApproval[]; interactive: boolean }>("/approvals")
+        apiRequest<{ items: PendingApproval[]; approvalAvailable: boolean }>("/approvals")
             .then((data) => {
                 setItems(data.items);
-                setInteractive(data.interactive);
+                setApprovalAvailable(data.approvalAvailable);
                 setSelected((current) =>
                     current && data.items.some((item) => item.id === current.id)
                         ? current
@@ -102,14 +102,14 @@ export function ApprovalsPage({
                         }
                     />
                     <p className="text-sm leading-6 text-muted-foreground">
-                        {interactive ? t("approvalHint") : t("offline")}
+                        {approvalAvailable ? t("approvalHint") : t("offline")}
                     </p>
                 </div>
             ) : (
                 <PageHeading
                     eyebrow={t("operatorWorkspace")}
                     title={t("approvals")}
-                    description={interactive ? t("approvalHint") : t("offline")}
+                    description={approvalAvailable ? t("approvalHint") : t("offline")}
                     action={
                         <Button variant="outline" size="sm" onClick={load}>
                             <RefreshCw className="size-3.5"/>

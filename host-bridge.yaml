@@ -2,7 +2,7 @@
 #
 # This file is safe for a local development start:
 # - the HTTP server binds to loopback
-# - normal commands require approval from the local TUI
+# - normal commands require approval from the local TUI or web console
 # - only the local `host` execution target is enabled
 #
 # Configuration lookup order:
@@ -20,7 +20,7 @@
 # Start the interactive TUI for local approvals.
 tui: true
 
-# Open the web console in the default browser at startup.
+# Enable web approvals and open the web console in the default browser at startup.
 web: true
 
 server:
@@ -47,7 +47,7 @@ history:
 execution:
   # Fallback for commands without a matching command policy.
   # allow   = run a normal command without approval
-  # confirm = wait for approval in the local TUI
+  # confirm = wait for approval in the TUI or web console
   # deny    = reject a normal command
   default-action: confirm
 
@@ -58,10 +58,10 @@ execution:
   # linux, macos.
   target-platform: auto
 
-  # Default timeout for execute_command requests: 30 minutes.
+  # Default timeout for approval waits and execute_command requests: 30 minutes.
   default-timeout-ms: 1800000
 
-  # Maximum request timeout: 2 hours.
+  # Maximum timeout for approval waits and execute_command requests: 2 hours.
   max-timeout-ms: 7200000
 
   # Optional working directory used when a request does not provide one.

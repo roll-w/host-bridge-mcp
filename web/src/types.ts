@@ -39,6 +39,7 @@ export type ApprovalDecision = "approve-once" | "reject";
 
 export interface ConsoleSnapshot {
     interactive: boolean;
+    approvalAvailable: boolean;
     pendingApprovals: PendingApproval[];
 }
 

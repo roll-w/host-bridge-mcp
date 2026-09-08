@@ -100,7 +100,8 @@ The console provides:
 - persisted execution history and command output.
 
 The web console always shows in-page notifications. Use the bell control in the top bar to grant browser permission for
-parallel desktop notifications; new approvals and execution completions are monitored while the console is open.
+parallel desktop notifications. New approvals are delivered over SSE while the console is open; execution history
+refreshes after commands finish without a completion notification.
 
 The JSON API is under `/api/v1/`. Normal responses and errors use the same `{status, data}` envelope.
 

@@ -20,10 +20,10 @@ mod session;
 mod static_assets;
 
 use self::api_handlers::{
-    delete_history, exchange_session, get_config, get_history_entry, get_history_output,
-    get_history_page, get_logs, get_overview, get_session_status, list_approvals, login_session,
-    logout_session, resolve_approval, runtime_log_stream, save_raw_config, save_visual_config,
-    write_ssh_password_file,
+    approval_stream, delete_history, exchange_session, get_config, get_history_entry,
+    get_history_output, get_history_page, get_logs, get_overview, get_session_status,
+    list_approvals, login_session, logout_session, resolve_approval, runtime_log_stream,
+    save_raw_config, save_visual_config, write_ssh_password_file,
 };
 use self::execution_stream::stream_execution;
 use self::session::require_web_session;
@@ -84,6 +84,7 @@ pub(crate) fn router(
         .route("/session/logout", post(logout_session))
         .route("/overview", get(get_overview))
         .route("/approvals", get(list_approvals))
+        .route("/approvals/event", get(approval_stream))
         .route("/approvals/{approval_id}", post(resolve_approval))
         .route("/logs", get(get_logs))
         .route("/logs/stream", get(runtime_log_stream))

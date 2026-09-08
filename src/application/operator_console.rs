@@ -58,6 +58,13 @@ pub struct PendingApprovalView {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum ApprovalEvent {
+    Created { approval: PendingApprovalView },
+    Removed { id: Uuid },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalDecision {
     ApproveOnce,
@@ -119,6 +126,7 @@ struct ConsoleState {
     log_store: LogStore,
     runtime_logs: VecDeque<ConsoleLogEntry>,
     runtime_log_sender: broadcast::Sender<ConsoleLogEntry>,
+    approval_event_sender: broadcast::Sender<ApprovalEvent>,
     pending_approvals: Vec<PendingApproval>,
 }
 
@@ -133,6 +141,7 @@ impl OperatorConsole {
         data_directory: DataDirectory,
     ) -> io::Result<Self> {
         let (runtime_log_sender, _) = broadcast::channel(1_024);
+        let (approval_event_sender, _) = broadcast::channel(1_024);
         Ok(Self {
             state: Arc::new(Mutex::new(ConsoleState {
                 interactive: false,
@@ -140,6 +149,7 @@ impl OperatorConsole {
                 log_store: LogStore::new(logging, &data_directory)?,
                 runtime_logs: VecDeque::new(),
                 runtime_log_sender,
+                approval_event_sender,
                 pending_approvals: Vec::new(),
             })),
         })
@@ -192,6 +202,14 @@ impl OperatorConsole {
             .lock()
             .expect("console lock poisoned")
             .runtime_log_sender
+            .subscribe()
+    }
+
+    pub fn subscribe_approval_events(&self) -> broadcast::Receiver<ApprovalEvent> {
+        self.state
+            .lock()
+            .expect("console lock poisoned")
+            .approval_event_sender
             .subscribe()
     }
 
@@ -274,18 +292,30 @@ impl OperatorConsole {
         let request_preview = request.command_line.clone();
         let approval_timeout = std::time::Duration::from_millis(request.timeout_ms);
         let (sender, receiver) = oneshot::channel();
-        let (approval_id, receiver) = {
+        let (approval_id, receiver, approval_view) = {
             let mut state = self.state.lock().expect("console lock poisoned");
 
             let approval_id = Uuid::new_v4();
-            state.pending_approvals.push(PendingApproval::new(
+            let pending = PendingApproval::new(
                 approval_id,
                 execution_id,
                 request,
                 sender,
-            ));
+            );
+            let approval_view = PendingApprovalView {
+                id: pending.id,
+                execution_id: pending.execution_id,
+                request: pending.request.clone(),
+                created_at: pending.created_at.clone(),
+            };
+            state.pending_approvals.push(pending);
+            let _ = state
+                .approval_event_sender
+                .send(ApprovalEvent::Created {
+                    approval: approval_view.clone(),
+                });
 
-            (approval_id, receiver)
+            (approval_id, receiver, approval_view)
         };
 
         self.push_log(
@@ -320,6 +350,9 @@ impl OperatorConsole {
                 return false;
             };
             let approval = state.pending_approvals.remove(index);
+            let _ = state
+                .approval_event_sender
+                .send(ApprovalEvent::Removed { id: approval.id });
             (approval, decision)
         };
 
@@ -360,7 +393,11 @@ impl OperatorConsole {
             else {
                 return;
             };
-            state.pending_approvals.remove(index)
+            let expired = state.pending_approvals.remove(index);
+            let _ = state
+                .approval_event_sender
+                .send(ApprovalEvent::Removed { id: expired.id });
+            expired
         };
 
         self.push_log(
@@ -382,7 +419,11 @@ impl OperatorConsole {
             else {
                 return;
             };
-            state.pending_approvals.remove(index)
+            let cancelled = state.pending_approvals.remove(index);
+            let _ = state
+                .approval_event_sender
+                .send(ApprovalEvent::Removed { id: cancelled.id });
+            cancelled
         };
 
         self.push_log(
@@ -464,6 +505,41 @@ mod tests {
             .expect("wait task should not panic")
             .expect("approval should be delivered");
         assert!(approved);
+    }
+
+    #[tokio::test]
+    async fn approval_events_track_pending_lifecycle() {
+        let console = OperatorConsole::new(sample_logging()).expect("console should initialize");
+        let mut events = console.subscribe_approval_events();
+        let waiter_console = console.clone();
+        let wait_task = tokio::spawn(async move {
+            waiter_console
+                .request_confirmation(Uuid::new_v4(), sample_request())
+                .await
+        });
+
+        let created = timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("created event should arrive before timeout")
+            .expect("approval event channel should remain open");
+        let approval_id = match created {
+            ApprovalEvent::Created { approval } => approval.id,
+            ApprovalEvent::Removed { .. } => panic!("expected approval creation event"),
+        };
+        assert!(console.resolve_confirmation(approval_id, ApprovalDecision::Reject));
+
+        let removed = timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("removed event should arrive before timeout")
+            .expect("approval event channel should remain open");
+        assert!(matches!(
+            removed,
+            ApprovalEvent::Removed { id } if id == approval_id
+        ));
+        assert!(!wait_task
+            .await
+            .expect("approval task should not panic")
+            .expect("approval request should resolve"));
     }
 
     #[tokio::test]

@@ -18,7 +18,7 @@ use super::HttpState;
 use super::session::WebSessionController;
 use crate::application::config_store::{ConfigStoreError, VisualConfigPatch};
 use crate::application::execution_service::ExecutionError;
-use crate::application::operator_console::{ApprovalDecision, ConsoleLogEntry};
+use crate::application::operator_console::{ApprovalDecision, ApprovalEvent, ConsoleLogEntry};
 use crate::transport::api::{self, ApiError};
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
@@ -181,6 +181,42 @@ pub(crate) async fn list_approvals(State(state): State<HttpState>) -> impl IntoR
     }))
 }
 
+pub(crate) async fn approval_stream(
+    State(state): State<HttpState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let receiver = state.operator_console.subscribe_approval_events();
+    let snapshot = state.operator_console.snapshot();
+    let initial = once(Ok::<Event, Infallible>(
+        Event::default().event("snapshot").data(
+            api::success_value(json!({
+                "approvalAvailable": snapshot.approval_available,
+                "items": snapshot.pending_approvals,
+            }))
+            .to_string(),
+        ),
+    ));
+    let updates = tokio_stream::wrappers::BroadcastStream::new(receiver).filter_map(
+        |result| match result {
+            Ok(event) => Some(Ok::<Event, Infallible>(
+                Event::default()
+                    .event("approval")
+                    .data(serialize_approval_event(&event)),
+            )),
+            Err(BroadcastStreamRecvError::Lagged(skipped)) => Some(Ok::<Event, Infallible>(
+                Event::default()
+                    .event("lagged")
+                    .data(api::success_value(json!({ "skipped": skipped })).to_string()),
+            )),
+        },
+    );
+
+    Ok(Sse::new(initial.chain(updates)).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keep-alive"),
+    ))
+}
+
 pub(crate) async fn resolve_approval(
     State(state): State<HttpState>,
     Path(approval_id): Path<String>,
@@ -248,6 +284,16 @@ pub(crate) async fn runtime_log_stream(
             .interval(Duration::from_secs(15))
             .text("keep-alive"),
     ))
+}
+
+fn serialize_approval_event(event: &ApprovalEvent) -> String {
+    let data = serde_json::to_value(event).unwrap_or_else(|error| {
+        json!({
+            "type": "error",
+            "message": format!("failed to serialize approval event: {error}"),
+        })
+    });
+    api::success_value(data).to_string()
 }
 
 pub(crate) async fn get_config(

@@ -15,78 +15,72 @@
  */
 
 import {useEffect, useRef} from "react";
-import {apiRequest} from "@/api";
+import {apiRequest, parseEvent} from "@/api";
 import {useNotifications} from "@/components/notification";
 import {type MessageKey} from "@/i18n";
 
-type ApprovalList = {
+export const APPROVALS_CHANGED_EVENT = "host-bridge:approvals-changed";
+
+type ApprovalSnapshot = {
     items: Array<{ id: string }>;
 };
 
-type HistoryList = {
-    records: Array<{
-        executionId: string;
-        state: "running" | "completed" | "failed";
-    }>;
-};
+type ApprovalEvent =
+    | { type: "created"; approval: { id: string } }
+    | { type: "removed"; id: string };
 
 export function NotificationMonitor({t}: { t: (key: MessageKey) => string }) {
     const previousApprovalIds = useRef<Set<string> | null>(null);
-    const previousRunningIds = useRef<Set<string> | null>(null);
     const {notify} = useNotifications();
 
     useEffect(() => {
         let active = true;
-
-        const loadNotifications = async () => {
-            const [approvalResult, historyResult] = await Promise.allSettled([
-                apiRequest<ApprovalList>("/approvals"),
-                apiRequest<HistoryList>("/history?offset=0&limit=1000"),
-            ]);
-            if (!active) return;
-
-            if (approvalResult.status === "fulfilled") {
-                const approvalData = approvalResult.value;
-                const nextApprovalIds = new Set(
-                    approvalData.items.map((item) => item.id),
-                );
-                const previous = previousApprovalIds.current;
-                if (previous && [...nextApprovalIds].some((id) => !previous.has(id))) {
-                    notify({message: t("newApprovalNotification")});
-                }
-                previousApprovalIds.current = nextApprovalIds;
+        const source = new EventSource("/api/v1/approvals/event");
+        const publishChange = () => {
+            window.dispatchEvent(new Event(APPROVALS_CHANGED_EVENT));
+        };
+        const updateApprovalIds = (nextApprovalIds: Set<string>) => {
+            const previous = previousApprovalIds.current;
+            if (previous && [...nextApprovalIds].some((id) => !previous.has(id))) {
+                notify({message: t("newApprovalNotification")});
             }
-
-            if (historyResult.status === "fulfilled") {
-                const historyData = historyResult.value;
-                const nextRunningIds = new Set(
-                    historyData.records
-                        .filter((record) => record.state === "running")
-                        .map((record) => record.executionId),
-                );
-                const previousRunning = previousRunningIds.current;
-                const finishedCount = previousRunning
-                    ? [...previousRunning].filter((id) => !nextRunningIds.has(id)).length
-                    : 0;
-                if (finishedCount > 0) {
-                    notify({
-                        message: t(
-                            finishedCount === 1
-                                ? "executionFinishedNotification"
-                                : "executionsFinishedNotification",
-                        ),
-                        tone: "success",
-                    });
-                }
-                previousRunningIds.current = nextRunningIds;
+            previousApprovalIds.current = nextApprovalIds;
+            publishChange();
+        };
+        const resync = async () => {
+            try {
+                const data = await apiRequest<ApprovalSnapshot>("/approvals");
+                if (active) updateApprovalIds(new Set(data.items.map((item) => item.id)));
+            } catch {
+                // The stream will reconnect automatically after a transient failure.
             }
         };
 
-        void loadNotifications();
-        const timer = window.setInterval(loadNotifications, 1_500);
+        source.addEventListener("snapshot", (event) => {
+            const data = parseEvent<ApprovalSnapshot>(event);
+            if (active && data) updateApprovalIds(new Set(data.items.map((item) => item.id)));
+        });
+        source.addEventListener("approval", (event) => {
+            const data = parseEvent<ApprovalEvent>(event);
+            if (!active || !data) return;
+            const nextApprovalIds = new Set(previousApprovalIds.current ?? []);
+            if (data.type === "created") {
+                if (!nextApprovalIds.has(data.approval.id)) {
+                    notify({message: t("newApprovalNotification")});
+                }
+                nextApprovalIds.add(data.approval.id);
+            } else {
+                nextApprovalIds.delete(data.id);
+            }
+            previousApprovalIds.current = nextApprovalIds;
+            publishChange();
+        });
+        source.addEventListener("lagged", () => {
+            if (active) void resync();
+        });
         return () => {
             active = false;
-            window.clearInterval(timer);
+            source.close();
         };
     }, [notify, t]);
 

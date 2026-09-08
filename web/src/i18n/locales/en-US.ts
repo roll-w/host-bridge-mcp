@@ -158,6 +158,8 @@ export const enUSMessages = {
         "Review the source, target, and arguments before deciding.",
     approvalHint:
         "Requests come from MCP calls; the browser is for review and approval only.",
+    approvalKeyboardHint:
+        "Shortcuts: ↑/↓ or J/K select · R/Delete reject · Enter details · Esc close",
     interactiveReady: "Approval channel ready",
     commandReviewed: "Command details shown",
     shellOperatorWarning: "Contains shell operators; review carefully.",
@@ -277,6 +279,4 @@ export const enUSMessages = {
     newApprovalNotification: "A new approval request is waiting.",
     approvalApprovedNotification: "Approval accepted. The command is starting.",
     approvalRejectedNotification: "Approval request rejected.",
-    executionFinishedNotification: "Command execution finished. History refreshed.",
-    executionsFinishedNotification: "Command executions finished. History refreshed.",
 } as const;

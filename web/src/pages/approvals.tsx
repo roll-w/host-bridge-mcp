@@ -14,13 +14,14 @@
  * limitations under the License.
  */
 
-import {useEffect, useState} from "react";
+import {useEffect, useRef, useState} from "react";
 import {RefreshCw, ShieldCheck} from "lucide-react";
 import {apiRequest, jsonBody} from "@/api";
 import {type Locale, type MessageKey} from "@/i18n";
 import type {ApprovalDecision, PendingApproval} from "@/types";
 import {ApprovalRows} from "@/components/approval";
 import {EmptyState, ErrorState, InlineError, PageHeading, SectionHeading,} from "@/components/layout";
+import {APPROVALS_CHANGED_EVENT} from "@/components/notification-monitor";
 import {Button} from "@/components/ui/button";
 import {useNotifications} from "@/components/notification";
 
@@ -38,7 +39,10 @@ export function ApprovalsPage({
     const [items, setItems] = useState<PendingApproval[]>([]);
     const [approvalAvailable, setApprovalAvailable] = useState(false);
     const [selected, setSelected] = useState<PendingApproval | null>(null);
+    const [activeId, setActiveId] = useState<string | null>(null);
     const [error, setError] = useState<string | null>(null);
+    const approvalsRef = useRef<HTMLDivElement | null>(null);
+    const decidingId = useRef<string | null>(null);
     const {notify} = useNotifications();
 
     const load = () =>
@@ -46,6 +50,11 @@ export function ApprovalsPage({
             .then((data) => {
                 setItems(data.items);
                 setApprovalAvailable(data.approvalAvailable);
+                setActiveId((current) =>
+                    current && data.items.some((item) => item.id === current)
+                        ? current
+                        : data.items[0]?.id ?? null,
+                );
                 setSelected((current) =>
                     current && data.items.some((item) => item.id === current.id)
                         ? current
@@ -57,12 +66,19 @@ export function ApprovalsPage({
                 setError(reason instanceof Error ? reason.message : t("loadFailed")),
             );
     useEffect(() => {
-        load();
-        const timer = window.setInterval(load, 2000);
-        return () => window.clearInterval(timer);
+        void load();
+        const handleApprovalsChanged = () => {
+            void load();
+        };
+        window.addEventListener(APPROVALS_CHANGED_EVENT, handleApprovalsChanged);
+        return () =>
+            window.removeEventListener(APPROVALS_CHANGED_EVENT, handleApprovalsChanged);
     }, []);
 
     const decide = async (id: string, decision: ApprovalDecision) => {
+        if (decidingId.current !== null) return;
+        decidingId.current = id;
+        setActiveId(id);
         try {
             await apiRequest(
                 `/approvals/${encodeURIComponent(id)}`,
@@ -83,13 +99,100 @@ export function ApprovalsPage({
             const message = reason instanceof Error ? reason.message : t("loadFailed");
             setError(message);
             notify({message, tone: "error"});
+        } finally {
+            decidingId.current = null;
         }
     };
+
+    useEffect(() => {
+        const handleKeyDown = (event: KeyboardEvent) => {
+            const target = event.target;
+            const isButtonLikeTarget =
+                target instanceof HTMLElement &&
+                target.closest("button, a, [role='button']") !== null;
+            if (
+                target instanceof Node &&
+                approvalsRef.current &&
+                !approvalsRef.current.contains(target) &&
+                isButtonLikeTarget
+            ) {
+                return;
+            }
+            if (
+                target instanceof HTMLElement &&
+                (target.isContentEditable ||
+                    target instanceof HTMLInputElement ||
+                    target instanceof HTMLTextAreaElement ||
+                    target instanceof HTMLSelectElement)
+            ) {
+                return;
+            }
+            if (
+                event.defaultPrevented ||
+                event.isComposing ||
+                event.altKey ||
+                event.ctrlKey ||
+                event.metaKey ||
+                items.length === 0
+            ) {
+                return;
+            }
+
+            const currentIndex = Math.max(
+                0,
+                items.findIndex((item) => item.id === activeId),
+            );
+            const move = (offset: number) => {
+                const nextIndex = Math.min(
+                    items.length - 1,
+                    Math.max(0, currentIndex + offset),
+                );
+                setActiveId(items[nextIndex].id);
+            };
+
+            if (event.key === "ArrowDown" || event.key.toLowerCase() === "j") {
+                event.preventDefault();
+                move(1);
+                return;
+            }
+            if (event.key === "ArrowUp" || event.key.toLowerCase() === "k") {
+                event.preventDefault();
+                move(-1);
+                return;
+            }
+
+            const activeItem = items[currentIndex];
+            if (!activeItem) return;
+
+            if (event.key.toLowerCase() === "r" || event.key === "Delete") {
+                event.preventDefault();
+                void decide(activeItem.id, "reject");
+                return;
+            }
+            if (event.key === "Enter" && !isButtonLikeTarget) {
+                event.preventDefault();
+                setSelected((current) =>
+                    current?.id === activeItem.id ? null : activeItem,
+                );
+                return;
+            }
+            if (event.key === "Escape" && selected !== null) {
+                event.preventDefault();
+                setSelected(null);
+            }
+        };
+
+        window.addEventListener("keydown", handleKeyDown);
+        return () => window.removeEventListener("keydown", handleKeyDown);
+    }, [activeId, decide, items, selected]);
 
     if (error && items.length === 0)
         return <ErrorState message={error} onRetry={load} t={t}/>;
     return (
-        <div className={embedded ? "space-y-5" : "space-y-9"}>
+        <div
+            ref={approvalsRef}
+            className={embedded ? "space-y-5" : "space-y-9"}
+        >
             {embedded ? (
                 <div>
                     <SectionHeading
@@ -104,19 +207,29 @@ export function ApprovalsPage({
                     <p className="text-sm leading-6 text-muted-foreground">
                         {approvalAvailable ? t("approvalHint") : t("offline")}
                     </p>
+                    <p className="mt-2 text-xs text-muted-foreground">
+                        {t("approvalKeyboardHint")}
+                    </p>
                 </div>
             ) : (
-                <PageHeading
-                    eyebrow={t("operatorWorkspace")}
-                    title={t("approvals")}
-                    description={approvalAvailable ? t("approvalHint") : t("offline")}
-                    action={
-                        <Button variant="outline" size="sm" onClick={load}>
-                            <RefreshCw className="size-3.5"/>
-                            {t("refresh")}
-                        </Button>
-                    }
-                />
+                <>
+                    <PageHeading
+                        eyebrow={t("operatorWorkspace")}
+                        title={t("approvals")}
+                        description={
+                            approvalAvailable ? t("approvalHint") : t("offline")
+                        }
+                        action={
+                            <Button variant="outline" size="sm" onClick={load}>
+                                <RefreshCw className="size-3.5"/>
+                                {t("refresh")}
+                            </Button>
+                        }
+                    />
+                    <p className="mt-2 text-xs text-muted-foreground">
+                        {t("approvalKeyboardHint")}
+                    </p>
+                </>
             )}
             {error && <InlineError message={error}/>}
             {items.length === 0 ? (
@@ -130,10 +243,15 @@ export function ApprovalsPage({
                     t={t}
                     locale={locale}
                     onDecision={decide}
+                    activeId={activeId}
+                    onActiveChange={setActiveId}
                     expandedId={selected?.id}
-                    onOpen={(item) =>
-                        setSelected((current) => (current?.id === item.id ? null : item))
-                    }
+                    onOpen={(item) => {
+                        setActiveId(item.id);
+                        setSelected((current) =>
+                            current?.id === item.id ? null : item,
+                        );
+                    }}
                 />
             )}
         </div>

@@ -28,7 +28,9 @@ export function ApprovalRows({
                                  locale,
                                  compact = false,
                                  expandedId,
+                                 activeId,
                                  onDecision,
+                                 onActiveChange,
                                  onOpen,
                              }: {
     items: PendingApproval[];
@@ -36,7 +38,9 @@ export function ApprovalRows({
     locale: Locale;
     compact?: boolean;
     expandedId?: string | null;
+    activeId?: string | null;
     onDecision?: (id: string, decision: ApprovalDecision) => void;
+    onActiveChange?: (id: string) => void;
     onOpen?: (item: PendingApproval) => void;
 }) {
     return (
@@ -49,7 +53,9 @@ export function ApprovalRows({
                     locale={locale}
                     compact={compact}
                     expanded={expandedId === item.id}
+                    active={activeId === item.id}
                     onDecision={onDecision}
+                    onActiveChange={onActiveChange}
                     onOpen={onOpen}
                 />
             ))}
@@ -63,7 +69,9 @@ function ApprovalRow({
                          locale,
                          compact,
                          expanded,
+                         active,
                          onDecision,
+                         onActiveChange,
                          onOpen,
                      }: {
     item: PendingApproval;
@@ -71,11 +79,21 @@ function ApprovalRow({
     locale: Locale;
     compact: boolean;
     expanded: boolean;
+    active: boolean;
     onDecision?: (id: string, decision: ApprovalDecision) => void;
+    onActiveChange?: (id: string) => void;
     onOpen?: (item: PendingApproval) => void;
 }) {
     return (
-        <div className="rounded-md bg-card px-4 py-4 transition-colors hover:bg-muted/60 sm:p-5">
+        <div
+            className={cn(
+                "rounded-md bg-card px-4 py-4 transition-colors hover:bg-muted/60 sm:p-5",
+                active && "ring-2 ring-primary/30 ring-offset-2 ring-offset-background",
+            )}
+            onFocusCapture={() => onActiveChange?.(item.id)}
+            onMouseEnter={() => onActiveChange?.(item.id)}
+            aria-current={active ? "true" : undefined}
+        >
             <div className="flex items-start gap-3">
         <span className="mt-0.5 grid size-8 shrink-0 place-items-center rounded-md bg-amber-500/10 text-amber-700">
           <ShieldAlert className="size-4"/>

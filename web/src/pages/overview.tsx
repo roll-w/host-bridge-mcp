@@ -204,7 +204,7 @@ export function OverviewPage({
                                     tone={
                                         record.state === "completed"
                                             ? "good"
-                                            : record.state === "failed"
+                                            : record.state === "failed" || record.state === "rejected"
                                                 ? "bad"
                                                 : "warn"
                                     }

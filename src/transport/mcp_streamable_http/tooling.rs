@@ -58,6 +58,13 @@ pub(super) async fn execute_command_tool(
         };
 
         if !approved {
+            if let Err(error) = server.execution_service.record_rejected(&prepared) {
+                tracing::error!(
+                    execution_id = %prepared.execution_id(),
+                    error = %error,
+                    "Failed to persist rejected execution history"
+                );
+            }
             return Ok(structured_error("command confirmation was rejected"));
         }
     }

@@ -126,6 +126,7 @@ pub enum ExecutionState {
     Running,
     Completed,
     Failed,
+    Rejected,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -551,6 +552,16 @@ impl ExecutionService {
         })
     }
 
+    pub fn record_rejected(&self, prepared: &PreparedExecution) -> Result<(), ExecutionError> {
+        self.history
+            .record_rejected(
+                prepared.execution_id,
+                prepared.run.command_line.clone(),
+                prepared.run.server_name.clone(),
+            )
+            .map_err(|error| ExecutionError::HistoryStore(error.to_string()))
+    }
+
     pub async fn launch_prepared_command(
         &self,
         prepared: PreparedExecution,
@@ -621,6 +632,15 @@ impl ExecutionService {
         match record {
             Some(record) => record.read_output(),
             None => {
+                if matches!(
+                    self.history
+                        .get(execution_id)
+                        .map_err(|error| ExecutionError::HistoryStore(error.to_string()))?,
+                    Some(entry) if entry.state == ExecutionState::Rejected
+                ) {
+                    return Ok(String::new());
+                }
+
                 let path = self
                     .data_directory
                     .execution_output_path(execution_id)

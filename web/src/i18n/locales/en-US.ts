@@ -136,6 +136,7 @@ export const enUSMessages = {
     stateRunning: "Running",
     stateCompleted: "Completed",
     stateFailed: "Failed",
+    stateRejected: "Rejected",
     stateUnknown: "Unknown",
     language: "Language",
     langZh: "中文",
@@ -190,7 +191,7 @@ export const enUSMessages = {
     executionSectionHint:
         "Default policy, platform, working directory, and timeouts.",
     historySectionHint:
-        "Automatic retention for completed executions and command output.",
+        "Automatic retention for completed or rejected executions and command output.",
     commandPoliciesHint:
         "Edit each command policy and more specific argument-prefix rules.",
     wildcardHint:

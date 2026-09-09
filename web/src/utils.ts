@@ -37,6 +37,7 @@ export function stateLabel(
         running: "stateRunning",
         completed: "stateCompleted",
         failed: "stateFailed",
+        rejected: "stateRejected",
     };
     return t(labels[state] ?? "stateUnknown");
 }

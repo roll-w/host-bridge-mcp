@@ -128,6 +128,37 @@ impl ExecutionHistoryStore {
         Ok(())
     }
 
+    pub fn record_rejected(
+        &self,
+        execution_id: Uuid,
+        command_line: String,
+        server: String,
+    ) -> Result<(), ExecutionHistoryError> {
+        let mut state = self.state.lock().expect("execution history lock poisoned");
+        state
+            .entries
+            .retain(|entry| entry.execution_id != execution_id);
+        let rejected_at = unix_timestamp_ms();
+        state.entries.push(ExecutionHistoryEntry {
+            execution_id,
+            command_line,
+            server,
+            state: ExecutionState::Rejected,
+            started_at: rejected_at,
+            finished_at: Some(rejected_at),
+            exit_code: None,
+            success: Some(false),
+            timed_out: None,
+        });
+
+        let config = state.config.clone();
+        let removed = prune_entries(&mut state.entries, &config);
+        write_entries(&self.path, &state.entries)?;
+        drop(state);
+        remove_output_files(&self.data_directory, &removed);
+        Ok(())
+    }
+
     pub fn record_finished(
         &self,
         execution_id: Uuid,
@@ -323,6 +354,7 @@ fn unix_timestamp_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn history_config() -> HistoryConfig {
         HistoryConfig {
@@ -391,5 +423,39 @@ mod tests {
         assert!(entries.iter().any(|entry| entry.execution_id == id_two));
         assert!(entries.iter().any(|entry| entry.execution_id == id_three));
         assert!(entries.iter().any(|entry| entry.execution_id == id_four));
+    }
+
+    #[test]
+    fn record_rejected_persists_a_terminal_entry() {
+        let root = std::env::temp_dir().join(format!(
+            "host-bridge-mcp-history-rejected-{}",
+            Uuid::new_v4()
+        ));
+        let data_directory = DataDirectory::from_root(root.clone()).expect("data directory");
+        let store = ExecutionHistoryStore::new(history_config(), data_directory)
+            .expect("history store");
+        let execution_id = Uuid::new_v4();
+
+        store
+            .record_rejected(
+                execution_id,
+                "rm -rf build".to_string(),
+                "host".to_string(),
+            )
+            .expect("rejected command should be persisted");
+
+        let page = store.list(0, 10).expect("history should be readable");
+        let entry = page
+            .records
+            .first()
+            .expect("rejected entry should be listed");
+        assert_eq!(entry.execution_id, execution_id);
+        assert_eq!(entry.state, ExecutionState::Rejected);
+        assert!(entry.finished_at.is_some());
+        assert_eq!(entry.success, Some(false));
+        assert_eq!(entry.exit_code, None);
+
+        drop(store);
+        let _ = fs::remove_dir_all(root);
     }
 }

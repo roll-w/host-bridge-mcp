@@ -151,8 +151,8 @@ directory. Changing `data-dir` through the configuration editor takes effect aft
 
 | Key                      | Default | Description                                                                              |
 |--------------------------|---------|------------------------------------------------------------------------------------------|
-| `history.retention-days` | `30`    | Remove completed execution records older than this many days; must be greater than zero. |
-| `history.max-records`    | `1000`  | Maximum number of completed records kept; running records are retained separately.       |
+| `history.retention-days` | `30`    | Remove terminal execution records older than this many days; must be greater than zero.  |
+| `history.max-records`    | `1000`  | Maximum number of terminal records kept; running records are retained separately.         |
 
 ### `execution`
 
@@ -272,6 +272,7 @@ deprecated MCP Logging capability or send `notifications/message`; live output r
 
 The MCP `timeoutMs` argument overrides the configured default for that request; if omitted,
 `execution.default-timeout-ms` is used. A request that is not approved before the timeout is rejected.
+Explicitly rejected approval requests are retained in execution history with a `rejected` status and no output.
 
 ### `get_execution_environment`
 

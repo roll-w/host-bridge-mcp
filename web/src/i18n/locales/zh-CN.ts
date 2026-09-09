@@ -131,6 +131,7 @@ export const zhCNMessages = {
     stateRunning: "运行中",
     stateCompleted: "已完成",
     stateFailed: "失败",
+    stateRejected: "已拒绝",
     stateUnknown: "未知",
     language: "语言",
     langZh: "中文",
@@ -179,7 +180,7 @@ export const zhCNMessages = {
     apiKeyEnvHint: "留空表示不启用 API Key 登录。",
     loggingSectionHint: "运行日志按日期轮转并自动清理旧文件。",
     executionSectionHint: "默认执行策略、平台、工作目录和超时。",
-    historySectionHint: "已完成执行记录和命令输出的自动保留策略。",
+    historySectionHint: "已完成或已拒绝执行记录和命令输出的自动保留策略。",
     commandPoliciesHint: "编辑每条命令的策略和更具体的参数前缀规则。",
     wildcardHint:
         "命令名支持 * 通配符，可匹配任意字符；精确命令优先于通配符。参数前缀不支持通配符。",

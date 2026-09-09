@@ -182,7 +182,7 @@ export function HistoryPage({
                                                     tone={
                                                         record.state === "completed"
                                                             ? "good"
-                                                            : record.state === "failed"
+                                                            : record.state === "failed" || record.state === "rejected"
                                                                 ? "bad"
                                                                 : "warn"
                                                     }

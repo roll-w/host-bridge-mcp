@@ -66,7 +66,7 @@ export interface HistoryRecord {
     executionId: string;
     commandLine: string;
     server: string;
-    state: "running" | "completed" | "failed";
+    state: "running" | "completed" | "failed" | "rejected";
     startedAt: number;
     finishedAt: number | null;
     exitCode: number | null;

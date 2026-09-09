@@ -34,6 +34,7 @@ export function WorkspacePage({
     const [historyRefreshToken, setHistoryRefreshToken] = useState(0);
     const protectedExecutionIds = useRef(new Map<string, number>());
     const trackedRunningIds = useRef(new Set<string>());
+    const historyFingerprint = useRef<string | null>(null);
 
     useEffect(() => {
         let active = true;
@@ -46,6 +47,15 @@ export function WorkspacePage({
                 if (!active) return;
 
                 const now = Date.now();
+                const nextHistoryFingerprint = `${page.total}:${page.records[0]?.executionId ?? ""}`;
+                if (
+                    historyFingerprint.current !== null &&
+                    historyFingerprint.current !== nextHistoryFingerprint
+                ) {
+                    setHistoryRefreshToken((value) => value + 1);
+                }
+                historyFingerprint.current = nextHistoryFingerprint;
+
                 const runningIds = page.records
                     .filter((record) => record.state === "running")
                     .map((record) => record.executionId);
@@ -102,13 +112,14 @@ export function WorkspacePage({
         item: PendingApproval,
         decision: ApprovalDecision,
     ) => {
-        if (decision === "reject") return;
-        protectedExecutionIds.current.set(item.executionId, Date.now() + 5_000);
-        setRunningExecutionIds((current) =>
-            current.includes(item.executionId)
-                ? current
-                : [...current, item.executionId],
-        );
+        if (decision !== "reject") {
+            protectedExecutionIds.current.set(item.executionId, Date.now() + 5_000);
+            setRunningExecutionIds((current) =>
+                current.includes(item.executionId)
+                    ? current
+                    : [...current, item.executionId],
+            );
+        }
         setHistoryRefreshToken((value) => value + 1);
     };
 

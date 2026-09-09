@@ -19,11 +19,10 @@ import {RefreshCw, ShieldCheck} from "lucide-react";
 import {apiRequest, jsonBody} from "@/api";
 import {type Locale, type MessageKey} from "@/i18n";
 import type {ApprovalDecision, PendingApproval} from "@/types";
-import {ApprovalRows} from "@/components/approval";
+import {ApprovalRows, ApprovalShortcutLegend} from "@/components/approval";
 import {EmptyState, ErrorState, InlineError, PageHeading, SectionHeading,} from "@/components/layout";
 import {APPROVALS_CHANGED_EVENT} from "@/components/notification-monitor";
 import {Button} from "@/components/ui/button";
-import {useNotifications} from "@/components/notification";
 
 export function ApprovalsPage({
                                   t,
@@ -43,7 +42,6 @@ export function ApprovalsPage({
     const [error, setError] = useState<string | null>(null);
     const approvalsRef = useRef<HTMLDivElement | null>(null);
     const decidingId = useRef<string | null>(null);
-    const {notify} = useNotifications();
 
     const load = () =>
         apiRequest<{ items: PendingApproval[]; approvalAvailable: boolean }>("/approvals")
@@ -78,7 +76,10 @@ export function ApprovalsPage({
     const decide = async (id: string, decision: ApprovalDecision) => {
         if (decidingId.current !== null) return;
         decidingId.current = id;
-        setActiveId(id);
+        const itemIndex = items.findIndex((item) => item.id === id);
+        const nextItem =
+            items[itemIndex + 1] ?? items[itemIndex - 1] ?? items[itemIndex];
+        setActiveId(nextItem?.id ?? id);
         try {
             await apiRequest(
                 `/approvals/${encodeURIComponent(id)}`,
@@ -86,19 +87,12 @@ export function ApprovalsPage({
             );
             const item = items.find((value) => value.id === id);
             if (item) onResolved?.(item, decision);
-            notify({
-                message:
-                    decision === "reject"
-                        ? t("approvalRejectedNotification")
-                        : t("approvalApprovedNotification"),
-                tone: decision === "reject" ? "info" : "success",
-            });
             setSelected(null);
             await load();
         } catch (reason) {
+            setActiveId(id);
             const message = reason instanceof Error ? reason.message : t("loadFailed");
             setError(message);
-            notify({message, tone: "error"});
         } finally {
             decidingId.current = null;
         }
@@ -164,6 +158,11 @@ export function ApprovalsPage({
             const activeItem = items[currentIndex];
             if (!activeItem) return;
 
+            if (event.key.toLowerCase() === "a") {
+                event.preventDefault();
+                void decide(activeItem.id, "approve-once");
+                return;
+            }
             if (event.key.toLowerCase() === "r" || event.key === "Delete") {
                 event.preventDefault();
                 void decide(activeItem.id, "reject");
@@ -207,9 +206,9 @@ export function ApprovalsPage({
                     <p className="text-sm leading-6 text-muted-foreground">
                         {approvalAvailable ? t("approvalHint") : t("offline")}
                     </p>
-                    <p className="mt-2 text-xs text-muted-foreground">
-                        {t("approvalKeyboardHint")}
-                    </p>
+                    <div className="mt-3 rounded-md border border-border/60 bg-muted/30 px-3 py-2">
+                        <ApprovalShortcutLegend t={t}/>
+                    </div>
                 </div>
             ) : (
                 <>
@@ -226,9 +225,9 @@ export function ApprovalsPage({
                             </Button>
                         }
                     />
-                    <p className="mt-2 text-xs text-muted-foreground">
-                        {t("approvalKeyboardHint")}
-                    </p>
+                    <div className="mt-3 rounded-md border border-border/60 bg-muted/30 px-3 py-2">
+                        <ApprovalShortcutLegend t={t}/>
+                    </div>
                 </>
             )}
             {error && <InlineError message={error}/>}

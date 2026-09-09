@@ -292,7 +292,7 @@ impl OperatorConsole {
         let request_preview = request.command_line.clone();
         let approval_timeout = std::time::Duration::from_millis(request.timeout_ms);
         let (sender, receiver) = oneshot::channel();
-        let (approval_id, receiver, approval_view) = {
+        let (approval_id, receiver, _approval_view) = {
             let mut state = self.state.lock().expect("console lock poisoned");
 
             let approval_id = Uuid::new_v4();

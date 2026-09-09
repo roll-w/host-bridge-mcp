@@ -150,8 +150,7 @@ export const zhCNMessages = {
     approvalDetail: "申请详情",
     approvalDetailHint: "确认来源、目标和参数后再作出决定。",
     approvalHint: "这里的申请来自 MCP 请求；浏览器只负责查看和审批。",
-    approvalKeyboardHint:
-        "快捷键：↑/↓ 或 J/K 选择 · R/Delete 拒绝 · Enter 展开 · Esc 收起",
+    approvalShortcutSelect: "选择",
     interactiveReady: "审批通道已就绪",
     commandReviewed: "命令信息已展示",
     shellOperatorWarning: "包含 Shell 操作符，请仔细确认。",
@@ -255,6 +254,4 @@ export const zhCNMessages = {
     streamReconnecting: "重连中",
     noRunningExecution: "批准命令后，执行过程会显示在这里。",
     newApprovalNotification: "有新的待审批申请。",
-    approvalApprovedNotification: "申请已批准，命令正在启动。",
-    approvalRejectedNotification: "申请已拒绝。",
 } as const;

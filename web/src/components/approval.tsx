@@ -20,7 +20,44 @@ import {formatTime} from "@/utils";
 import type {ApprovalDecision, PendingApproval} from "@/types";
 import {Detail, Expandable} from "@/components/layout";
 import {Button} from "@/components/ui/button";
+import {Kbd} from "@/components/ui/kbd";
 import {cn} from "@/lib/utils";
+
+export function ApprovalShortcutLegend({t}: { t: (key: MessageKey) => string }) {
+    return (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2 text-xs text-muted-foreground">
+            <span className="inline-flex items-center gap-1.5">
+                <span className="inline-flex gap-1">
+                    <Kbd>↑</Kbd>
+                    <Kbd>↓</Kbd>
+                    <Kbd>J</Kbd>
+                    <Kbd>K</Kbd>
+                </span>
+                <span>{t("approvalShortcutSelect")}</span>
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+                <Kbd>A</Kbd>
+                <span>{t("approveOnce")}</span>
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+                <span className="inline-flex items-center gap-1">
+                    <Kbd>R</Kbd>
+                    <span>/</span>
+                    <Kbd>Delete</Kbd>
+                </span>
+                <span>{t("reject")}</span>
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+                <Kbd>Enter</Kbd>
+                <span>{t("openDetails")}</span>
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+                <Kbd>Esc</Kbd>
+                <span>{t("close")}</span>
+            </span>
+        </div>
+    );
+}
 
 export function ApprovalRows({
                                  items,
@@ -88,7 +125,7 @@ function ApprovalRow({
         <div
             className={cn(
                 "rounded-md bg-card px-4 py-4 transition-colors hover:bg-muted/60 sm:p-5",
-                active && "ring-2 ring-primary/30 ring-offset-2 ring-offset-background",
+                active && "ring-1 ring-primary/30 ring-offset-2 ring-offset-background",
             )}
             onFocusCapture={() => onActiveChange?.(item.id)}
             onMouseEnter={() => onActiveChange?.(item.id)}
@@ -102,7 +139,7 @@ function ApprovalRow({
                     <Button
                         variant="ghost"
                         size="sm"
-                        className="group h-auto w-full flex-col items-start justify-start gap-0 p-0 text-left hover:bg-transparent"
+                        className="group h-auto w-full flex-col items-start justify-start gap-0 p-0 text-left hover:bg-transparent aria-expanded:!bg-transparent"
                         onClick={() => onOpen?.(item)}
                         aria-expanded={onOpen ? expanded : undefined}
                     >
@@ -229,7 +266,7 @@ export function ApprovalDetail({
                 </Button>
             </div>
             <div className="mt-5 space-y-7">
-                <div className="rounded-md bg-muted/60 px-4 py-4 text-foreground">
+                <div className="rounded-md px-4 py-4 text-foreground">
                     <div
                         className="mb-2 flex items-center gap-2 text-[11px] uppercase tracking-[0.16em] text-muted-foreground">
                         <Terminal className="size-3"/>

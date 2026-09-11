@@ -15,7 +15,9 @@
  */
 
 use crate::config::{
-    AppConfig, CommandPolicyConfig, ConfigError, ExecutionServerConfig, ResolvedConfigPath,
+    AccessConfig, AppConfig, CommandPolicyConfig, CommandRuleConfig, ConfigError, ExecutionConfig,
+    ExecutionServerConfig, HistoryConfig, LoggingConfig, PolicyAction, ResolvedConfigPath,
+    ServerConfig, SshAuthConfig, SshAuthType, TargetPlatform,
 };
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
@@ -61,6 +63,235 @@ pub struct VisualConfigPatch {
     pub servers: Option<Vec<ExecutionServerConfig>>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct YamlAppConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_dir: Option<String>,
+    tui: bool,
+    web: bool,
+    server: YamlServerConfig,
+    execution: YamlExecutionConfig,
+    logging: LoggingConfig,
+    history: HistoryConfig,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct YamlServerConfig {
+    #[serde(rename = "address")]
+    bind_address: String,
+    #[serde(skip_serializing_if = "YamlAccessConfig::is_empty")]
+    access: YamlAccessConfig,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct YamlAccessConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_key_env: Option<String>,
+}
+
+impl YamlAccessConfig {
+    fn is_empty(&self) -> bool {
+        self.api_key_env.is_none()
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct YamlExecutionConfig {
+    default_action: PolicyAction,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    commands: Vec<YamlCommandPolicyConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_working_directory: Option<String>,
+    default_server: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    servers: Vec<YamlExecutionServerConfig>,
+    target_platform: TargetPlatform,
+    default_timeout_ms: u64,
+    max_timeout_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "transport", rename_all_fields = "kebab-case")]
+enum YamlExecutionServerConfig {
+    #[serde(rename = "host")]
+    Host {
+        name: String,
+        target_platform: TargetPlatform,
+    },
+    #[serde(rename = "ssh")]
+    Ssh {
+        name: String,
+        host: String,
+        port: u16,
+        user: String,
+        target_platform: TargetPlatform,
+        auth: YamlSshAuthConfig,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        known_hosts_file: Option<String>,
+        verify_host_key: bool,
+        connection_idle_timeout_ms: u64,
+    },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct YamlSshAuthConfig {
+    #[serde(rename = "type")]
+    kind: SshAuthType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    r#ref: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct YamlCommandPolicyConfig {
+    command: String,
+    action: PolicyAction,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    targets: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_working_directory: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    rules: Vec<YamlCommandRuleConfig>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct YamlCommandRuleConfig {
+    args_prefix: Vec<String>,
+    action: PolicyAction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_working_directory: Option<String>,
+}
+
+impl From<&AppConfig> for YamlAppConfig {
+    fn from(config: &AppConfig) -> Self {
+        Self {
+            data_dir: config.data_dir.clone(),
+            tui: config.tui,
+            web: config.web,
+            server: YamlServerConfig::from(&config.server),
+            execution: YamlExecutionConfig::from(&config.execution),
+            logging: config.logging.clone(),
+            history: config.history.clone(),
+        }
+    }
+}
+
+impl From<&ServerConfig> for YamlServerConfig {
+    fn from(server: &ServerConfig) -> Self {
+        Self {
+            bind_address: server.bind_address.clone(),
+            access: YamlAccessConfig::from(&server.access),
+        }
+    }
+}
+
+impl From<&AccessConfig> for YamlAccessConfig {
+    fn from(access: &AccessConfig) -> Self {
+        Self {
+            api_key_env: access.api_key_env.clone(),
+        }
+    }
+}
+
+impl From<&ExecutionConfig> for YamlExecutionConfig {
+    fn from(execution: &ExecutionConfig) -> Self {
+        Self {
+            default_action: execution.default_action,
+            commands: execution
+                .commands
+                .iter()
+                .map(YamlCommandPolicyConfig::from)
+                .collect(),
+            default_working_directory: execution.default_working_directory.clone(),
+            default_server: execution.default_server.clone(),
+            servers: execution
+                .servers
+                .iter()
+                .map(YamlExecutionServerConfig::from)
+                .collect(),
+            target_platform: execution.target_platform,
+            default_timeout_ms: execution.default_timeout_ms,
+            max_timeout_ms: execution.max_timeout_ms,
+        }
+    }
+}
+
+impl From<&ExecutionServerConfig> for YamlExecutionServerConfig {
+    fn from(server: &ExecutionServerConfig) -> Self {
+        match server {
+            ExecutionServerConfig::Host {
+                name,
+                target_platform,
+            } => Self::Host {
+                name: name.clone(),
+                target_platform: *target_platform,
+            },
+            ExecutionServerConfig::Ssh {
+                name,
+                host,
+                port,
+                user,
+                target_platform,
+                auth,
+                known_hosts_file,
+                verify_host_key,
+                connection_idle_timeout_ms,
+            } => Self::Ssh {
+                name: name.clone(),
+                host: host.clone(),
+                port: *port,
+                user: user.clone(),
+                target_platform: *target_platform,
+                auth: YamlSshAuthConfig::from(auth),
+                known_hosts_file: known_hosts_file.clone(),
+                verify_host_key: *verify_host_key,
+                connection_idle_timeout_ms: *connection_idle_timeout_ms,
+            },
+        }
+    }
+}
+
+impl From<&SshAuthConfig> for YamlSshAuthConfig {
+    fn from(auth: &SshAuthConfig) -> Self {
+        Self {
+            kind: auth.kind,
+            r#ref: auth.r#ref.clone(),
+        }
+    }
+}
+
+impl From<&CommandPolicyConfig> for YamlCommandPolicyConfig {
+    fn from(command: &CommandPolicyConfig) -> Self {
+        Self {
+            command: command.command.clone(),
+            action: command.action,
+            targets: command.targets.clone(),
+            default_working_directory: command.default_working_directory.clone(),
+            rules: command
+                .rules
+                .iter()
+                .map(YamlCommandRuleConfig::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<&CommandRuleConfig> for YamlCommandRuleConfig {
+    fn from(rule: &CommandRuleConfig) -> Self {
+        Self {
+            args_prefix: rule.args_prefix.clone(),
+            action: rule.action,
+            default_working_directory: rule.default_working_directory.clone(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ConfigStore {
     path: String,
@@ -79,8 +310,7 @@ impl ConfigStore {
         let raw = match fs::read_to_string(&self.path) {
             Ok(raw) => raw,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                serde_saphyr::to_string(fallback)
-                    .map_err(|error| ConfigStoreError::Serialize(error.to_string()))?
+                serialize_config_yaml(fallback)?
             }
             Err(error) => return Err(error.into()),
         };
@@ -249,21 +479,34 @@ fn apply_visual_patch(raw: &str, patch: &VisualConfigPatch) -> Result<String, Co
     ];
 
     for (path, value) in updates {
-        if let Some(value) = value
-            && !replace_yaml_scalar(&mut lines, path, &value)
-        {
-            let _ = insert_yaml_scalar(&mut lines, path, &value);
+        if let Some(value) = value {
+            if value == "null" {
+                let _ = remove_yaml_scalar(&mut lines, path);
+            } else if !replace_yaml_scalar(&mut lines, path, &value) {
+                let _ = insert_yaml_scalar(&mut lines, path, &value);
+            }
         }
     }
 
     if let Some(commands) = patch.commands.as_ref() {
-        let value = serialize_yaml_value(commands)?;
+        let value = serialize_command_policies(commands)?;
         replace_or_insert_yaml_block(&mut lines, "execution.commands", &value);
     }
 
     if let Some(servers) = patch.servers.as_ref() {
-        let value = serialize_yaml_value(servers)?;
+        let value = serialize_execution_servers(servers)?;
         replace_or_insert_yaml_block(&mut lines, "execution.servers", &value);
+    }
+
+    for path in [
+        "data-dir",
+        "server.access.api-key-env",
+        "execution.default-working-directory",
+    ] {
+        let _ = remove_empty_yaml_scalar(&mut lines, path);
+    }
+    for path in ["server.access", "execution.commands", "execution.servers"] {
+        let _ = remove_empty_yaml_mapping(&mut lines, path);
     }
 
     Ok(lines.concat())
@@ -273,7 +516,36 @@ fn serialize_yaml_value<T: Serialize>(value: &T) -> Result<String, ConfigStoreEr
     serde_saphyr::to_string(value).map_err(|error| ConfigStoreError::Serialize(error.to_string()))
 }
 
+fn serialize_config_yaml(config: &AppConfig) -> Result<String, ConfigStoreError> {
+    serialize_yaml_value(&YamlAppConfig::from(config))
+}
+
+fn serialize_command_policies(
+    commands: &[CommandPolicyConfig],
+) -> Result<String, ConfigStoreError> {
+    let commands = commands
+        .iter()
+        .map(YamlCommandPolicyConfig::from)
+        .collect::<Vec<_>>();
+    serialize_yaml_value(&commands)
+}
+
+fn serialize_execution_servers(
+    servers: &[ExecutionServerConfig],
+) -> Result<String, ConfigStoreError> {
+    let servers = servers
+        .iter()
+        .map(YamlExecutionServerConfig::from)
+        .collect::<Vec<_>>();
+    serialize_yaml_value(&servers)
+}
+
 fn replace_or_insert_yaml_block(lines: &mut Vec<String>, path: &str, value: &str) {
+    if value.trim() == "[]" {
+        let _ = remove_yaml_block(lines, path);
+        return;
+    }
+
     if !replace_yaml_block(lines, path, value) {
         let _ = insert_yaml_block(lines, path, value);
     }
@@ -298,6 +570,30 @@ fn replace_yaml_scalar(lines: &mut [String], path: &str, value: &str) -> bool {
     };
 
     replace_scalar_value(&mut lines[line_index], colon_index, value);
+    true
+}
+
+fn remove_yaml_scalar(lines: &mut Vec<String>, path: &str) -> bool {
+    let wanted = path.split('.').collect::<Vec<_>>();
+    let Some((line_index, _, _)) = find_yaml_mapping(lines, &wanted) else {
+        return false;
+    };
+
+    lines.remove(line_index);
+    true
+}
+
+fn remove_empty_yaml_scalar(lines: &mut Vec<String>, path: &str) -> bool {
+    let wanted = path.split('.').collect::<Vec<_>>();
+    let Some((line_index, _, colon_index)) = find_yaml_mapping(lines, &wanted) else {
+        return false;
+    };
+
+    if !is_yaml_null_value(yaml_scalar_value(&lines[line_index], colon_index)) {
+        return false;
+    }
+
+    lines.remove(line_index);
     true
 }
 
@@ -332,6 +628,58 @@ fn replace_yaml_block(lines: &mut Vec<String>, path: &str, value: &str) -> bool 
 
     lines.splice(line_index..block_end, replacement);
     true
+}
+
+fn remove_yaml_block(lines: &mut Vec<String>, path: &str) -> bool {
+    let wanted = path.split('.').collect::<Vec<_>>();
+    let Some((line_index, indent, _)) = find_yaml_mapping(lines, &wanted) else {
+        return false;
+    };
+
+    let block_end = mapping_block_end(lines, line_index, indent);
+    lines.drain(line_index..block_end);
+    true
+}
+
+fn remove_empty_yaml_mapping(lines: &mut Vec<String>, path: &str) -> bool {
+    let wanted = path.split('.').collect::<Vec<_>>();
+    let Some((line_index, indent, colon_index)) = find_yaml_mapping(lines, &wanted) else {
+        return false;
+    };
+
+    let value = yaml_scalar_value(&lines[line_index], colon_index);
+    if !value.is_empty()
+        && !is_yaml_null_value(value)
+        && !matches!(value, "[]" | "[ ]" | "{}" | "{ }")
+    {
+        return false;
+    }
+
+    let block_end = mapping_block_end(lines, line_index, indent);
+    let has_content = lines
+        .iter()
+        .skip(line_index + 1)
+        .take(block_end.saturating_sub(line_index + 1))
+        .any(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && !trimmed.starts_with('#')
+        });
+    if has_content {
+        return false;
+    }
+
+    lines.drain(line_index..block_end);
+    true
+}
+
+fn yaml_scalar_value(line: &str, colon_index: usize) -> &str {
+    let content = line.trim_end_matches(['\r', '\n']);
+    let comment_index = find_inline_comment(content, colon_index + 1).unwrap_or(content.len());
+    content[colon_index + 1..comment_index].trim()
+}
+
+fn is_yaml_null_value(value: &str) -> bool {
+    matches!(value, "" | "~" | "null" | "Null" | "NULL")
 }
 
 fn yaml_mapping_header(line: &str, colon_index: usize, newline: &str) -> String {
@@ -646,7 +994,7 @@ mod tests {
         )
         .expect("visual patch should serialize");
 
-        let config = crate::config::AppConfig::parse_raw("test.yaml", &patched)
+        let config = AppConfig::parse_raw("test.yaml", &patched)
             .expect("inserted visual fields should remain valid configuration");
         assert_eq!(
             config.server.access.api_key_env.as_deref(),
@@ -674,26 +1022,68 @@ mod tests {
             &VisualConfigPatch {
                 commands: Some(vec![CommandPolicyConfig {
                     command: "cargo".to_string(),
-                    action: crate::config::PolicyAction::Allow,
+                    action: PolicyAction::Allow,
                     targets: Vec::new(),
                     default_working_directory: None,
                     rules: vec![],
                 }]),
                 servers: Some(vec![ExecutionServerConfig::Host {
                     name: "builder".to_string(),
-                    target_platform: crate::config::TargetPlatform::Linux,
+                    target_platform: TargetPlatform::Linux,
                 }]),
                 ..VisualConfigPatch::default()
             },
         )
         .expect("visual collections should serialize");
 
-        let config = crate::config::AppConfig::parse_raw("test.yaml", &patched)
+        let config = AppConfig::parse_raw("test.yaml", &patched)
             .expect("visual collections should remain valid configuration");
         assert_eq!(config.execution.commands.len(), 1);
         assert_eq!(config.execution.commands[0].command, "cargo");
         assert_eq!(config.execution.servers.len(), 1);
         assert_eq!(config.execution.servers[0].name(), "builder");
+        assert!(patched.contains("  commands:\n    - command: cargo\n      action: allow\n"));
+        assert!(!patched.contains("targets: []"));
+        assert!(!patched.contains("default-working-directory: null"));
+        assert!(!patched.contains("rules: []"));
+    }
+
+    #[test]
+    fn visual_patch_preserves_non_empty_command_policy_fields() {
+        let raw = "server:\n  address: 127.0.0.1:8787\nexecution:\n  default-action: confirm\n  default-server: host\n  target-platform: auto\n  default-timeout-ms: 1800000\n  max-timeout-ms: 7200000\n";
+        let patched = apply_visual_patch(
+            raw,
+            &VisualConfigPatch {
+                commands: Some(vec![CommandPolicyConfig {
+                    command: "cargo".to_string(),
+                    action: PolicyAction::Allow,
+                    targets: vec!["host".to_string()],
+                    default_working_directory: Some("/workspace".to_string()),
+                    rules: vec![CommandRuleConfig {
+                        args_prefix: vec!["publish".to_string()],
+                        action: PolicyAction::Confirm,
+                        default_working_directory: None,
+                    }],
+                }]),
+                ..VisualConfigPatch::default()
+            },
+        )
+        .expect("visual command policies should serialize");
+
+        let config = AppConfig::parse_raw("test.yaml", &patched)
+            .expect("serialized command policies should remain valid configuration");
+        let command = &config.execution.commands[0];
+        assert_eq!(command.targets, vec!["host"]);
+        assert_eq!(
+            command.default_working_directory.as_deref(),
+            Some("/workspace")
+        );
+        assert_eq!(command.rules.len(), 1);
+        assert_eq!(command.rules[0].args_prefix, vec!["publish"]);
+        assert!(patched.contains("targets:\n"));
+        assert!(patched.contains("default-working-directory: /workspace\n"));
+        assert!(patched.contains("rules:\n"));
+        assert!(!patched.contains("default-working-directory: null"));
     }
 
     #[test]
@@ -704,21 +1094,21 @@ mod tests {
             &VisualConfigPatch {
                 commands: Some(vec![CommandPolicyConfig {
                     command: "cargo".to_string(),
-                    action: crate::config::PolicyAction::Allow,
+                    action: PolicyAction::Allow,
                     targets: Vec::new(),
                     default_working_directory: None,
                     rules: vec![],
                 }]),
                 servers: Some(vec![ExecutionServerConfig::Host {
                     name: "builder".to_string(),
-                    target_platform: crate::config::TargetPlatform::Linux,
+                    target_platform: TargetPlatform::Linux,
                 }]),
                 ..VisualConfigPatch::default()
             },
         )
         .expect("visual collections should serialize");
 
-        let config = crate::config::AppConfig::parse_raw("test.yaml", &patched)
+        let config = AppConfig::parse_raw("test.yaml", &patched)
             .expect("replaced visual collections should remain valid configuration");
         assert_eq!(config.execution.commands[0].command, "cargo");
         assert_eq!(config.execution.servers[0].name(), "builder");
@@ -728,6 +1118,146 @@ mod tests {
         assert!(!patched.contains("name: old"));
         assert!(!patched.contains("commands: [{"));
         assert!(!patched.contains("servers: [{"));
+    }
+
+    #[test]
+    fn visual_patch_omits_empty_optional_fields_from_the_entire_configuration() {
+        let raw = "data-dir: null\nserver:\n  address: 127.0.0.1:8787\n  access:\n    api-key-env: null\nlogging:\n  retention-days: 30\nhistory:\n  retention-days: 30\n  max-records: 1000\nexecution:\n  default-action: confirm\n  commands: []\n  default-working-directory: null\n  default-server: host\n  servers: []\n  target-platform: auto\n  default-timeout-ms: 1800000\n  max-timeout-ms: 7200000\n";
+        let patched = apply_visual_patch(
+            raw,
+            &VisualConfigPatch {
+                data_dir: Some(String::new()),
+                api_key_env: Some(String::new()),
+                default_working_directory: Some(String::new()),
+                commands: Some(vec![CommandPolicyConfig {
+                    command: "npm".to_string(),
+                    action: PolicyAction::Allow,
+                    targets: Vec::new(),
+                    default_working_directory: None,
+                    rules: Vec::new(),
+                }]),
+                servers: Some(Vec::new()),
+                ..VisualConfigPatch::default()
+            },
+        )
+        .expect("visual configuration should serialize");
+
+        let config = AppConfig::parse_raw("test.yaml", &patched)
+            .expect("compact visual configuration should remain valid");
+        assert!(config.data_dir.is_none());
+        assert!(config.server.access.api_key_env.is_none());
+        assert!(config.execution.default_working_directory.is_none());
+        assert!(config.execution.servers.is_empty());
+        assert_eq!(config.execution.commands[0].command, "npm");
+        assert!(patched.contains("  commands:\n    - command: npm\n      action: allow\n"));
+        assert!(!patched.contains("data-dir:"));
+        assert!(!patched.contains("access:"));
+        assert!(!patched.contains("api-key-env:"));
+        assert!(!patched.contains("default-working-directory:"));
+        assert!(!patched.contains("targets: []"));
+        assert!(!patched.contains("rules: []"));
+        assert!(!patched.contains("servers:"));
+        assert!(!patched.contains("null"));
+        assert!(!patched.contains("[]"));
+    }
+
+    #[test]
+    fn missing_config_snapshot_uses_compact_yaml_defaults() {
+        let path = std::env::temp_dir().join(format!(
+            "host-bridge-config-store-default-{}.yaml",
+            uuid::Uuid::new_v4()
+        ));
+        let store = ConfigStore::new(ResolvedConfigPath {
+            path: path.display().to_string(),
+            explicit: true,
+        });
+
+        let snapshot = store
+            .snapshot(&AppConfig::default())
+            .expect("default configuration should serialize");
+
+        assert!(!snapshot.raw.contains("null"));
+        assert!(!snapshot.raw.contains("[]"));
+        assert!(!snapshot.raw.contains("access:"));
+        assert!(!snapshot.raw.contains("commands:"));
+        assert!(!snapshot.raw.contains("servers:"));
+    }
+
+    #[test]
+    fn visual_patch_preserves_non_empty_ssh_optional_fields() {
+        let raw = "server:\n  address: 127.0.0.1:8787\nexecution:\n  default-action: confirm\n  default-server: host\n  target-platform: auto\n  default-timeout-ms: 1800000\n  max-timeout-ms: 7200000\n";
+        let patched = apply_visual_patch(
+            raw,
+            &VisualConfigPatch {
+                servers: Some(vec![ExecutionServerConfig::Ssh {
+                    name: "builder".to_string(),
+                    host: "build.example.com".to_string(),
+                    port: 22,
+                    user: "builder".to_string(),
+                    target_platform: TargetPlatform::Linux,
+                    auth: SshAuthConfig {
+                        kind: SshAuthType::PasswordEnv,
+                        r#ref: Some("BUILD_SSH_PASSWORD".to_string()),
+                    },
+                    known_hosts_file: Some("/home/builder/.ssh/known_hosts".to_string()),
+                    verify_host_key: true,
+                    connection_idle_timeout_ms: 300000,
+                }]),
+                ..VisualConfigPatch::default()
+            },
+        )
+        .expect("SSH server configuration should serialize");
+
+        let config = AppConfig::parse_raw("test.yaml", &patched)
+            .expect("serialized SSH server should remain valid configuration");
+        let ExecutionServerConfig::Ssh {
+            auth,
+            known_hosts_file,
+            ..
+        } = &config.execution.servers[0]
+        else {
+            panic!("expected an SSH server");
+        };
+        assert_eq!(auth.r#ref.as_deref(), Some("BUILD_SSH_PASSWORD"));
+        assert_eq!(
+            known_hosts_file.as_deref(),
+            Some("/home/builder/.ssh/known_hosts")
+        );
+        assert!(patched.contains("ref: BUILD_SSH_PASSWORD\n"));
+        assert!(patched.contains("known-hosts-file: /home/builder/.ssh/known_hosts\n"));
+    }
+
+    #[test]
+    fn visual_patch_omits_empty_ssh_optional_fields() {
+        let raw = "server:\n  address: 127.0.0.1:8787\nexecution:\n  default-action: confirm\n  default-server: host\n  target-platform: auto\n  default-timeout-ms: 1800000\n  max-timeout-ms: 7200000\n";
+        let patched = apply_visual_patch(
+            raw,
+            &VisualConfigPatch {
+                servers: Some(vec![ExecutionServerConfig::Ssh {
+                    name: "builder".to_string(),
+                    host: "build.example.com".to_string(),
+                    port: 22,
+                    user: "builder".to_string(),
+                    target_platform: TargetPlatform::Linux,
+                    auth: SshAuthConfig {
+                        kind: SshAuthType::Agent,
+                        r#ref: None,
+                    },
+                    known_hosts_file: None,
+                    verify_host_key: true,
+                    connection_idle_timeout_ms: 300000,
+                }]),
+                ..VisualConfigPatch::default()
+            },
+        )
+        .expect("SSH server configuration should serialize");
+
+        let config = AppConfig::parse_raw("test.yaml", &patched)
+            .expect("compact SSH server should remain valid configuration");
+        assert_eq!(config.execution.servers.len(), 1);
+        assert!(!patched.contains("ref:"));
+        assert!(!patched.contains("known-hosts-file:"));
+        assert!(!patched.contains("null"));
     }
 
     #[test]

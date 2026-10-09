@@ -383,19 +383,61 @@ impl ConfigStore {
             fs::create_dir_all(parent)?;
         }
 
-        let mut options = OpenOptions::new();
-        options.create(true).truncate(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-
-        let mut file = options.open(path)?;
-        file.write_all(raw.as_bytes())?;
-        file.flush()?;
+        atomic_write(path, |file| file.write_all(raw.as_bytes()))?;
         Ok(())
     }
+}
+
+// Keep the destination untouched until the complete replacement is ready. The
+// callback also lets tests simulate a short write followed by an I/O failure.
+fn atomic_write(
+    path: &Path,
+    write: impl FnOnce(&mut fs::File) -> io::Result<()>,
+) -> io::Result<()> {
+    // Preserve the previous behavior for existing symlinks: update their target.
+    let destination = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(path)?,
+        Ok(_) => path.to_path_buf(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => path.to_path_buf(),
+        Err(error) => return Err(error),
+    };
+    let permissions = match fs::metadata(&destination) {
+        Ok(metadata) => {
+            if !metadata.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "configuration is not a regular file",
+                ));
+            }
+            if metadata.permissions().readonly() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "configuration is read-only",
+                ));
+            }
+            Some(metadata.permissions())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    // NamedTempFile creates a unique file with restrictive permissions (0600 on
+    // Unix), and removes it on ordinary error paths. Same-directory persistence
+    // uses an atomic replacement on Unix and Windows; never remove the old file.
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    write(temporary.as_file_mut())?;
+    temporary.as_file_mut().flush()?;
+    if let Some(permissions) = permissions {
+        temporary.as_file().set_permissions(permissions)?;
+    }
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(&destination)
+        .map_err(|error| error.error)?;
+    Ok(())
 }
 
 fn apply_visual_patch(raw: &str, patch: &VisualConfigPatch) -> Result<String, ConfigStoreError> {
@@ -956,6 +998,120 @@ fn find_inline_comment(content: &str, start: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_store(path: &Path) -> ConfigStore {
+        ConfigStore::new(ResolvedConfigPath {
+            path: path.display().to_string(),
+            explicit: true,
+        })
+    }
+
+    #[test]
+    fn atomic_save_creates_nested_config_and_replaces_existing_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("nested/config.yaml");
+        let store = test_store(&path);
+        let original = "# original\nserver:\n  address: 127.0.0.1:8810\n";
+        store.save_raw(original.to_string()).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        let updated = "server:\n  address: 127.0.0.1:8811\n";
+        store.save_raw(updated.to_string()).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), updated);
+        store
+            .save_visual(
+                VisualConfigPatch {
+                    server_address: Some("127.0.0.1:8812".to_string()),
+                    ..VisualConfigPatch::default()
+                },
+                &AppConfig::default(),
+            )
+            .unwrap();
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("127.0.0.1:8812")
+        );
+        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn partial_write_failure_preserves_original_and_cleans_temporary_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.yaml");
+        let original = b"# original configuration\nserver:\n  address: 127.0.0.1:8810\n";
+        fs::write(&path, original).unwrap();
+        let error = atomic_write(&path, |file| {
+            file.write_all(b"incomplete replacement")?;
+            assert_eq!(fs::read(&path)?, original);
+            Err(io::Error::other("injected write failure"))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "injected write failure");
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn replacement_failure_preserves_destination_and_cleans_temporary_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.yaml");
+        // Create an incompatible destination after preparation, immediately
+        // before persistence. This is deterministic even when running as root.
+        assert!(
+            atomic_write(&path, |file| {
+                file.write_all(b"replacement")?;
+                fs::create_dir(&path)?;
+                fs::write(path.join("marker"), b"untouched")
+            })
+            .is_err()
+        );
+        assert_eq!(fs::read(path.join("marker")).unwrap(), b"untouched");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn read_only_configuration_is_preserved() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.yaml");
+        fs::write(&path, b"original").unwrap();
+        let original_permissions = fs::metadata(&path).unwrap().permissions();
+        let mut permissions = original_permissions.clone();
+        permissions.set_readonly(true);
+        fs::set_permissions(&path, permissions).unwrap();
+        assert!(test_store(&path).write("replacement").is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"original");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        // Allow TempDir cleanup on Windows.
+        fs::set_permissions(&path, original_permissions).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_save_preserves_unix_permissions_and_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.yaml");
+        test_store(&path).write("original").unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let link = directory.path().join("link.yaml");
+        symlink(&path, &link).unwrap();
+        test_store(&link).write("replacement").unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "replacement");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
 
     #[test]
     fn visual_scalar_patch_preserves_comments_and_layout() {
